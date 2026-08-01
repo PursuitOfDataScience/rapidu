@@ -115,7 +115,11 @@ def render_quota(snap: QuotaSnapshot, paths: Optional[List[str]] = None) -> List
 
 
 def render_walk(
-    res: WalkResult, settle: SettleCheck, top: int = 10, show_uids: bool = True
+    res: WalkResult,
+    settle: SettleCheck,
+    top: int = 10,
+    show_uids: bool = True,
+    scan: Optional[DeletedScan] = None,
 ) -> List[str]:
     out = _h("WALK  {}".format(res.root))
     rate = res.inodes / res.elapsed if res.elapsed > 0 else 0.0
@@ -172,14 +176,46 @@ def render_walk(
             )
 
     out.extend(render_settle(res, settle))
+    # Belongs with the other one-line facts about this tree, not after the
+    # rankings. The full section only appears when something was found.
+    if scan is not None:
+        out.extend(render_deleted_oneline(scan))
     out.extend(render_top(res, top))
     return out
+
+
+def render_footer() -> List[str]:
+    """Kept for --about; deliberately not printed on every run."""
+    return [
+        "",
+        _RULE,
+        "slurmdisk agrees with `du -s --block-size=1` byte-for-byte on the same tree.",
+        "It is not more accurate than du; it is faster, and it reports three things du",
+        "cannot see: unsettled trees, unlinked-but-open space, and the age of the quota",
+        "number it is compared against.",
+    ]
 
 
 def render_settle(res: WalkResult, settle: SettleCheck) -> List[str]:
     """The "this tree has not settled" warning -- a truth ``du`` cannot tell."""
     if not res.recent_files:
         return []
+
+    # A handful of freshly written files in a large tree cannot move the
+    # headline number, and spending five lines saying so trains the reader to
+    # skip the section on the run where it matters. Compact unless it is either
+    # measurably moving or big enough to move things.
+    if not settle.moved and not _settling_is_material(res):
+        return [
+            "  {:<22}{} file{} written in the last {} -- figure is provisional"
+            " (--settle-wait 60 to measure)".format(
+                "settling",
+                human_count(res.recent_files),
+                "" if res.recent_files == 1 else "s",
+                human_duration(res.settle_window),
+            )
+        ]
+
     out = ["", "  SETTLING"]
     out.append(
         "      {} file{} written in the last {}".format(
@@ -212,16 +248,26 @@ def render_settle(res: WalkResult, settle: SettleCheck) -> List[str]:
     else:
         # A re-stat taken immediately cannot see an effect that takes tens of
         # seconds. Saying "looks settled" here would be a null result from a
-        # blind instrument.
-        out.append("      the figure is PROVISIONAL: freshly written blocks are not final")
-        out.append("        on GPFS for tens of seconds, and this reading was taken now.")
-        out.append("        Re-run with --settle-wait 60 to measure the drift instead of")
-        out.append("        assuming it away.")
+        # blind instrument -- but four lines of caveat for a handful of files in
+        # a large tree is noise, so the long form is reserved for the case where
+        # the unsettled files could actually move the total.
+        out.append("      figure is PROVISIONAL -- use --settle-wait 60 to measure the drift")
     if settle.gone:
         out.append(
             "      {} of them disappeared between the walk and the re-stat".format(settle.gone)
         )
     return out
+
+
+def _settling_is_material(res: WalkResult) -> bool:
+    """Could the unsettled files plausibly move the headline number?
+
+    23 recently written files in a 21,530-inode tree cannot, and saying so at
+    length trains the reader to skip the section for the run where it can.
+    """
+    if not res.recent_files:
+        return False
+    return res.recent_files >= max(50, res.inodes // 100) or res.recent_apparent >= (256 << 20)
 
 
 def render_top(res: WalkResult, top: int) -> List[str]:
@@ -238,30 +284,45 @@ def render_top(res: WalkResult, top: int) -> List[str]:
                 )
             )
 
+    # Ranked by inodes, with density as a *column* rather than its own ranking.
+    #
+    # There used to be a third "DENSEST" section sorted by files/GiB. It was
+    # worse than useless: a ratio is won by the smallest denominator, so it
+    # nominated a 260 KiB .git directory as the "best candidate to pack" ahead of
+    # one holding ten times the inodes. Packing a directory reclaims the inodes
+    # it holds, so the absolute count is the ranking and density only says how
+    # cheap the tar will be.
     by_files = res.top_dirs(top, "files")
     if by_files and [a.path for a in by_files] != [a.path for a in by_size]:
-        out.extend(["", "  MOST INODES"])
+        out.extend(["", "  MOST INODES  (density is what a tar would cost you)"])
         for a in by_files:
-            out.append(
-                "      {:>10} inodes  {:>10}  {}".format(
-                    human_count(a.inodes), human_bytes(a.size), os.path.relpath(a.path, res.root)
-                )
-            )
-
-    dense = res.top_dirs(top, "density")
-    if dense:
-        out.extend(["", "  DENSEST -- best candidates to pack (files per GiB)"])
-        for a in dense:
             d = files_per_gib(a.size, a.inodes)
             out.append(
-                "      {:>12}  {:>10} inodes  {:>10}  {}".format(
-                    "n/a" if d is None else "{:,.0f}/GiB".format(d),
+                "      {:>10} inodes  {:>10}  {:>12}  {}".format(
                     human_count(a.inodes),
                     human_bytes(a.size),
+                    "n/a" if d is None else "{:,.0f}/GiB".format(d),
                     os.path.relpath(a.path, res.root),
                 )
             )
     return out
+
+
+def render_deleted_oneline(scan: DeletedScan) -> List[str]:
+    """One line for the combined report when the scan found nothing.
+
+    The full section exists to describe space that was found. Printing seven
+    lines of scope caveats to announce a null result buries the rest of the
+    report, and "incomplete" is unconditionally true on a shared login node
+    where every other user's processes are unreadable.
+    """
+    if not scan.available or scan.files:
+        return []
+    return [
+        "  {:<22}none on this node ({} of {} processes inspectable)".format(
+            "unlinked-but-open", scan.scanned_pids, scan.scanned_pids + scan.unreadable_pids
+        )
+    ]
 
 
 def render_deleted(scan: DeletedScan, top: int = 10) -> List[str]:
@@ -341,17 +402,6 @@ def render_reconcile(recs: List[rc.Reconciliation]) -> List[str]:
                 out.append("        - {}".format(c))
         out.append("")
     return out
-
-
-def render_footer() -> List[str]:
-    return [
-        "",
-        _RULE,
-        "slurmdisk agrees with `du -s --block-size=1` byte-for-byte on the same tree.",
-        "It is not more accurate than du; it is faster, and it reports three things du",
-        "cannot see: unsettled trees, unlinked-but-open space, and the age of the quota",
-        "number it is compared against.",
-    ]
 
 
 # --------------------------------------------------------------------------

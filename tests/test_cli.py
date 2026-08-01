@@ -81,7 +81,26 @@ def test_bare_path_runs_the_full_report(small_tree, capsys):
     cli.main([small_tree, "--no-quota", "--no-deleted"])
     out = capsys.readouterr().out
     assert "WALK" in out
-    assert "du" in out  # the footer's honesty note
+
+
+def test_no_density_ranking_section(small_tree, capsys):
+    """A files/GiB ranking is won by the smallest denominator.
+
+    It nominated a 260 KiB .git directory as the "best candidate to pack" ahead
+    of one holding ten times the inodes. Density is a column now, not a ranking.
+    """
+    cli.main([small_tree, "--no-quota", "--no-deleted", "-n", "5"])
+    out = capsys.readouterr().out
+    assert "DENSEST" not in out
+
+
+def test_clean_deleted_scan_is_one_line(small_tree, capsys):
+    """A null result must not cost seven lines of scope caveats."""
+    cli.main([small_tree, "--no-quota"])
+    out = capsys.readouterr().out
+    assert "UNLINKED BUT STILL OPEN" not in out
+    assert "unlinked-but-open" in out
+    assert len([ln for ln in out.splitlines() if "unlinked-but-open" in ln]) == 1
 
 
 def test_no_quota_skips_the_quota_section(small_tree, capsys):

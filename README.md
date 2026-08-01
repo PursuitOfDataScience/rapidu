@@ -101,10 +101,15 @@ checkpoint, pure inode cost. So directories are ranked three ways, and the third
 is the one that tells you what to pack:
 
 ```
-LARGEST SUBTREES        by allocated bytes
-MOST INODES             by inode count
-DENSEST                 by files per GiB -- best candidates to tar
+LARGEST SUBTREES   by allocated bytes -- the classic du question
+MOST INODES        by inode count, with files/GiB as a column
 ```
+
+Packing a directory reclaims the inodes it holds, so the absolute count is the
+ranking; density only tells you how cheap the tar will be. (An earlier version
+ranked by files/GiB directly. A ratio is won by the smallest denominator, so it
+nominated a 260 KiB `.git` directory as the top candidate ahead of one holding
+ten times the inodes.)
 
 ---
 

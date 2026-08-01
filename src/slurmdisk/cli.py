@@ -277,12 +277,11 @@ def cmd_walk(args: argparse.Namespace) -> int:
             lines = []  # type: List[str]
             if snap is not None:
                 lines.extend(report.render_quota(snap, [path]))
-            lines.extend(report.render_walk(res, settle, args.top))
-            if path_scan.available and (path_scan.files or not path_scan.complete):
+            lines.extend(report.render_walk(res, settle, args.top, scan=path_scan))
+            if path_scan.available and path_scan.files:
                 lines.extend(report.render_deleted(path_scan, args.top))
             if recs:
                 lines.extend(report.render_reconcile(recs))
-            lines.extend(report.render_footer())
             print("\n".join(lines))
 
         if not res.complete or settle.moved:
