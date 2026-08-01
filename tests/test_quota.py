@@ -153,3 +153,51 @@ def test_usage_fraction():
     r = QuotaRow("f", "files", "group", 92, 100, 110)
     assert abs(r.usage_fraction - 0.92) < 1e-9
     assert QuotaRow("f", "files", "group", 5, None, None).usage_fraction is None
+
+
+def test_render_disambiguates_same_named_filesets(monkeypatch):
+    """A fileset name is unique only within one filesystem.
+
+    On this site "rcc-staff" names four different quotas and "rcc" two. Without
+    the mount printed, those rows are indistinguishable and the reader cannot
+    tell which number belongs to which filesystem.
+    """
+    from slurmdisk.report import render_quota
+
+    text = "\n".join(render_quota(_parse(monkeypatch, SITE_OUTPUT)))
+    assert "filesystem" in text
+    rcc_lines = [ln for ln in text.splitlines() if ln.strip().startswith("rcc ")]
+    assert len(rcc_lines) == 2
+    assert any("/project" in ln for ln in rcc_lines)
+    # Every row must say which filesystem it is, or say it does not know.
+    for ln in text.splitlines():
+        if " blocks " in ln or " files  " in ln or " files " in ln:
+            if "fileset" in ln:
+                continue
+            assert ln.rstrip().split()[-1].startswith(("/", "?")), ln
+
+
+def test_render_flags_a_running_grace_timer(monkeypatch):
+    """An expired soft limit stops writes; it cannot be a quiet column."""
+    from slurmdisk.report import render_quota
+
+    over = SITE_OUTPUT.replace(
+        "Midway3-home     blocks (user)       679.66M     30.00G     35.00G     none",
+        "Midway3-home     blocks (user)        31.00G     30.00G     35.00G    6days",
+    )
+    text = "\n".join(render_quota(_parse(monkeypatch, over)))
+    assert "IN GRACE" in text and "6days" in text
+
+
+def test_units_are_base_1024():
+    """The wrapper's M/G/T are IEC.
+
+    Checked against ground truth: the row reading 127.94M for
+    /scratch/midway3/$USER corresponds to a tree du measures at 134,631,936 B.
+    Base-1024 predicts 134,154,813 (0.36% off, a stale snapshot); base-1000
+    predicts 127,940,000 (5.2% off). Also decisive in the raw output: the block
+    column prints "1024.00G" alongside "1.10T", so its G->T rollover is at 1024.
+    """
+    assert parse_size("127.94M") == int(127.94 * (1 << 20))
+    assert parse_size("1024.00G") == 1 << 40
+    assert parse_size("1.10T") == int(1.10 * (1 << 40))

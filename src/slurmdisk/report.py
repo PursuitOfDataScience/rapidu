@@ -69,9 +69,13 @@ def render_quota(snap: QuotaSnapshot, paths: Optional[List[str]] = None) -> List
             rows = keep
 
     out.append("")
+    # The filesystem column is not decoration. A fileset name is unique only
+    # within one filesystem: on this site "rcc-staff" names four different
+    # quotas and "rcc" two, and without the mount the rows are indistinguishable
+    # from each other.
     out.append(
-        "  {:<18}{:<8}{:<8}{:>12}{:>12}{:>8}".format(
-            "fileset", "type", "scope", "used", "soft limit", "at"
+        "  {:<18}{:<8}{:<7}{:>12}{:>12}{:>8}  {}".format(
+            "fileset", "type", "scope", "used", "soft limit", "use%", "filesystem"
         )
     )
     for r in rows:
@@ -81,16 +85,32 @@ def render_quota(snap: QuotaSnapshot, paths: Optional[List[str]] = None) -> List
             if r.soft is None
             else (human_count(r.soft) if r.kind == "files" else human_bytes(r.soft))
         )
+        # An unmapped mount prints as "?" rather than blank: the row is real and
+        # its numbers are real, we just could not tie it to a path on this host.
+        where = r.mount or "?"
+        grace = ""
+        if r.grace and r.grace.lower() not in ("none", "-", ""):
+            # A running grace timer means the soft limit is already exceeded and
+            # writes stop when it expires. That is the most urgent thing on the
+            # line and it must not be hidden in a column nobody reads.
+            grace = "  ! IN GRACE, {} left".format(r.grace)
         out.append(
-            "  {:<18}{:<8}{:<8}{:>12}{:>12}{:>8}".format(
+            "  {:<18}{:<8}{:<7}{:>12}{:>12}{:>8}  {}{}".format(
                 r.fileset[:17],
                 r.kind,
                 r.scope or "-",
                 used,
                 soft,
                 pct(r.usage_fraction, 1.0) if r.usage_fraction is not None else "n/a",
+                where,
+                grace,
             )
         )
+
+    unmapped = [r for r in rows if not r.mount]
+    if unmapped:
+        for note in snap.mapping_notes():
+            out.append("  ? {}".format(note))
     return out
 
 
