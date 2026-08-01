@@ -4,11 +4,11 @@ Where your bytes and inodes are, what `du` cannot see, and how old the quota
 number you are comparing against actually is.
 
 ```
-slurmdisk                    # quota + walk + reconciliation for $PWD
-slurmdisk ~/scratch          # ... for a specific tree
-slurmdisk quota              # just the quota table, and the age of its figures
-slurmdisk deleted            # space held by unlinked-but-open files
-slurmdisk --json             # for tooling
+sd .                    # quota + walk + reconciliation for the current directory
+sd ~/scratch            # ... for a specific tree
+sd --quota-only         # just the quota table, and the age of its figures
+sd --deleted-only       # space held by unlinked-but-open files
+sd . --json             # for tooling
 ```
 
 No dependencies, no root, no daemon, no config. Stdlib only, down to the
@@ -83,9 +83,9 @@ invisible to `ls`, to `du`, to `ncdu`, and to slurmdisk's own walk. The blocks
 are still allocated. Verified on GPFS:
 
 ```
-du -s                     512 B
-slurmdisk walk            512 B
-slurmdisk deleted scan    512.0 MiB in 1 inode(s)
+du -s                512 B
+sd . (walk)          512 B
+sd --deleted-only    512.0 MiB in 1 inode(s)
     512.0 MiB  pids=[731542]  /scratch/midway3/.../ckpt.bin
 ```
 
@@ -197,12 +197,23 @@ Or just run it — it is stdlib-only:
 
 ```bash
 git clone https://github.com/PursuitOfDataScience/slurmdisk
-PYTHONPATH=slurmdisk/src python3 -m slurmdisk
+PYTHONPATH=slurmdisk/src python3 -m slurmdisk .
 ```
+
+Installed, the command is `slurmdisk`, with `sd` as a short alias — the same
+pairing as `slurmwatch`/`sw`.
 
 ## Options
 
 ```
+sd [PATH ...] [options]
+
+The only positional argument is a path. Modes are flags, not subcommands:
+`quota`, `walk` and `deleted` are all ordinary directory names, so `sd deleted`
+must mean "measure ./deleted" and nothing else.
+
+-Q, --quota-only         quota table only; walk nothing
+-D, --deleted-only       unlinked-but-open space only
 -t, --threads N          walk concurrency, clamped to 16 (default 8)
 -d, --depth N            directory depth to aggregate for reporting (default 2)
 -n, --top N              entries per ranking (default 10)

@@ -1,13 +1,17 @@
 """Command line interface.
 
-    slurmdisk [PATH ...]        quota + walk + reconcile + where the inodes are
-    slurmdisk quota             just the quota table, with its snapshot age
-    slurmdisk walk PATH         just the walk, no quota comparison
-    slurmdisk deleted [PATH]    just the unlinked-but-open scan
+    sd .                 quota + walk + reconcile + where the inodes are
+    sd ~/scratch         the same, for another tree
+    sd --quota-only      just the quota table, with its snapshot age
+    sd --deleted-only    just the unlinked-but-open scan
 
-The command is matched as the first bare word rather than through argparse
-subparsers, which cannot disambiguate a leading ``nargs="*"`` positional from a
-subcommand name.
+**The only positional argument is a path.** An earlier version took bare-word
+subcommands (``sd quota``, ``sd walk``, ``sd deleted``), which is the wrong shape
+for a tool whose primary argument is a directory: ``quota``, ``walk`` and
+``deleted`` are all perfectly ordinary directory names, so ``sd deleted`` was
+ambiguous between "scan for deleted files" and "measure ./deleted" -- and it
+silently resolved to the former. Modes are flags now, and a path is always a
+path.
 
 Plain text by default because the output goes in a support ticket; ``--json``
 for tooling and for ``--support-bundle`` style composition.
@@ -32,21 +36,29 @@ EXIT_OK = 0
 EXIT_ATTENTION = 1
 EXIT_ERROR = 2
 
-COMMANDS = ("quota", "walk", "deleted")
+# Words the removed subcommand interface used. Kept only to recognise them when
+# they fail to resolve as a path, so the error can point at the flag.
+_LEGACY_COMMANDS = {
+    "quota": "--quota-only",
+    "walk": "--no-quota",
+    "deleted": "--deleted-only",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="slurmdisk",
-        usage="slurmdisk [quota|walk|deleted] [PATH ...] [options]",
+        usage="sd [PATH ...] [options]",
         description="Where your bytes and inodes are, what du cannot see, and "
         "how old the quota number you are comparing against is.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="commands:\n"
-        "  (none)      quota + walk + reconciliation for each PATH\n"
-        "  quota       the quota table and the age of its figures\n"
-        "  walk        walk PATH, no quota comparison\n"
-        "  deleted     unlinked-but-open space held on this node\n"
+        epilog="examples:\n"
+        "  sd .                  everything, for the current directory\n"
+        "  sd ~/scratch -n 20    the same, listing 20 directories per ranking\n"
+        "  sd --quota-only       just the quota table and the age of its figures\n"
+        "  sd . --no-quota       just the walk, no quota comparison\n"
+        "  sd --deleted-only     unlinked-but-open space held on this node\n"
+        "  sd . --settle-wait 60 measure how far a freshly written tree is drifting\n"
         "\n"
         "slurmdisk agrees with `du -s --block-size=1` byte-for-byte on the\n"
         "same tree. It is faster, not more accurate.",
@@ -101,6 +113,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not cross filesystem boundaries; use this when "
         "reconciling against a per-filesystem quota",
     )
+    p.add_argument(
+        "-Q",
+        "--quota-only",
+        action="store_true",
+        help="print only the quota table and the age of its figures; walk nothing. "
+        "A PATH, if given, selects which rows to show.",
+    )
+    p.add_argument(
+        "-D",
+        "--deleted-only",
+        action="store_true",
+        help="print only unlinked-but-open space held on this node. A PATH, if "
+        "given, restricts the scan to that subtree.",
+    )
     p.add_argument("--no-quota", action="store_true", help="skip the quota backend")
     p.add_argument(
         "--no-deleted", action="store_true", help="skip the /proc scan for unlinked-but-open files"
@@ -144,6 +170,15 @@ def _resolve_paths(raw: List[str]) -> List[str]:
         ap = os.path.abspath(os.path.expanduser(p))
         if not os.path.exists(ap):
             sys.stderr.write("slurmdisk: {}: no such path\n".format(p))
+            # Only when it is not a real directory: if ./quota exists it is a
+            # path, unambiguously, and gets measured like any other.
+            if p in _LEGACY_COMMANDS:
+                sys.stderr.write(
+                    "slurmdisk: `{0}` is no longer a subcommand -- the only "
+                    "positional argument is a path. Did you mean `sd {1}`?\n".format(
+                        p, _LEGACY_COMMANDS[p]
+                    )
+                )
             continue
         if not os.path.isdir(ap):
             sys.stderr.write("slurmdisk: {}: not a directory\n".format(p))
@@ -187,14 +222,14 @@ def cmd_deleted(args: argparse.Namespace) -> int:
     return rcode
 
 
-def cmd_walk(args: argparse.Namespace, reconcile: bool) -> int:
+def cmd_walk(args: argparse.Namespace) -> int:
     paths = _resolve_paths(args.paths)
     if not paths:
         return EXIT_ERROR
     _warn_threads(args.threads)
 
     snap = None
-    if reconcile and not args.no_quota:
+    if not args.no_quota:
         snap = quotamod.read_best(paths[0], args.quota_timeout)
 
     scan = None
@@ -261,13 +296,8 @@ def cmd_walk(args: argparse.Namespace, reconcile: bool) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    raw = list(sys.argv[1:] if argv is None else argv)
-    command = None
-    if raw and raw[0] in COMMANDS:
-        command = raw.pop(0)
-
     parser = build_parser()
-    args = parser.parse_args(raw)
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     if args.version:
         from . import __version__
@@ -275,12 +305,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("slurmdisk {}".format(__version__))
         return EXIT_OK
 
+    if args.quota_only and args.deleted_only:
+        parser.error("--quota-only and --deleted-only ask for different reports")
+
     try:
-        if command == "quota":
+        if args.quota_only:
             return cmd_quota(args)
-        if command == "deleted":
+        if args.deleted_only:
             return cmd_deleted(args)
-        return cmd_walk(args, reconcile=(command is None))
+        return cmd_walk(args)
     except KeyboardInterrupt:
         sys.stderr.write("\nslurmdisk: interrupted\n")
         return EXIT_ERROR

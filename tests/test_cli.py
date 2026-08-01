@@ -19,12 +19,62 @@ def small_tree(tmp_path):
     return root
 
 
-def test_command_word_is_split_from_paths(small_tree, capsys):
-    """`slurmdisk walk PATH` must not treat 'walk' as a path."""
-    assert cli.main(["walk", small_tree, "--no-deleted"]) in (cli.EXIT_OK, cli.EXIT_ATTENTION)
+def test_a_directory_named_like_an_old_subcommand_is_measured(tmp_path, capsys):
+    """The reason subcommands were removed: these are ordinary directory names.
+
+    `sd deleted` used to mean "scan for unlinked-but-open files" even when
+    ./deleted was a real directory the user wanted measured. A path is now
+    always a path.
+    """
+    for name in ("quota", "walk", "deleted"):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "f").write_bytes(b"x" * 4096)
+        import os
+
+        cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            cli.main([name, "--no-quota", "--no-deleted"])
+        finally:
+            os.chdir(cwd)
+        out = capsys.readouterr().out
+        assert "WALK" in out and name in out, name
+        assert "UNLINKED" not in out, "%s was taken as a subcommand" % name
+
+
+def test_quota_only_flag(capsys):
+    cli.main(["--quota-only"])
     out = capsys.readouterr().out
-    assert "WALK" in out
-    assert "no such path" not in out
+    assert "QUOTA" in out
+    assert "WALK" not in out
+
+
+def test_deleted_only_flag(capsys):
+    cli.main(["--deleted-only"])
+    out = capsys.readouterr().out
+    assert "UNLINKED BUT STILL OPEN" in out
+    assert "WALK" not in out
+
+
+def test_conflicting_only_flags_rejected():
+    with pytest.raises(SystemExit):
+        cli.main(["--quota-only", "--deleted-only"])
+
+
+def test_removed_subcommand_word_gets_a_pointer(tmp_path, capsys):
+    """`sd quota` with no ./quota directory should say what to type instead."""
+    import os
+
+    cwd = os.getcwd()
+    os.chdir(str(tmp_path))
+    try:
+        assert cli.main(["quota"]) == cli.EXIT_ERROR
+    finally:
+        os.chdir(cwd)
+    err = capsys.readouterr().err
+    assert "no longer a subcommand" in err
+    assert "--quota-only" in err
 
 
 def test_bare_path_runs_the_full_report(small_tree, capsys):
@@ -34,8 +84,8 @@ def test_bare_path_runs_the_full_report(small_tree, capsys):
     assert "du" in out  # the footer's honesty note
 
 
-def test_walk_subcommand_skips_quota(small_tree, capsys):
-    cli.main(["walk", small_tree, "--no-deleted"])
+def test_no_quota_skips_the_quota_section(small_tree, capsys):
+    cli.main([small_tree, "--no-quota", "--no-deleted"])
     assert "QUOTA" not in capsys.readouterr().out
 
 
@@ -75,8 +125,8 @@ def test_thread_clamp_warns(small_tree, capsys):
     assert "clamped" in capsys.readouterr().err
 
 
-def test_deleted_subcommand(capsys):
-    rc = cli.main(["deleted", "--json"])
+def test_deleted_only_json(capsys):
+    rc = cli.main(["--deleted-only", "--json"])
     assert rc in (cli.EXIT_OK, cli.EXIT_ATTENTION)
     doc = json.loads(capsys.readouterr().out)
     assert doc["deleted_but_open"]["node_local_only"] is True
