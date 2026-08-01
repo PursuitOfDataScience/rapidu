@@ -53,12 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
         "how old the quota number you are comparing against is.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
-        "  sd .                  everything, for the current directory\n"
-        "  sd ~/scratch -n 20    the same, listing 20 directories per ranking\n"
-        "  sd --quota-only       just the quota table and the age of its figures\n"
-        "  sd . --no-quota       just the walk, no quota comparison\n"
-        "  sd --deleted-only     unlinked-but-open space held on this node\n"
-        "  sd . --settle-wait 60 measure how far a freshly written tree is drifting\n"
+        "  sd .                  how big is this tree, and what is big inside it\n"
+        "  sd ~/scratch -n 20    the same, listing 20 directories\n"
+        "  sd . -i               rank by inode count instead of bytes\n"
+        "  sd . -a               the full report: quota, /proc scan, reconciliation\n"
+        "  sd -Q                 just the quota table and the age of its figures\n"
+        "  sd -D                 unlinked-but-open space held on this node\n"
+        "  sd . -a --settle-wait 60   measure how far a fresh tree is still drifting\n"
         "\n"
         "slurmdisk agrees with `du -s --block-size=1` byte-for-byte on the\n"
         "same tree. It is faster, not more accurate.",
@@ -112,6 +113,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not cross filesystem boundaries; use this when "
         "reconciling against a per-filesystem quota",
+    )
+    p.add_argument(
+        "-a",
+        "--full",
+        action="store_true",
+        help="the whole diagnostic report: quota with its snapshot age, the "
+        "unlinked-but-open scan, and the reconciliation between them. Off by "
+        "default because `sd .` is asked how big a tree is, not for an audit.",
+    )
+    p.add_argument(
+        "-i",
+        "--inodes",
+        action="store_true",
+        help="rank directories by inode count instead of bytes",
     )
     p.add_argument(
         "-Q",
@@ -228,12 +243,19 @@ def cmd_walk(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     _warn_threads(args.threads)
 
+    # --json is for tooling, which wants the complete document rather than
+    # whichever subset the terminal view happens to show.
+    full = args.full or args.as_json
+
     snap = None
-    if not args.no_quota:
+    # Both of these are work the default view does not use: the quota backend
+    # shells out to a site wrapper that can take seconds, and the /proc sweep
+    # walks every pid on the node.
+    if full and not args.no_quota:
         snap = quotamod.read_best(paths[0], args.quota_timeout)
 
     scan = None
-    if not args.no_deleted:
+    if full and not args.no_deleted:
         scan = deletedmod.scan()
 
     docs = []
@@ -273,6 +295,8 @@ def cmd_walk(args: argparse.Namespace) -> int:
 
         if args.as_json:
             docs.append(report.to_json(res, settle, snap, path_scan, recs, args.top))
+        elif not full:
+            print("\n".join(report.render_compact(res, settle, args.top, args.inodes)))
         else:
             lines = []  # type: List[str]
             if snap is not None:

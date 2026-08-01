@@ -114,6 +114,57 @@ def render_quota(snap: QuotaSnapshot, paths: Optional[List[str]] = None) -> List
     return out
 
 
+def render_compact(res: WalkResult, settle: SettleCheck, top: int, by_inodes: bool) -> List[str]:
+    """The default view: how big is this tree, and what is big inside it.
+
+    That is the question ``sd .`` is asked, and answering it should look like
+    ``du -sh`` with a breakdown -- not like a diagnostic report. Everything this
+    tool knows that ``du`` does not (quota and its age, the reconciliation, the
+    /proc scan) is real work the user did not ask for here, costs latency, and
+    lives behind ``--full``.
+
+    Only warnings that change what the number *means* survive into this view: an
+    incomplete walk, or drift that was actually measured. A caveat that fires on
+    every run is not a warning, it is furniture.
+    """
+    out = [
+        "{}   {}   {} inodes   {:.2f}s".format(
+            res.root, human_bytes(res.size), human_count(res.inodes), res.elapsed
+        )
+    ]
+
+    warn = []  # type: List[str]
+    if not res.complete:
+        detail = []
+        if res.unreadable_dirs:
+            detail.append("{} dirs unreadable".format(len(res.unreadable_dirs)))
+        if res.unstatable:
+            detail.append("{} entries unstatable".format(res.unstatable))
+        if res.partial:
+            detail.append("interrupted")
+        warn.append("! this is a FLOOR, not a total: {}".format(", ".join(detail)))
+    if settle.moved:
+        warn.append(
+            "! still settling: re-stat {:.0f}s later found {} {} allocated".format(
+                settle.gap,
+                human_bytes(abs(settle.drift)),
+                "more" if settle.drift > 0 else "less",
+            )
+        )
+    out.extend(warn)
+
+    ranked = res.top_dirs(top, "files" if by_inodes else "size")
+    if ranked:
+        out.append("")
+        for a in ranked:
+            out.append(
+                "  {:>10}  {:>9} inodes  {}".format(
+                    human_bytes(a.size), human_count(a.inodes), os.path.relpath(a.path, res.root)
+                )
+            )
+    return out
+
+
 def render_walk(
     res: WalkResult,
     settle: SettleCheck,

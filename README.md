@@ -4,11 +4,25 @@ Where your bytes and inodes are, what `du` cannot see, and how old the quota
 number you are comparing against actually is.
 
 ```
-sd .                    # quota + walk + reconciliation for the current directory
-sd ~/scratch            # ... for a specific tree
-sd --quota-only         # just the quota table, and the age of its figures
-sd --deleted-only       # space held by unlinked-but-open files
-sd . --json             # for tooling
+$ sd .
+/home/researcher   700.6 MiB   21,526 inodes   0.18s
+
+    70.6 MiB        283 inodes  notebooks
+    46.3 MiB      2,581 inodes  project-alpha/midtraining
+    43.7 MiB      2,328 inodes  slurmwatch/.git
+    ...
+```
+
+That is the default, and it is all the default does: how big is this tree, and
+what is big inside it. Everything below is behind a flag, because none of it is
+needed to answer that question and all of it costs time.
+
+```
+sd . -i        # rank by inode count instead of bytes
+sd . -a        # the full report: quota + /proc scan + reconciliation
+sd -Q          # just the quota table, and the age of its figures
+sd -D          # space held by unlinked-but-open files
+sd . --json    # the complete document, for tooling
 ```
 
 No dependencies, no root, no daemon, no config. Stdlib only, down to the
@@ -217,6 +231,8 @@ The only positional argument is a path. Modes are flags, not subcommands:
 `quota`, `walk` and `deleted` are all ordinary directory names, so `sd deleted`
 must mean "measure ./deleted" and nothing else.
 
+-a, --full               quota + /proc scan + reconciliation
+-i, --inodes             rank directories by inode count, not bytes
 -Q, --quota-only         quota table only; walk nothing
 -D, --deleted-only       unlinked-but-open space only
 -t, --threads N          walk concurrency, clamped to 16 (default 8)

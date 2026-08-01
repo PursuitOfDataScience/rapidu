@@ -35,11 +35,12 @@ def test_a_directory_named_like_an_old_subcommand_is_measured(tmp_path, capsys):
         cwd = os.getcwd()
         os.chdir(str(tmp_path))
         try:
-            cli.main([name, "--no-quota", "--no-deleted"])
+            cli.main([name])
         finally:
             os.chdir(cwd)
         out = capsys.readouterr().out
-        assert "WALK" in out and name in out, name
+        assert name in out, name
+        assert "inodes" in out, name
         assert "UNLINKED" not in out, "%s was taken as a subcommand" % name
 
 
@@ -77,10 +78,41 @@ def test_removed_subcommand_word_gets_a_pointer(tmp_path, capsys):
     assert "--quota-only" in err
 
 
-def test_bare_path_runs_the_full_report(small_tree, capsys):
-    cli.main([small_tree, "--no-quota", "--no-deleted"])
+def test_default_answers_how_big_and_nothing_else(small_tree, capsys):
+    """`sd .` was asked a size question. It must not run an audit.
+
+    The quota backend shells out to a site wrapper and the /proc sweep visits
+    every pid on the node; neither is used to answer "how big is this tree".
+    """
+    cli.main([small_tree])
+    out = capsys.readouterr().out
+    assert small_tree in out
+    # Byte totals are not asserted: on GPFS a just-written fixture reports
+    # delayed-allocation blocks, which is the effect this package reports
+    # elsewhere and has no business making a CLI test flaky.
+    assert "inodes" in out
+    for section in ("QUOTA", "WALK", "RECONCILIATION", "UNLINKED", "SETTLING"):
+        assert section not in out, section
+    # Headline plus a blank line plus one line per subdirectory.
+    assert len(out.strip().splitlines()) <= 6
+
+
+def test_full_flag_restores_the_whole_report(small_tree, capsys):
+    cli.main([small_tree, "-a", "--no-quota", "--no-deleted"])
     out = capsys.readouterr().out
     assert "WALK" in out
+
+
+def test_inodes_flag_switches_the_ranking(small_tree, capsys):
+    cli.main([small_tree, "-i"])
+    assert small_tree in capsys.readouterr().out
+
+
+def test_json_implies_the_full_document(small_tree, capsys):
+    """Tooling wants everything, not whichever subset the terminal view shows."""
+    cli.main([small_tree, "--json", "--no-quota", "--no-deleted"])
+    doc = json.loads(capsys.readouterr().out)
+    assert "walk" in doc and "settling" in doc
 
 
 def test_no_density_ranking_section(small_tree, capsys):
@@ -89,22 +121,21 @@ def test_no_density_ranking_section(small_tree, capsys):
     It nominated a 260 KiB .git directory as the "best candidate to pack" ahead
     of one holding ten times the inodes. Density is a column now, not a ranking.
     """
-    cli.main([small_tree, "--no-quota", "--no-deleted", "-n", "5"])
+    cli.main([small_tree, "-a", "--no-quota", "--no-deleted", "-n", "5"])
     out = capsys.readouterr().out
     assert "DENSEST" not in out
 
 
 def test_clean_deleted_scan_is_one_line(small_tree, capsys):
-    """A null result must not cost seven lines of scope caveats."""
-    cli.main([small_tree, "--no-quota"])
+    """In the full report, a null result must not cost seven lines of caveats."""
+    cli.main([small_tree, "-a", "--no-quota"])
     out = capsys.readouterr().out
     assert "UNLINKED BUT STILL OPEN" not in out
-    assert "unlinked-but-open" in out
     assert len([ln for ln in out.splitlines() if "unlinked-but-open" in ln]) == 1
 
 
 def test_no_quota_skips_the_quota_section(small_tree, capsys):
-    cli.main([small_tree, "--no-quota", "--no-deleted"])
+    cli.main([small_tree, "-a", "--no-quota", "--no-deleted"])
     assert "QUOTA" not in capsys.readouterr().out
 
 
@@ -140,7 +171,7 @@ def test_file_argument_rejected(tmp_path, capsys):
 
 
 def test_thread_clamp_warns(small_tree, capsys):
-    cli.main(["walk", small_tree, "--threads", "999", "--no-deleted"])
+    cli.main([small_tree, "--threads", "999"])
     assert "clamped" in capsys.readouterr().err
 
 
