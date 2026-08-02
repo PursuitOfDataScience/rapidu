@@ -556,7 +556,15 @@ def main():
         if transcript.startswith("# "):
             head, _, transcript = transcript.partition("\n")
             label = head[2:].strip()
-        scenes.append((label, transcript))
+        # The capture was taken on a real filesystem, so its paths go through
+        # the same redaction as the live scenes -- label included, since the
+        # label is the command line and the command line names the tree.
+        scenes.append(
+            (
+                anonymize(label, tree, scratch),
+                anonymize(transcript, tree, scratch),
+            )
+        )
 
     rows = max(len(to_cells(out)) + 3 for _, out in scenes) + 1
     painter = Painter(rows)

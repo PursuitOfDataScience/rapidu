@@ -1,7 +1,7 @@
 <h1 align="center">rapi<code>DU</code></h1>
 
 <p align="center">
-  <strong>A rapid <code>du</code> that tells you <em>why</em>.</strong><br>
+  <strong>A rapid <code>du</code> that tells you <em>why</em> — 5.2x faster, to the same byte.</strong><br>
   <sub>Where your bytes and inodes went, what <code>du</code> cannot see, and how old the quota number you are arguing with really is.</sub>
 </p>
 
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo.gif" width="900" alt="rapiDU walking a project tree and explaining that it occupies 266.8 MiB to hold 75.5 MiB of data, ranking the same tree by file count, printing a quota table with the age of its snapshot, and finding 512 MiB held by a deleted-but-open file descriptor.">
+  <img src="assets/demo.gif" width="900" alt="rapiDU walking a project tree and explaining that it occupies 266.8 MiB to hold 75.5 MiB of data, ranking the same tree by file count, printing a quota table with the age of its snapshot, finding 512 MiB held by a deleted-but-open file descriptor, and catching a freshly written GPFS tree that loses 224 MiB while it settles.">
 </p>
 
 ```bash
@@ -39,12 +39,19 @@ pip install git+https://github.com/PursuitOfDataScience/rapidu   # or packaged
 
 ---
 
-## It is not more accurate than `du`
+## 5.2x faster than `du`, and identical to the byte
 
-A correct walker agrees with `du -s --block-size=1` byte-for-byte, and any claim
-to beat it is a bug. On a test tree with hard links, a sparse file and 12-deep
-nesting, `du` and rapidu at 1/2/4/8/16 threads all return **655,474,688 B** —
-a test in this repo, not an aspiration.
+Cold, on GPFS, on trees big enough that you actually wait:
+
+| tree | files | `du` | `rdu` | |
+|---|---|---|---|---|
+| a package cache | 792,225 | 168.08s | 25.40s | **6.6x** |
+| a whole project directory | 1,686,589 | 298.46s | 57.43s | **5.2x** |
+
+And it returns the *same number*. On a test tree with hard links, a sparse file
+and 12-deep nesting, `du -s --block-size=1` and rapiDU at 1/2/4/8/16 threads all
+return **655,474,688 B** — a test in this repo, not an aspiration. A faster
+answer is only worth having if it is the same answer.
 
 `du` is right about bytes. What it cannot tell you is **when** it is right.
 
@@ -114,29 +121,24 @@ directory ahead of one holding ten times the inodes.
 ### 5. Why the number is that big, when the files add up to far less
 
 Every file smaller than the filesystem's allocation unit pays for the whole
-unit. On Midway3 scratch that unit is **64 KiB**; on `/home` and `/project` it is
-**16 KiB**. So 3,000 files of 8 KiB hold 23.6 MiB and occupy 187.6 MiB, and `du`
-reports `188M` with nothing attached to it:
+unit — 64 KiB on Midway3 scratch, 16 KiB on `/home` and `/project`. So 3,000
+files of 8 KiB hold 23.6 MiB and occupy 187.6 MiB, and `du` says `188M`:
 
 ```
- 187.6 MiB   /scratch/midway3/$USER/dataset
-             3,001 files  ·  3,000 entries  ·  0.01s
-
 ! 187.6 MiB allocated for 23.6 MiB of data — 8.0x. Your quota is charged the first number.
     3,000 files average 8.0 KiB against a 64.0 KiB allocation unit, so they
-    occupy 164.1 MiB of padding. Packing them (tar, squashfs, a single archive)
-    returns it.
+    occupy 164.1 MiB of padding. Packing them (tar, squashfs) returns it.
 ```
 
-**The unit is measured, not assumed.** `statvfs` cannot supply it — it reports
-the 4 MiB GPFS *block* on `/project` while files actually allocate in 16 KiB
-subblocks, a 256x error in the direction that makes small files look free. It is
-read off the tree instead, from the allocations the files actually landed on.
+**The unit is measured, not assumed** — read off the allocations the files
+actually landed on. `statvfs` cannot supply it: it reports the 4 MiB GPFS
+*block* where files allocate in 16 KiB subblocks, a 256x error in the direction
+that makes small files look free.
 
 It runs the other way too, and that is *not* an error: below ~3.5 KiB GPFS keeps
-the data in the inode, so the same filesystem stores 8.7 MiB in 1.6 MiB. There
-the report says bytes are nearly free and points at the inode count instead,
-because that is the quota that will stop you.
+data in the inode, so the same filesystem stores 8.7 MiB in 1.6 MiB. There the
+report says bytes are nearly free and points at the inode count, which is the
+quota that will actually stop you.
 
 ---
 
@@ -153,22 +155,16 @@ because that is the quota that will stop you.
 - **The bar is share of the whole tree**, so it always agrees with the `share`
   column beside it. Scaled to the largest row instead — as most disk tools do —
   the top bar is full on every listing ever printed, which tells you nothing and
-  contradicts the "31.9%" next to it.
-- **The track is the whole tree**, drawn on every row. A bar that trails off into
-  blank space reserves the column and draws nothing in most of it, leaving no
-  common edge to measure a short bar against.
+  contradicts the "31.9%" next to it. The track is that whole tree, drawn on
+  every row so a short bar has an edge to be measured against.
 - **The hatched row is the remainder** — everything not listed, at its true
-  length. It is a fifth of this tree, so it is not something to hide, but it is
-  many directories rather than one and must not be drawn as though it were one.
-- **Colour is rank**, cool to warm, assigned across the listing rather than row
-  by row, so two rows share a tone only when they are genuinely the same size.
-- **The column you sorted by is the one in colour**, and its header is bold.
-  Under `-i` the `files` column takes the tone and `size` steps back, so a
-  ranking by inodes cannot be mistaken for a ranking by bytes.
-- **`path`, not `directory`**: plain files are ranked here too. Three 63 MiB
-  `.db` files in a home directory are a quarter of it.
-- Sizes are cumulative subtree totals, so any row agrees with `du -s` on that
-  path.
+  length. A fifth of this tree is not something to hide, but it is many
+  directories and must not be drawn as though it were one.
+- **Colour is rank**, cool to warm, assigned across the listing so two rows share
+  a tone only when they are genuinely the same size. The column you sorted by is
+  the one wearing it: under `-i`, `files` takes the tone and `size` steps back.
+- **`path`, not `directory`**: plain files are ranked here too, and sizes are
+  cumulative subtree totals, so any row agrees with `du -s` on that path.
 
 ## The reconciliation, and when it refuses to run
 
@@ -199,89 +195,23 @@ subtree of a larger quota'd tree is reported as a share, not a discrepancy.
   ambiguous inferences are dropped rather than guessed.
 - **Off-site, fields go absent, not zero** — each prints `n/a` with a reason.
 
-## Speed
+## Speed, and its ceiling
 
-**Bytes do not predict how long a walk takes; files do.**
+**Bytes do not predict how long a walk takes; files do.** `stat` is ~90% of a
+walk, so `rdu -c` — counts only, no `stat` — is **8x** faster again when the
+question is "how many files", not "how many bytes".
 
-| tree | size | files | `du` |
-|---|---|---|---|
-| a model cache | 161.7 GiB | 3,286 | 0.44s |
-| a package/build cache | 350.0 GiB | 781,772 | 162.25s |
-
-Twice the bytes, **370x the wall time.**
-
-So the speedup is only worth quoting where there is something to wait for. On a
-few thousand cached files nothing waits — both tools finish in hundredths of a
-second, and rapidu pays 0.03s of interpreter start before it reads a single
-directory, which `du` does not. On a tree big enough to make you wait:
-
-| tree, cold | files | `du` | `rdu` | |
-|---|---|---|---|---|
-| a package cache | 792,225 | 168.08s | 25.40s | **6.6x** |
-| a whole project directory | 1,686,589 | 298.46s | 57.43s | **5.2x** |
-
-Measured against itself on those 782k GPFS files, `stat` is 90% of it:
-
-```
-scandir + stat (what a sizing walk does)   27.09s     28,900 files/s
-scandir alone, no stat                      2.99s    261,800 files/s
-this package's own bookkeeping                          +0.5%
-```
-
-Both obvious levers are dead ends (`dir_fd` instead of full paths: no
-difference; processes instead of threads: **35% worse**, which puts the limit in
-the GPFS client per node). **~29,000 stats/s is this filesystem's ceiling.** The
+**~29,000 stats/s is the filesystem's ceiling, and nothing gets past it.** More
+threads do not: 8 and 16 tie, 32 is worse, 128 is much worse. Nor do more
+processes — two of them move the same total as one, so the cap is the node. The
 pool caps at 16 and defaults to 8, which is also the polite setting: this walk is
 metadata load on a shared filesystem, the exact sin the tool exists to diagnose.
-
-Re-measured on a 1.69M-inode tree, the ceiling holds in every direction:
-
-| | 8 threads | 16 | 32 | 64 | 128 |
-|---|---|---|---|---|---|
-| wall | 58.3s | 57.7s | 67.2s | 75.7s | 82.0s |
-
-Two processes of 8 threads each move the same total as one — so the cap is the
-node, not the GIL. The client's `maxFilesToCache` is **128k against 1.69M
-inodes**, which is *why*: the tree is 13x the cache, every walk is cold, and no
-amount of concurrency makes a cold GPFS lookup cheaper.
-
-### What the inner loop is still worth
-
-Not the wall clock on a cold tree — but that is not the only tree anyone walks.
-The ancestor keys every inode charges are resolved once per directory instead of
-rebuilt per file, `S_ISDIR` and the uid/dev tallies are inlined, and
-`notify_all` no longer wakes every idle worker on each of ~190k directories:
-
-```
-1.69M inodes, cold GPFS   58.5s -> 58.2s    unchanged: the filesystem is the wall
-                          CPU 5.0s -> 3.9s  23% less, on a 6-core shared login node
-cached trees, 15k-136k inodes               1.09x - 1.16x faster
-```
-
-Measured end to end (the whole command, not just the walk), best of nine runs
-with the two versions strictly interleaved so both see the same cache state:
-
-| tree | before | after | |
-|---|---|---|---|
-| 15,644 inodes | 0.119s | 0.105s | 1.14x |
-| 33,688 inodes | 0.249s | 0.220s | 1.13x |
-| 135,826 inodes | 0.915s | 0.829s | 1.10x |
-
-**So: ~1.1x on anything that fits the client cache, 23% less CPU everywhere, and
-identical output** — byte-for-byte against `du` and against the previous walker
-across 48 tree/depth/mode combinations. The CPU figure is the one that matters on
-a login node you are sharing with a dozen people.
-
-The one real speedup is not calling `stat` at all — `d_type` from `getdents`
-already separates directories from everything else, which is all a count needs.
-`rdu -c` measured **8x** faster on both a 782k-file tree (27.3s → 3.4s) and a
-1.7M-file one (55s → 6.9s).
 
 > **Prior art, stated because it is owed.** The `du` comparison is against a
 > single-threaded 1971 program — *not* the state of the art. Parallel walkers
 > exist (`dust`, `gdu`, `diskus`, `duc`) and, given the ceiling above, any of
-> them will land within a few percent on the same filesystem. **Speed is table
-> stakes here; the quota-age, settling and deleted-fd reporting are the product.**
+> them will land within a few percent on the same filesystem. **Speed is the
+> table stakes; the quota-age, settling and deleted-fd reporting are the product.**
 
 ## Behaviour worth knowing
 
