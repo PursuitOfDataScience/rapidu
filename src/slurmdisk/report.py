@@ -106,14 +106,15 @@ def render_quota(
 def render_entries(
     res: WalkResult, top: int, by_inodes: bool, style: ui.Style, indent: str = "  "
 ) -> List[str]:
-    """The ranked table: size, proportional bar, share of tree, inodes, name.
+    """The ranked table: size, proportional bar, share of tree, inodes, path.
 
     Sizes are cumulative subtree totals, so any row agrees with ``du -s`` on that
     path. Plain files appear alongside directories -- three 63 MiB ``.db`` files
     in a home directory are a quarter of it, and a directory-only listing cannot
-    show them.
+    show them. That is also why the last column is headed ``path`` and not
+    ``directory``: not everything in it is one.
 
-    The name comes last and is never truncated: it is the only variable-width
+    The path comes last and is never truncated: it is the only variable-width
     column, and putting it at the end keeps every numeric column aligned no
     matter how deep the paths go. It is also the order ``du`` prints.
     """
@@ -146,11 +147,6 @@ def render_entries(
     def metric(e):
         return e.inodes if (by_inodes or res.count_only) else e.size
 
-    # Scaled to the largest listed entry, not to the total: the bar exists to
-    # discriminate between the rows on screen. The remainder row is deliberately
-    # left barless -- it is an aggregate of things not shown, and giving it the
-    # longest bar would make "everything else" look like the top offender.
-    peak = max(metric(e) for e in ranked) or 1
     # A share needs a denominator. After an interrupt there is no tree total, so
     # the column is blanked rather than filled with a fraction of an accident.
     if res.partial:
@@ -160,36 +156,54 @@ def render_entries(
     else:
         total = res.size or 1
 
+    # The bar is scaled to the *total*, so a full track is the whole tree and the
+    # bar says exactly what the share column beside it says. It used to be scaled
+    # to the largest listed row, which made the top row's bar full on every
+    # listing ever printed -- 31.9% of a tree drawn as a completely full bar,
+    # directly left of the text "31.9%". A mark that is identical on every run
+    # carries no information, and here it actively contradicted the number.
+    #
+    # Only when there is no total -- an interrupted walk -- does it fall back to
+    # ranking against the largest row, and there the share column is already
+    # blank, so nothing disagrees with anything.
+    peak = max(metric(e) for e in ranked) or 1
+    scale = float(total) if total else float(peak)
+
+    # Colour is assigned across the listing rather than row by row, so that two
+    # rows share a tone only when they are genuinely the same size.
+    tones = style.heat_scale([metric(e) for e in ranked])
+
     rows = [
         _entry_line(
             os.path.relpath(e.path, res.root) + ("/" if e.is_dir else ""),
             e.size,
             e.inodes,
             metric(e),
-            peak,
+            metric(e) / scale,
             total,
+            tone,
             style,
             indent,
-            is_dir=e.is_dir,
             size_hidden=res.count_only,
         )
-        for e in ranked
+        for e, tone in zip(ranked, tones)
     ]
     if show_rest:
         # Say how to see them. A truncated listing that does not tell you it is
         # truncated, or how to expand it, is just missing data.
         label = "({} more {} use -n 0 for all)".format(human_count(hidden), ui.dash(style))
+        rest_value = rest_inodes if (by_inodes or res.count_only) else rest_size
         rows.append(
             _entry_line(
                 label,
                 rest_size,
                 rest_inodes,
-                rest_inodes if by_inodes else rest_size,
-                None,
+                rest_value,
+                rest_value / scale,
                 total,
+                "dim",
                 style,
                 indent,
-                is_dir=False,
                 aggregate=True,
                 size_hidden=res.count_only,
             )
@@ -205,48 +219,37 @@ def _entry_line(
     size: int,
     inodes: int,
     value: int,
-    peak: Optional[int],
+    fraction: float,
     total: int,
+    tone: str,
     style: ui.Style,
     indent: str,
-    is_dir: bool,
     aggregate: bool = False,
     size_hidden: bool = False,
 ) -> str:
-    """``value`` is the ranked metric; it drives the bar, the share and the tone.
+    """One row. ``fraction`` drives the bar; ``tone`` is assigned by the listing.
 
-    The tone is a function of share-of-tree, so the colour of a row says how much
-    it matters. Size and bar carry the same tone: whichever column the eye lands
-    on gives the same answer.
+    Size, bar, share and path all carry the same tone, so whichever column the
+    eye lands on gives the same answer. The path is included in that on purpose:
+    painting every directory one flat blue made the whole right-hand column a
+    single colour, which is the one place the reader is actually looking.
 
     Files are *not* dimmed. A 63 MiB file that is 9% of a home directory is more
     worth looking at than a 3% directory, and greying it out said the opposite.
-    Directories are marked by a trailing slash and a blue name, the way ``ls``
-    does it -- shape, not emphasis.
+    Directories are marked the way ``ls -p`` marks them, with a trailing slash --
+    shape, not colour, so colour is left free to mean size.
     """
-    # Colour is indexed by the same quantity the bar length encodes -- this row
-    # against the largest row -- so the two always agree and the full ramp is
-    # used on every listing. Share-of-total keeps its own column.
-    rel = (value / float(peak)) if peak else 0.0
-    tone = "dim" if aggregate else style.heat(rel)
-    bar = " " * _BAR_W if peak is None else ui.bar(value / float(peak), _BAR_W, style, accent=tone)
+    bar = ui.bar(fraction, _BAR_W, style, accent=tone, track=False)
     # In count mode there are no sizes at all, so the column is omitted rather
     # than left as ten blank characters the eye has to step over.
     size_cell = "" if size_hidden else style.paint(human_bytes(size).rjust(10), tone) + "  "
-    name_style = []  # type: List[str]
-    if aggregate:
-        name_style = ["dim"]
-    elif is_dir:
-        name_style = ["bold_blue"]
     return "{}{}{}  {}  {}  {}".format(
         indent,
         size_cell,
         bar,
-        style.paint(
-            "{:>6}".format(pct(value, total) if total else ""), "dim" if aggregate else tone
-        ),
+        style.paint("{:>6}".format(pct(value, total) if total else ""), tone),
         style.paint("{:>9}".format(human_count(inodes)), "dim"),
-        style.paint(name, *name_style),
+        style.paint(name, *(["dim"] if aggregate else [tone])),
     )
 
 
@@ -268,7 +271,9 @@ def _entries_rule(style: ui.Style, names: List[str], indent: str = "  ") -> str:
     return style.paint(indent + glyph * max(20, span), "dim")
 
 
-def _entries_header(style: ui.Style, indent: str = "  ", size_label: str = "size") -> str:
+def _entries_header(
+    style: ui.Style, indent: str = "  ", size_label: str = "size", bar_label: str = "of tree"
+) -> str:
     """Column labels.
 
     The count column is headed ``files``, not ``inodes``. "inode" is the correct
@@ -277,15 +282,19 @@ def _entries_header(style: ui.Style, indent: str = "  ", size_label: str = "size
     them files (``files (user) 21,553 / 300,000``), so using the quota's own word
     lets the two numbers be compared without a translation step. Directories are
     included in the count, exactly as the quota includes them.
+
+    The last column is ``path``, not ``name`` and not ``directory``. ``name`` said
+    nothing -- every column is the name of something -- and ``directory`` would be
+    a lie, because plain files are ranked here too.
     """
     head = "" if not size_label else style.paint("{:>10}".format(size_label), "dim") + "  "
     return "{}{}{}  {}  {}  {}".format(
         indent,
         head,
-        " " * _BAR_W,
+        style.paint("{:<{}}".format(bar_label, _BAR_W), "dim"),
         style.paint("{:>6}".format("share"), "dim"),
         style.paint("{:>9}".format("files"), "dim"),
-        style.paint("name", "dim"),
+        style.paint("path", "dim"),
     )
 
 
@@ -378,7 +387,15 @@ def render_compact(
     body = render_entries(res, top, by_inodes, style)
     if body:
         out.append(_entries_rule(style, _entry_names(res, top, by_inodes)))
-        out.append(_entries_header(style, size_label="" if res.count_only else "size"))
+        out.append(
+            _entries_header(
+                style,
+                size_label="" if res.count_only else "size",
+                # An interrupted walk has no total to be a share of, so the bar
+                # falls back to ranking against the largest row and says so.
+                bar_label="of largest" if res.partial else "of tree",
+            )
+        )
         out.extend(body)
     return out
 
@@ -513,7 +530,15 @@ def render_walk(
     body = render_entries(res, top, by_inodes, style)
     if body:
         out.append(_entries_rule(style, _entry_names(res, top, by_inodes)))
-        out.append(_entries_header(style, size_label="" if res.count_only else "size"))
+        out.append(
+            _entries_header(
+                style,
+                size_label="" if res.count_only else "size",
+                # An interrupted walk has no total to be a share of, so the bar
+                # falls back to ranking against the largest row and says so.
+                bar_label="of largest" if res.partial else "of tree",
+            )
+        )
         out.extend(body)
     return out
 

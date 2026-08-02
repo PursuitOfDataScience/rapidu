@@ -45,9 +45,40 @@ _LEGACY_COMMANDS = {
     "deleted": "--deleted-only",
 }
 
+_COLOR_MODES = ("auto", "always", "never")
+
+
+class _Parser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` that colours its own ``--help``.
+
+    The colour goes on after argparse has finished laying the text out, not
+    before -- see :func:`slurmdisk.ui.colorize_help` for why. ``style`` is set by
+    :func:`main` before parsing, because ``-h`` is handled *during* parsing and
+    so there is no parsed ``--color`` to consult by the time help is printed.
+    """
+
+    style = None  # type: Optional[ui.Style]
+
+    def format_help(self) -> str:
+        return ui.colorize_help(super().format_help(), self.style or ui.resolve_style("auto"))
+
+
+def _peek_color(argv: List[str]) -> str:
+    """``--color`` as written on the command line, before argparse sees it."""
+    for i, arg in enumerate(argv):
+        if arg.startswith("--color="):
+            mode = arg.split("=", 1)[1]
+        elif arg == "--color" and i + 1 < len(argv):
+            mode = argv[i + 1]
+        else:
+            continue
+        if mode in _COLOR_MODES:
+            return mode
+    return "auto"
+
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="slurmdisk",
         usage="sd [PATH ...] [options]",
         description="Where your bytes and inodes are, what du cannot see, and "
@@ -77,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--threads",
         type=int,
         default=walkmod.DEFAULT_THREADS,
+        metavar="N",
         help="walk concurrency, clamped to {} (default: %(default)s). "
         "Past the cap the walk measurably slows down and the "
         "metadata load stops being polite.".format(walkmod.MAX_THREADS),
@@ -86,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--depth",
         type=int,
         default=1,
+        metavar="N",
         help="how deep to break the tree down. 1 lists the immediate children, "
         "like `du -d1` (default: %(default)s)",
     )
@@ -94,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--top",
         type=int,
         default=10,
+        metavar="N",
         help="how many directories to list per ranking (default: %(default)s)",
     )
     p.add_argument(
@@ -193,10 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--color",
-        choices=("auto", "always", "never"),
+        choices=_COLOR_MODES,
         default="auto",
-        help="colourise output. auto = only when stdout is a terminal, and never "
-        "when NO_COLOR is set (default: %(default)s)",
+        metavar="WHEN",
+        help="auto | always | never. auto colourises only when stdout is a "
+        "terminal, and never when NO_COLOR is set (default: %(default)s)",
     )
     p.add_argument(
         "--ascii", action="store_true", help="draw bars with ASCII instead of block glyphs"
@@ -421,8 +456,10 @@ def cmd_walk(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
     parser = build_parser()
-    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    parser.style = ui.resolve_style(_peek_color(argv), "--ascii" in argv)  # type: ignore[attr-defined]
+    args = parser.parse_args(argv)
 
     if args.version:
         from . import __version__

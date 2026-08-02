@@ -191,6 +191,13 @@ jobs:
           if grep -qP '\x1b\[' nocolor.txt; then
             echo "::error::NO_COLOR was ignored"; exit 1
           fi
+          # --help is painted after argparse has laid it out, which is a second
+          # place colour can leak from -- and `sd --help > usage.txt` is exactly
+          # what someone does before pasting it into a ticket.
+          sd --help > help.txt
+          if grep -qP '\x1b\[' help.txt; then
+            echo "::error::colour escapes leaked into redirected --help"; exit 1
+          fi
 
       # A -c walk never calls stat, so it has no bytes. Reconciling that against
       # a live quota once fabricated an UNEXPLAINED GAP the size of the whole

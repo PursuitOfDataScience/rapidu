@@ -6,10 +6,11 @@ it was unreachable dead code once -- these tests keep it wired in.
 """
 
 import os
+import re
 
 from slurmdisk import report, ui
 from slurmdisk.deleted import DeletedScan
-from slurmdisk.walk import SettleCheck, WalkResult
+from slurmdisk.walk import Entry, SettleCheck, WalkResult
 
 PLAIN = ui.resolve_style("never")
 
@@ -117,6 +118,75 @@ def test_the_compact_view_keeps_the_one_line_warning():
     )
     assert "still settling" in out
     assert "SETTLING" not in out
+
+
+# --- the ranked table ------------------------------------------------------
+
+
+def listing(shares, root="/tmp/tree", total=1 << 40):
+    """A walk whose children hold the given shares of the tree."""
+    r = make_walk(root=root, size=total, inodes=100 * len(shares))
+    for i, share in enumerate(shares):
+        e = Entry(os.path.join(root, "child{}".format(i)), True)
+        e.add(int(total * share), 99, 1)
+        r.dir_agg[e.path] = e
+    r.dir_agg[root] = Entry(root, True)
+    r.files = sum(e.files for e in r.dir_agg.values())
+    r.dirs = sum(e.dirs for e in r.dir_agg.values())
+    return r
+
+
+def bar_cells(line, style=PLAIN):
+    return sum(line.count(ch) for ch in (style.bar_chars[0],) + ui._BAR_PARTIALS[1:])
+
+
+def test_the_bar_measures_share_of_the_tree_not_the_row_above_it():
+    """A 32% directory drawn as a full bar, beside the text "32%", is a lie.
+
+    Scaling to the largest listed row also made the top bar full on *every*
+    listing ever printed, so it carried no information at all.
+    """
+    rows = report.render_entries(listing([0.32, 0.28, 0.16]), 10, False, PLAIN)
+    assert "31.9%" in rows[0] or "32.0%" in rows[0]
+    assert bar_cells(rows[0]) <= report._BAR_W // 2, rows[0]
+    # And the ordering the bar shows still matches the ordering the table has.
+    assert bar_cells(rows[0]) > bar_cells(rows[1]) > bar_cells(rows[2])
+
+
+def test_one_directory_holding_the_whole_tree_does_fill_the_bar():
+    rows = report.render_entries(listing([0.99]), 10, False, PLAIN)
+    assert bar_cells(rows[0]) == report._BAR_W
+
+
+def test_the_bar_column_leaves_no_shaded_track_behind_the_rows():
+    rows = report.render_entries(listing([0.32, 0.28]), 10, False, PLAIN)
+    assert PLAIN.bar_chars[1] not in "".join(rows)
+
+
+def test_the_last_column_is_headed_path_because_files_are_listed_too():
+    head = report._entries_header(PLAIN)
+    assert head.endswith("path")
+    assert "name" not in head and "directory" not in head
+
+
+def test_an_interrupted_walk_says_the_bar_is_relative_instead():
+    """With no total there is no share, so the bar cannot claim to be one."""
+    res = listing([0.32, 0.28])
+    res.partial = True
+    res.finished_tops = {os.path.basename(e.path) for e in res.dir_agg.values()}
+    assert "of largest" in report._entries_header(PLAIN, bar_label="of largest")
+    rows = report.render_entries(res, 10, False, PLAIN)
+    assert rows and "%" not in rows[0], rows[0]
+
+
+def test_every_row_of_a_skewed_listing_gets_its_own_colour():
+    """End to end: the colour a reader actually sees, not just the ramp."""
+    style = ui.resolve_style("always")
+    style.depth = 256
+    shares = [0.319, 0.286, 0.166, 0.086, 0.051, 0.032, 0.028, 0.014, 0.006, 0.005]
+    rows = report.render_entries(listing(shares), 10, False, style)
+    tones = [re.findall(r"\033\[38;5;(\d+)m", row)[0] for row in rows]
+    assert len(set(tones)) == len(shares), tones
 
 
 def test_a_clean_deleted_scan_is_one_fact_on_the_walk_line():
