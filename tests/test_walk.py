@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from slurmdisk.walk import MAX_THREADS, TokenBucket, walk
+from rapidu.walk import MAX_THREADS, TokenBucket, walk
 
 
 def _du(path):

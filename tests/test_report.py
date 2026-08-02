@@ -8,9 +8,9 @@ it was unreachable dead code once -- these tests keep it wired in.
 import os
 import re
 
-from slurmdisk import report, ui
-from slurmdisk.deleted import DeletedScan
-from slurmdisk.walk import Entry, SettleCheck, WalkResult
+from rapidu import report, ui
+from rapidu.deleted import DeletedScan
+from rapidu.walk import Entry, SettleCheck, WalkResult
 
 PLAIN = ui.resolve_style("never")
 
@@ -158,9 +158,29 @@ def test_one_directory_holding_the_whole_tree_does_fill_the_bar():
     assert bar_cells(rows[0]) == report._BAR_W
 
 
-def test_the_bar_column_leaves_no_shaded_track_behind_the_rows():
-    rows = report.render_entries(listing([0.32, 0.28]), 10, False, PLAIN)
-    assert PLAIN.bar_chars[1] not in "".join(rows)
+def test_every_bar_is_drawn_as_a_full_width_box():
+    """The bar column is a box of fixed width, filled to the share.
+
+    It used to trail off into blank space, which reserved eighteen columns on
+    every row and drew nothing in most of them: a 4.0% bar and a 14.1% bar had
+    no common edge to be measured against, and the table read as though it had a
+    hole in it. Fill plus track must come to exactly the column width on every
+    row, including the hatched remainder.
+    """
+    fill, empty = PLAIN.bar_chars
+    rows = report.render_entries(listing([0.32, 0.28, 0.04]), 2, False, PLAIN)
+    assert len(rows) == 3, "two ranked rows and the remainder"
+    for row in rows:
+        cells = bar_cells(row) + row.count(empty) + row.count(ui._BAR_HATCH)
+        assert cells == report._BAR_W, (cells, row)
+    # The track is drawn, and it is a different glyph from the fill.
+    assert empty in rows[0] and fill != empty
+
+
+def test_a_full_bar_has_no_track_left_to_draw():
+    rows = report.render_entries(listing([0.999]), 10, False, PLAIN)
+    assert bar_cells(rows[0]) == report._BAR_W
+    assert PLAIN.bar_chars[1] not in rows[0]
 
 
 def test_the_last_column_is_headed_path_because_files_are_listed_too():
@@ -194,4 +214,20 @@ def test_a_clean_deleted_scan_is_one_fact_on_the_walk_line():
     scan.scanned_pids = 27
     scan.unreadable_pids = 1416
     out = "\n".join(report.render_walk(make_walk(), make_settle(), scan=scan, style=PLAIN))
-    assert "no unlinked-but-open space (27 of 1443 pids inspectable)" in out
+    assert "no unlinked-but-open space visible (27 of 1443 pids inspectable" in out
+
+
+def test_an_empty_deleted_scan_does_not_read_as_an_all_clear():
+    """27 of 1443 pids is 1.9% coverage, and none of them are on a compute node.
+
+    The motivating case for the whole section -- a job holding a deleted
+    checkpoint -- is invisible here by construction, so a bare "none found"
+    answers a question the scan did not ask.
+    """
+    scan = DeletedScan()
+    scan.scanned_pids = 27
+    scan.unreadable_pids = 1416
+    out = "\n".join(report.render_deleted(scan, style=PLAIN))
+    assert "not an all-clear" in out
+    assert "compute node" in out
+    assert "27 of 1443" in out

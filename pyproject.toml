@@ -3,7 +3,10 @@ requires = ["setuptools>=64", "wheel", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "slurmdisk"
+# Display name only. PyPI matches case-insensitively (PEP 503), so this
+# installs as `pip install rapidu` just as readily, and the importable
+# module stays lowercase `rapidu` -- the PyYAML/yaml arrangement.
+name = "rapiDU"
 description = "Where your bytes and inodes are, what du cannot see, and how old the quota number is"
 readme = "README.md"
 license = { text = "MIT" }
@@ -14,7 +17,10 @@ license = { text = "MIT" }
 # range GitHub runners still provide.
 requires-python = ">=3.6"
 authors = [{ name = "Youzhi Yu", email = "yuyouzhi666@icloud.com" }]
-keywords = ["hpc", "slurm", "quota", "inodes", "gpfs", "storage", "disk-usage"]
+# No "slurm" here: this package never calls a scheduler. It reads filesystems,
+# quota backends and /proc, and everything it uniquely reports is a property of
+# a quota'd network filesystem rather than of a batch system.
+keywords = ["du", "disk-usage", "quota", "inodes", "gpfs", "lustre", "hpc", "storage"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -34,15 +40,26 @@ dependencies = []
 dynamic = ["version"]
 
 [project.urls]
-Homepage = "https://github.com/PursuitOfDataScience/slurmdisk"
-Repository = "https://github.com/PursuitOfDataScience/slurmdisk.git"
-Documentation = "https://github.com/PursuitOfDataScience/slurmdisk#readme"
-Issues = "https://github.com/PursuitOfDataScience/slurmdisk/issues"
+Homepage = "https://github.com/PursuitOfDataScience/rapidu"
+Repository = "https://github.com/PursuitOfDataScience/rapidu.git"
+Documentation = "https://github.com/PursuitOfDataScience/rapidu#readme"
+Issues = "https://github.com/PursuitOfDataScience/rapidu/issues"
 
 [project.scripts]
-slurmdisk = "slurmdisk.cli:main"
-# "sd" is a short alias for the same entry point, matching slurmwatch's "sw".
-sd = "slurmdisk.cli:main"
+rapidu = "rapidu.cli:main"
+# `rdu` is the short alias, and it is also how the name stays tied to `du`:
+# you type `du`, you type `rdu`.
+#
+# Both names were checked against the registries on 2026-08-02, because
+# Constraint 16 exists. `rapidu` is free on PyPI, npm and crates.io. `rdu` is
+# taken on PyPI by an unrelated chemistry library that ships no console script,
+# and no Debian package installs an `rdu` binary, so the *command* is clear.
+#
+# The previous alias was `sd`, which was wrong: chmln/sd is a widely packaged
+# Rust find-and-replace tool in Debian, Ubuntu, Homebrew and Arch, so on any
+# machine with both installed one of them was silently shadowed depending on
+# PATH order.
+rdu = "rapidu.cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -60,15 +77,15 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["slurmdisk*"]
+include = ["rapidu*"]
 
 [tool.setuptools.package-data]
-slurmdisk = ["py.typed"]
+rapidu = ["py.typed"]
 
 [tool.setuptools_scm]
 # Written at build/install time so the version needs no runtime metadata
 # lookup -- importlib.metadata does not exist on the 3.6 login-node python.
-version_file = "src/slurmdisk/_version.py"
+version_file = "src/rapidu/_version.py"
 # setuptools-scm's stock template opens with `from __future__ import
 # annotations` and annotates with PEP 604 unions, which is a SyntaxError on
 # 3.6 and would break the login-node path this package exists to serve.
@@ -85,8 +102,8 @@ line-length = 100
 select = ["E", "F", "W", "I", "B", "C4", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
-"src/slurmdisk/cli.py" = ["T201"]
-"src/slurmdisk/report.py" = ["T201"]
+"src/rapidu/cli.py" = ["T201"]
+"src/rapidu/report.py" = ["T201"]
 # The deleted-fd tests must hold descriptors open across statements -- that is
 # precisely the condition under test -- so a context manager is not available.
 "tests/test_deleted.py" = ["SIM115"]
@@ -101,7 +118,7 @@ quote-style = "double"
 python_version = "3.10"   # mypy's own floor; the runtime floor is 3.6, guarded by tests/test_py36_compat.py
 ignore_missing_imports = true
 warn_unused_ignores = false
-exclude = "src/slurmdisk/_version.py"
+exclude = "src/rapidu/_version.py"
 
 [tool.pytest.ini_options]
 minversion = "7.0"
@@ -109,7 +126,7 @@ testpaths = ["tests"]
 addopts = "-q"
 
 [tool.coverage.run]
-source = ["slurmdisk"]
+source = ["rapidu"]
 omit = ["*/tests/*", "*/_version.py"]
 
 [tool.coverage.report]

@@ -3,7 +3,7 @@
 import argparse
 import re
 
-from slurmdisk import cli, ui
+from rapidu import cli, ui
 
 ANSI = re.compile(r"\033\[[0-9;]*m")
 

@@ -16,7 +16,7 @@ import pathlib
 
 import pytest
 
-SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmdisk"
+SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "rapidu"
 MIN_FEATURE_VERSION = (3, 6)
 
 
@@ -82,10 +82,10 @@ def test_no_pep604_unions_in_annotations(path):
 
 def test_version_is_a_usable_string():
     """Whatever the build backend wrote, the package must expose a version."""
-    import slurmdisk
+    import rapidu
 
-    assert isinstance(slurmdisk.__version__, str)
-    assert slurmdisk.__version__
+    assert isinstance(rapidu.__version__, str)
+    assert rapidu.__version__
 
 
 @pytest.mark.skipif(
@@ -103,7 +103,7 @@ def test_imports_under_the_system_interpreter():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(SRC.parent)
     proc = subprocess.run(
-        ["/usr/bin/python3", "-c", "import slurmdisk; print(slurmdisk.__version__)"],
+        ["/usr/bin/python3", "-c", "import rapidu; print(rapidu.__version__)"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,

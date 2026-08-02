@@ -5,9 +5,9 @@ import os
 
 import pytest
 
-from slurmdisk import cli
-from slurmdisk import walk as walkmod
-from slurmdisk.fmt import human_bytes, human_count, human_duration, pct
+from rapidu import cli
+from rapidu import walk as walkmod
+from rapidu.fmt import human_bytes, human_count, human_duration, pct
 
 
 @pytest.fixture
@@ -144,7 +144,7 @@ def test_no_quota_skips_the_quota_section(small_tree, capsys):
 def test_json_is_valid_and_shaped(small_tree, capsys):
     cli.main([small_tree, "--no-quota", "--no-deleted", "--json"])
     doc = json.loads(capsys.readouterr().out)
-    assert doc["tool"] == "slurmdisk"
+    assert doc["tool"] == "rapidu"
     assert doc["walk"]["root"] == small_tree
     assert doc["walk"]["files"] == 3
     assert doc["walk"]["complete"] is True

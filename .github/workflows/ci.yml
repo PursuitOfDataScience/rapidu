@@ -66,7 +66,7 @@ jobs:
       # filesystem -- that is what the settling logic is for -- but the fixture
       # trees would take tens of seconds to settle for no added coverage.
       - name: Test with pytest
-        run: python -m pytest --cov=slurmdisk --cov-report=xml --cov-report=term --cov-fail-under=70
+        run: python -m pytest --cov=rapidu --cov-report=xml --cov-report=term --cov-fail-under=70
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
@@ -97,11 +97,11 @@ jobs:
           ln -s /etc/hostname tree/dangling.sym
           sync
 
-      - name: du and slurmdisk must return the same integer
+      - name: du and rapidu must return the same integer
         run: |
           cat > walksize.py <<'PY'
           import sys
-          from slurmdisk.walk import walk
+          from rapidu.walk import walk
           print(walk(sys.argv[1], threads=int(sys.argv[2])).size)
           PY
           # Wait for two consecutive du readings to agree before comparing
@@ -119,9 +119,9 @@ jobs:
           DU=$(du -s --block-size=1 tree | cut -f1)
           for t in 1 2 4 8 16; do
             SD=$(PYTHONPATH=src python3 walksize.py tree "$t")
-            echo "threads=$t  du=$DU  slurmdisk=$SD"
+            echo "threads=$t  du=$DU  rapidu=$SD"
             if [ "$DU" != "$SD" ]; then
-              echo "::error::slurmdisk disagreed with du at $t threads ($SD vs $DU)"
+              echo "::error::rapidu disagreed with du at $t threads ($SD vs $DU)"
               exit 1
             fi
           done
@@ -141,8 +141,8 @@ jobs:
       - name: No pip, no venv, no dependencies -- just PYTHONPATH
         run: |
           cd /tmp && mkdir -p bare/sub && head -c 100000 /dev/urandom > bare/sub/f
-          PYTHONPATH=$GITHUB_WORKSPACE/src python3 -m slurmdisk bare
-          PYTHONPATH=$GITHUB_WORKSPACE/src python3 -m slurmdisk bare --json | python3 -m json.tool > /dev/null
+          PYTHONPATH=$GITHUB_WORKSPACE/src python3 -m rapidu bare
+          PYTHONPATH=$GITHUB_WORKSPACE/src python3 -m rapidu bare --json | python3 -m json.tool > /dev/null
 
       - name: The package imports nothing outside the standard library
         run: |
@@ -151,7 +151,7 @@ jobs:
           stdlib = set(getattr(sys, "stdlib_module_names", ()))
           assert stdlib, "need Python 3.10+ for stdlib_module_names"
           bad = []
-          for path in sorted(pathlib.Path("src/slurmdisk").glob("*.py")):
+          for path in sorted(pathlib.Path("src/rapidu").glob("*.py")):
               for node in ast.walk(ast.parse(path.read_text())):
                   if isinstance(node, ast.Import):
                       names = [a.name.split(".")[0] for a in node.names]
@@ -161,7 +161,7 @@ jobs:
                       continue
                   bad += [(path.name, n) for n in names if n and n not in stdlib]
           assert not bad, "non-stdlib imports: {}".format(bad)
-          print("stdlib only, confirmed across", len(list(pathlib.Path('src/slurmdisk').glob('*.py'))), "modules")
+          print("stdlib only, confirmed across", len(list(pathlib.Path('src/rapidu').glob('*.py'))), "modules")
           PY
 
       # There is no `quota`, no `mmlsquota` and no `lfs` on a GitHub runner, and
@@ -238,17 +238,17 @@ jobs:
         run: |
           python -m venv /tmp/check
           /tmp/check/bin/pip install --quiet dist/*.whl
-          /tmp/check/bin/slurmdisk --version
+          /tmp/check/bin/rapidu --version
           /tmp/check/bin/sd --version          # the short alias must be there too
           /tmp/check/bin/sd /tmp --json | python3 -m json.tool > /dev/null
-          /tmp/check/bin/python -c "import slurmdisk, pathlib; \
-            assert (pathlib.Path(slurmdisk.__file__).parent / 'py.typed').is_file(), \
+          /tmp/check/bin/python -c "import rapidu, pathlib; \
+            assert (pathlib.Path(rapidu.__file__).parent / 'py.typed').is_file(), \
             'py.typed missing from the wheel'"
 
       # The stdlib-only promise is a packaging fact, not just a source fact. The
       # `[dev]` extra legitimately appears here as `; extra == "dev"`, so only
       # unconditional requirements are a failure -- those are what a plain
-      # `pip install slurmdisk` would drag onto a login node.
+      # `pip install rapidu` would drag onto a login node.
       - name: The wheel carries no unconditional dependencies
         run: |
           python -m zipfile -e dist/*.whl /tmp/unpacked

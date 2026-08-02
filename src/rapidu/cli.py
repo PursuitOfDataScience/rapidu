@@ -1,14 +1,14 @@
 """Command line interface.
 
-    sd .                 quota + walk + reconcile + where the inodes are
-    sd ~/scratch         the same, for another tree
-    sd --quota-only      just the quota table, with its snapshot age
-    sd --deleted-only    just the unlinked-but-open scan
+    rdu .                 quota + walk + reconcile + where the inodes are
+    rdu ~/scratch         the same, for another tree
+    rdu --quota-only      just the quota table, with its snapshot age
+    rdu --deleted-only    just the unlinked-but-open scan
 
 **The only positional argument is a path.** An earlier version took bare-word
-subcommands (``sd quota``, ``sd walk``, ``sd deleted``), which is the wrong shape
+subcommands (``rdu quota``, ``rdu walk``, ``rdu deleted``), which is the wrong shape
 for a tool whose primary argument is a directory: ``quota``, ``walk`` and
-``deleted`` are all perfectly ordinary directory names, so ``sd deleted`` was
+``deleted`` are all perfectly ordinary directory names, so ``rdu deleted`` was
 ambiguous between "scan for deleted files" and "measure ./deleted" -- and it
 silently resolved to the former. Modes are flags now, and a path is always a
 path.
@@ -52,7 +52,7 @@ class _Parser(argparse.ArgumentParser):
     """An ``ArgumentParser`` that colours its own ``--help``.
 
     The colour goes on after argparse has finished laying the text out, not
-    before -- see :func:`slurmdisk.ui.colorize_help` for why. ``style`` is set by
+    before -- see :func:`rapidu.ui.colorize_help` for why. ``style`` is set by
     :func:`main` before parsing, because ``-h`` is handled *during* parsing and
     so there is no parsed ``--color`` to consult by the time help is printed.
     """
@@ -79,21 +79,21 @@ def _peek_color(argv: List[str]) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     p = _Parser(
-        prog="slurmdisk",
-        usage="sd [PATH ...] [options]",
+        prog="rapidu",
+        usage="rdu [PATH ...] [options]",
         description="Where your bytes and inodes are, what du cannot see, and "
         "how old the quota number you are comparing against is.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
-        "  sd .                  how big is this tree, and what is big inside it\n"
-        "  sd ~/scratch -n 20    the same, listing 20 directories\n"
-        "  sd . -i               rank by file count instead of bytes\n"
-        "  sd . -a               the full report: quota, /proc scan, reconciliation\n"
-        "  sd -Q                 just the quota table and the age of its figures\n"
-        "  sd -D                 unlinked-but-open space held on this node\n"
-        "  sd . -a --settle-wait 60   measure how far a fresh tree is still drifting\n"
+        "  rdu .                  how big is this tree, and what is big inside it\n"
+        "  rdu ~/scratch -n 20    the same, listing 20 directories\n"
+        "  rdu . -i               rank by file count instead of bytes\n"
+        "  rdu . -a               the full report: quota, /proc scan, reconciliation\n"
+        "  rdu -Q                 just the quota table and the age of its figures\n"
+        "  rdu -D                 unlinked-but-open space held on this node\n"
+        "  rdu . -a --settle-wait 60   measure how far a fresh tree is still drifting\n"
         "\n"
-        "slurmdisk agrees with `du -s --block-size=1` byte-for-byte on the\n"
+        "rapidu agrees with `du -s --block-size=1` byte-for-byte on the\n"
         "same tree. It is faster, not more accurate.",
     )
     p.add_argument(
@@ -156,21 +156,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="the whole diagnostic report: quota with its snapshot age, the "
         "unlinked-but-open scan, and the reconciliation between them. Off by "
-        "default because `sd .` is asked how big a tree is, not for an audit.",
+        "default because `rdu .` is asked how big a tree is, not for an audit.",
     )
     p.add_argument(
         "-c",
         "--count",
         action="store_true",
-        help="count files only, skipping every stat. Measured 8x faster on 782k "
-        "GPFS files (3.4s against 27.3s), because stat is 90%% of a normal "
-        "walk. No sizes, and hard links count once per name.",
+        help="count files only, skipping every stat. Measured {:.0f}x faster on "
+        "1.7M GPFS files (58.7s against 7.1s), because stat is ~90%% of a normal "
+        "walk. No sizes, and hard links count once per name.".format(walkmod.COUNT_SPEEDUP),
     )
     p.add_argument(
         "-i",
         "--inodes",
         action="store_true",
-        help="rank by file count instead of bytes -- what an inode quota limits",
+        help="rank by file count instead of bytes -- what an inode quota limits. "
+        "Add -c to answer it ~{:.0f}x faster, at the cost of counting a hard-linked "
+        "file once per name rather than once per inode.".format(walkmod.COUNT_SPEEDUP),
     )
     p.add_argument(
         "-Q",
@@ -245,19 +247,19 @@ def _resolve_paths(raw: List[str]) -> List[str]:
     for p in raw or [os.getcwd()]:
         ap = os.path.abspath(os.path.expanduser(p))
         if not os.path.exists(ap):
-            sys.stderr.write("slurmdisk: {}: no such path\n".format(p))
+            sys.stderr.write("rapidu: {}: no such path\n".format(p))
             # Only when it is not a real directory: if ./quota exists it is a
             # path, unambiguously, and gets measured like any other.
             if p in _LEGACY_COMMANDS:
                 sys.stderr.write(
-                    "slurmdisk: `{0}` is no longer a subcommand -- the only "
-                    "positional argument is a path. Did you mean `sd {1}`?\n".format(
+                    "rapidu: `{0}` is no longer a subcommand -- the only "
+                    "positional argument is a path. Did you mean `rdu {1}`?\n".format(
                         p, _LEGACY_COMMANDS[p]
                     )
                 )
             continue
         if not os.path.isdir(ap):
-            sys.stderr.write("slurmdisk: {}: not a directory\n".format(p))
+            sys.stderr.write("rapidu: {}: not a directory\n".format(p))
             continue
         out.append(ap)
     return out
@@ -266,12 +268,12 @@ def _resolve_paths(raw: List[str]) -> List[str]:
 def _warn_threads(requested: int) -> None:
     if requested > walkmod.MAX_THREADS:
         sys.stderr.write(
-            "slurmdisk: --threads {} clamped to {}: past the cap the walk is "
+            "rapidu: --threads {} clamped to {}: past the cap the walk is "
             "slower (measured: 32 threads was 31% worse than 16) and the "
             "metadata load stops being polite.\n".format(requested, walkmod.MAX_THREADS)
         )
     elif requested < 1:
-        sys.stderr.write("slurmdisk: --threads {} raised to 1\n".format(requested))
+        sys.stderr.write("rapidu: --threads {} raised to 1\n".format(requested))
 
 
 def cmd_quota(args: argparse.Namespace) -> int:
@@ -350,7 +352,7 @@ def _walk_with_progress(
             )
             stop.wait(ui.PROGRESS_INTERVAL_S)
 
-    painter = threading.Thread(target=paint, name="slurmdisk-progress", daemon=True)
+    painter = threading.Thread(target=paint, name="rapidu-progress", daemon=True)
     painter.start()
     try:
         return walkmod.walk(
@@ -400,7 +402,7 @@ def cmd_walk(args: argparse.Namespace) -> int:
         try:
             res = _walk_with_progress(path, args, style)
         except OSError as exc:
-            sys.stderr.write("slurmdisk: {}\n".format(exc))
+            sys.stderr.write("rapidu: {}\n".format(exc))
             rcode = EXIT_ERROR
             continue
 
@@ -464,7 +466,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.version:
         from . import __version__
 
-        print("slurmdisk {}".format(__version__))
+        print("rapidu {}".format(__version__))
         return EXIT_OK
 
     if args.quota_only and args.deleted_only:
@@ -477,7 +479,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return cmd_deleted(args)
         return cmd_walk(args)
     except KeyboardInterrupt:
-        sys.stderr.write("\nslurmdisk: interrupted\n")
+        sys.stderr.write("\nrapidu: interrupted\n")
         return EXIT_ERROR
     except BrokenPipeError:
         # Downstream closed the pipe (`| head`); nothing left to say.

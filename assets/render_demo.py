@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render the README hero GIF (``assets/demo.gif``).
 
-Runs the **real** ``slurmdisk`` CLI, captures its real ANSI output, and paints it
+Runs the **real** ``rapidu`` CLI, captures its real ANSI output, and paints it
 into an animated GIF frame by frame. There is no recording of a hand-typed
 session anywhere in here: every character in the GIF below the prompt came out
 of the tool.
@@ -24,25 +24,28 @@ run over a freshly written tree. That scene needs a GPFS filesystem and a
 minute of drift to exist at all, so it is captured once rather than re-measured
 on every render; ``assets/capture_settle.sh`` is what captures it.
 
-Overridable with environment variables: ``SLURMDISK_DEMO_OUTPUT``,
-``SLURMDISK_DEMO_FONT``, ``SLURMDISK_DEMO_FONT_SIZE``, ``SLURMDISK_DEMO_COLS``.
+Overridable with environment variables: ``RAPIDU_DEMO_OUTPUT``,
+``RAPIDU_DEMO_FONT``, ``RAPIDU_DEMO_FONT_SIZE``, ``RAPIDU_DEMO_COLS``.
 """
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src")
 
-OUTPUT = os.environ.get("SLURMDISK_DEMO_OUTPUT", os.path.join(REPO, "assets", "demo.gif"))
-FONT_SIZE = int(os.environ.get("SLURMDISK_DEMO_FONT_SIZE", "17"))
-COLS = int(os.environ.get("SLURMDISK_DEMO_COLS", "96"))
+OUTPUT = os.environ.get("RAPIDU_DEMO_OUTPUT", os.path.join(REPO, "assets", "demo.gif"))
+FONT_SIZE = int(os.environ.get("RAPIDU_DEMO_FONT_SIZE", "17"))
+COLS = int(os.environ.get("RAPIDU_DEMO_COLS", "96"))
 
 _FONT_CANDIDATES = (
-    os.environ.get("SLURMDISK_DEMO_FONT", ""),
+    os.environ.get("RAPIDU_DEMO_FONT", ""),
     "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
@@ -226,7 +229,7 @@ def load_font():
     for path in _FONT_CANDIDATES:
         if path and os.path.exists(path):
             return ImageFont.truetype(path, FONT_SIZE)
-    raise SystemExit("no monospace TTF found; set SLURMDISK_DEMO_FONT to a DejaVu Sans Mono path")
+    raise SystemExit("no monospace TTF found; set RAPIDU_DEMO_FONT to a DejaVu Sans Mono path")
 
 
 class Painter:
@@ -251,7 +254,7 @@ class Painter:
         for i, col in enumerate(((255, 95, 86), (255, 189, 46), (39, 201, 63))):
             cx = 20 + i * 20
             d.ellipse([cx - 6, TITLEBAR // 2 - 6, cx + 6, TITLEBAR // 2 + 6], fill=col)
-        title = "slurmdisk — midway3 login node"
+        title = "rapidu — midway3 login node"
         d.text(
             ((self.width - self.font.getlength(title)) / 2, (TITLEBAR - self.ch) / 2 + 2),
             title,
@@ -360,7 +363,7 @@ def run(argv, env_extra=None):
     env["TERM"] = "xterm-256color"
     env.update(env_extra or {})
     proc = subprocess.run(
-        [sys.executable, "-m", "slurmdisk"] + argv + ["--color", "always", "--no-progress"],
+        [sys.executable, "-m", "rapidu"] + argv + ["--color", "always", "--no-progress"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env=env,
@@ -388,28 +391,168 @@ def deleted_fd_scene(tmpdir, megabytes=512):
         fh.close()
 
 
+# ---------------------------------------------------------------------------
+# The demo tree, and why it is synthetic.
+#
+# This renderer used to walk `~` and print the live `quota` table. Both went
+# into a GIF committed to a public repository, which meant the hero image
+# shipped a real home directory's contents, real research-project names, and
+# the quota rows of *other people's* groups on a shared filesystem. None of that
+# is the reader's business and none of it is needed to show what the tool does.
+#
+# So the demo now builds its own tree and its own quota snapshot. Everything
+# still runs for real -- the walker really walks this tree, `render_quota`
+# really renders these rows -- but nothing on screen belongs to anyone.
+# ---------------------------------------------------------------------------
+
+# (relative dir, file count, bytes each). Shaped like a real ML project so the
+# rankings are worth looking at: a few enormous checkpoints, a dataset of many
+# small files that dominates the *inode* ranking without troubling the byte
+# ranking, and a hidden cache that `ls` would not show.
+_DEMO_LAYOUT = (
+    ("checkpoints", 6, 5 << 20),
+    ("model-weights", 3, 7 << 20),
+    ("datasets/train", 900, 6 << 10),
+    ("datasets/val", 220, 6 << 10),
+    ("results", 40, 96 << 10),
+    ("logs", 350, 3 << 10),
+    ("envs/py311/lib", 1400, 5 << 10),
+    (".cache/pip", 800, 4 << 10),
+    ("notebooks", 12, 256 << 10),
+)
+
+
+def anonymize(text, tree, scratch):
+    """Replace machine-specific paths in captured output with generic ones.
+
+    The tree is synthetic and the quota rows are invented, but the *paths* are
+    still wherever this happened to run -- which on a cluster means
+    ``/scratch/<site>/<username>/...``. Every figure on screen stays exactly as
+    the tool produced it; only the directory the reader has no business knowing
+    is relabelled. Applied to the finished capture rather than by passing a fake
+    path to the CLI, so the walker really did walk a real tree.
+    """
+    user = os.environ.get("USER") or ""
+    for real, shown in (
+        (tree, "/home/researcher/project"),
+        (os.path.realpath(tree), "/home/researcher/project"),
+        (scratch, "/scratch/$USER"),
+        (os.path.realpath(scratch), "/scratch/$USER"),
+    ):
+        if real and real not in ("/", ""):
+            text = text.replace(real, shown)
+    if user:
+        text = text.replace(user, "researcher")
+    return text
+
+
+def build_demo_tree(root):
+    """Write a synthetic project tree and return its path."""
+    payload = os.urandom(1 << 20)
+    for rel, count, size in _DEMO_LAYOUT:
+        d = os.path.join(root, rel)
+        os.makedirs(d, exist_ok=True)
+        blob = payload[:size] if size <= len(payload) else payload * (size // len(payload) + 1)
+        for i in range(count):
+            with open(os.path.join(d, "%s-%04d.bin" % (os.path.basename(rel), i)), "wb") as fh:
+                fh.write(blob[:size])
+    return root
+
+
+def wait_until_settled(tree, timeout=180.0, quiet_for=2):
+    """Do not render a tree the filesystem has not finished allocating.
+
+    The first attempt at this demo walked the tree the instant it was written
+    and captured ``0.43x`` with the ranking led by whichever directory happened
+    to have been flushed -- on GPFS ``st_blocks`` is not final for tens of
+    seconds. That is precisely the effect this package exists to warn about, so
+    shipping a hero image of it would have been a poor advertisement.
+
+    Waits until the walked total is unchanged over ``quiet_for`` consecutive
+    reads, which is the same "two readings that agree" rule the CI uses against
+    ``du``.
+    """
+    sys.path.insert(0, SRC)
+    from rapidu.walk import walk
+
+    os.sync()
+    stable, previous, deadline = 0, None, time.time() + timeout
+    while time.time() < deadline:
+        size = walk(tree, threads=4).size
+        stable = stable + 1 if size == previous else 0
+        previous = size
+        if stable >= quiet_for:
+            return size
+        time.sleep(10)
+    return previous
+
+
+def demo_quota_scene():
+    """Render a real quota table from a synthetic snapshot.
+
+    Calls the shipping renderer, so the layout, the colours, the bar and the
+    staleness wording are all genuinely the tool's own output -- only the rows
+    are invented.
+    """
+    sys.path.insert(0, SRC)
+    from rapidu.quota import QuotaRow, QuotaSnapshot
+    from rapidu.report import render_quota
+    from rapidu.ui import Style
+
+    snap = QuotaSnapshot("quota -s")
+    snap.available = True
+    snap.taken_at = snap.read_at - 691  # 11m 31s: stale enough to be the point
+    snap.rows = [
+        QuotaRow("home", "blocks", "user", 731 << 20, 30 << 30, 35 << 30, "", "/home"),
+        QuotaRow("home", "files", "user", 21_842, 300_000, 1_000_000, "", "/home"),
+        QuotaRow("scratch", "blocks", "user", 1932 << 30, 2 << 40, 4 << 40, "", "/scratch"),
+        QuotaRow("labgroup", "blocks", "group", 79288 << 30, 202 << 40, 203 << 40, "", "/project"),
+        QuotaRow(
+            "labgroup", "files", "group", 43_583_258, 230_900_000, 231_900_000, "", "/project"
+        ),
+    ]
+    return "\n".join(render_quota(snap, style=Style(True, True, COLS, 256))) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--tree", default=os.path.expanduser("~"), help="tree to walk in scene 1")
+    ap.add_argument(
+        "--tree",
+        default=None,
+        help="tree to walk in scenes 1-2 (default: a synthetic project tree in a "
+        "temporary directory -- never pass a real path you would not publish)",
+    )
     ap.add_argument("--scratch", default=None, help="writable dir for the deleted-fd scene")
     ap.add_argument("--settle", default=None, help="captured `-a --settle-wait` transcript")
-    ap.add_argument("--quota-path", default="/project", help="which quota rows to show")
     args = ap.parse_args()
 
     scratch = args.scratch or os.environ.get("TMPDIR") or "/tmp"
 
-    scenes = [
-        ("sd ~", run([args.tree, "-n", "8"])),
-        ("sd ~ -i", run([args.tree, "-i", "-n", "6"])),
-        ("sd -Q " + args.quota_path, run(["-Q", args.quota_path])),
-        ("sd -D", deleted_fd_scene(scratch)),
-    ]
+    tmp = None
+    tree = args.tree
+    if tree is None:
+        tmp = tempfile.mkdtemp(prefix="rapidu-demo-", dir=scratch)
+        tree = build_demo_tree(os.path.join(tmp, "project"))
+        sys.stderr.write("waiting for the demo tree to settle...\n")
+        wait_until_settled(tree)
+
+    try:
+        scenes = [
+            ("rdu ~/project", run([tree, "-n", "8"])),
+            ("rdu ~/project -i", run([tree, "-i", "-n", "6"])),
+            ("rdu -Q", demo_quota_scene()),
+            ("rdu -D", deleted_fd_scene(scratch)),
+        ]
+        scenes = [(label, anonymize(out, tree, scratch)) for label, out in scenes]
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
     if args.settle:
         with open(args.settle) as fh:
             transcript = fh.read()
         # capture_settle.sh writes the exact command as a leading `# ` line, so
         # the label in the GIF cannot drift from the flags that produced it.
-        label = "sd $SCRATCH/run-217 -a --settle-wait 60"
+        label = "rdu $SCRATCH/run-217 -a --settle-wait 60"
         if transcript.startswith("# "):
             head, _, transcript = transcript.partition("\n")
             label = head[2:].strip()

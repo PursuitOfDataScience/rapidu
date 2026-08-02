@@ -1,4 +1,4 @@
-"""slurmdisk -- where your bytes and inodes are, and what ``du`` cannot see.
+"""rapidu -- where your bytes and inodes are, and what ``du`` cannot see.
 
 ``du`` is right about bytes, and a correct walker agrees with it byte-for-byte.
 What ``du`` cannot tell you is:

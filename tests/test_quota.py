@@ -8,8 +8,8 @@ updated at" line whose timestamp can be many minutes old.
 
 import time
 
-from slurmdisk import quota as quotamod
-from slurmdisk.quota import (
+from rapidu import quota as quotamod
+from rapidu.quota import (
     QuotaRow,
     _disambiguate_mounts,
     _parse_stock_quota,
@@ -30,9 +30,9 @@ scratch/midway3  files  (user)          3598   10000000   20000000     none
 ---------------- ---------------- ---------- ---------- ---------- --------
 >>> Capacity Filesystem: project (Midway3 GPFS mounted at /project)
 ---------------- ---------------- ---------- ---------- ---------- --------
-rcc              blocks (group)       71.94T    202.34T    203.34T     none
-rcc              files  (group)     43583258  230900000  231900000     none
-otherlab          files  (group)     16118011   17360000   18360000     none
+labgroup         blocks (group)       71.94T    202.34T    203.34T     none
+labgroup         files  (group)     43583258  230900000  231900000     none
+otherlab         files  (group)     16118011   17360000   18360000     none
 ---------------- ---------------- ---------- ---------- ---------- --------
 """
 
@@ -85,14 +85,14 @@ def test_rows_parsed(monkeypatch):
 def test_group_rows_take_mount_from_section_header(monkeypatch):
     """`mounted at /project` is published by the backend, not hard-coded."""
     snap = _parse(monkeypatch, SITE_OUTPUT)
-    rcc = [r for r in snap.rows if r.fileset == "rcc"]
-    assert rcc and all(r.mount == "/project" for r in rcc)
-    assert all(r.scope == "group" for r in rcc)
+    grouprows = [r for r in snap.rows if r.fileset == "labgroup"]
+    assert grouprows and all(r.mount == "/project" for r in grouprows)
+    assert all(r.scope == "group" for r in grouprows)
 
 
 def test_rows_for_path_picks_longest_prefix(monkeypatch):
     snap = _parse(monkeypatch, SITE_OUTPUT)
-    rows = snap.rows_for_path("/project/rcc/someone/data")
+    rows = snap.rows_for_path("/project/labgroup/someone/data")
     assert rows and all(r.mount == "/project" for r in rows)
     assert snap.rows_for_path("/nowhere/at/all") == []
 
@@ -110,7 +110,7 @@ def test_ambiguous_guessed_mounts_are_dropped():
 
 
 def test_hostname_breaks_the_tie(monkeypatch):
-    monkeypatch.setattr(quotamod.socket, "gethostname", lambda: "midway3-0455.rcc.local")
+    monkeypatch.setattr(quotamod.socket, "gethostname", lambda: "midway3-0455.example.local")
     rows = [
         QuotaRow("Midway2-home", "blocks", "user", 1, None, None, "", "/home/x", True),
         QuotaRow("Midway3-home", "blocks", "user", 2, None, None, "", "/home/x", True),
@@ -123,8 +123,8 @@ def test_hostname_breaks_the_tie(monkeypatch):
 def test_published_mounts_are_never_dropped(monkeypatch):
     """Only *guessed* mounts are subject to disambiguation."""
     snap = _parse(monkeypatch, SITE_OUTPUT)
-    rcc = [r for r in snap.rows if r.fileset == "rcc"]
-    assert all(r.mount == "/project" and not r.guessed for r in rcc)
+    grouprows = [r for r in snap.rows if r.fileset == "labgroup"]
+    assert all(r.mount == "/project" and not r.guessed for r in grouprows)
 
 
 def test_missing_command_is_reported_not_zero(monkeypatch):
@@ -158,14 +158,14 @@ def test_usage_fraction():
 def test_render_disambiguates_same_named_filesets(monkeypatch):
     """A fileset name is unique only within one filesystem.
 
-    On this site "rcc-staff" names four different quotas and "rcc" two. Without
+    On a real site one fileset name can appear on several filesystems. Without
     the mount printed, those rows are indistinguishable and the reader cannot
     tell which number belongs to which filesystem.
     """
-    from slurmdisk.report import render_quota
+    from rapidu.report import render_quota
 
     text = "\n".join(render_quota(_parse(monkeypatch, SITE_OUTPUT)))
-    rcc_lines = [ln for ln in text.splitlines() if ln.strip().startswith("rcc ")]
+    rcc_lines = [ln for ln in text.splitlines() if ln.strip().startswith("labgroup ")]
     assert len(rcc_lines) == 2
     assert any("/project" in ln for ln in rcc_lines)
     # Every data row must name its filesystem, or say it does not know.
@@ -176,7 +176,7 @@ def test_render_disambiguates_same_named_filesets(monkeypatch):
 
 def test_render_flags_a_running_grace_timer(monkeypatch):
     """An expired soft limit stops writes; it cannot be a quiet column."""
-    from slurmdisk.report import render_quota
+    from rapidu.report import render_quota
 
     over = SITE_OUTPUT.replace(
         "Midway3-home     blocks (user)       679.66M     30.00G     35.00G     none",

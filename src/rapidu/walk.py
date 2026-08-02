@@ -36,6 +36,26 @@ DEFAULT_THREADS = 8
 # A file modified this recently may not have its blocks allocated yet on GPFS.
 DEFAULT_SETTLE_WINDOW_S = 120.0
 
+# What skipping `stat` is worth. Held on both trees it has been measured on --
+# 782k GPFS inodes (27.3s -> 3.4s) and 1.69M (58.7s -> 7.1s) -- which is why the
+# README states one figure for both. Defined here once because the walk
+# docstring and the `--count` help text previously published 9.1x and 8x for the
+# same claim, and Constraint 18 says a number you cannot defend does not go on
+# the screen; two numbers for one measurement cannot both be defended.
+COUNT_SPEEDUP = 8.0
+
+# Below this an allocation is not a block, it is the filesystem storing the data
+# inside the inode. No mainstream filesystem allocates data in units under 4 KiB
+# -- ext4 and xfs are 4 KiB, GPFS subblocks here are 16 KiB, Lustre is larger --
+# so an allocation under it is evidence of inlining rather than of the unit.
+#
+# It has to be excluded from the unit measurement or it swallows it. Measured on
+# /home: GPFS gives a 100-byte file one 512-byte sector, and since 512 > 100 that
+# file is "padded", so it joined the allocation-unit estimate and dragged the
+# reported unit from the true 16 KiB down to 512 B. The one number that made the
+# whole diagnosis actionable was set by the files it does not describe.
+MIN_ALLOC_UNIT = 4096
+
 # Bound on how many recently-modified files we retain for the re-stat pass.
 _RECENT_SAMPLE_CAP = 4096
 
@@ -108,7 +128,7 @@ class Entry:
     ``size`` is **cumulative** for a directory -- it includes everything beneath
     it, which is what ``du`` reports and what anyone reading a disk-usage list
     expects. An earlier version charged a directory only with the entries
-    immediately inside it, so ``notebooks`` read 70.6 MiB against ``du``'s
+    immediately inside it, so one subtree read 70.6 MiB against ``du``'s
     94.3 MiB and a parent could rank *below* its own child. Worse, a directory
     whose bulk lived one level down vanished from the listing entirely while its
     children appeared, which reads exactly like missing data.
@@ -144,6 +164,29 @@ class WalkResult:
         self.root = root
         self.size = 0  # sum of st_blocks*512, hardlink-deduped
         self.apparent = 0  # sum of st_size, for the sparse/settling diagnosis
+        # Allocation accounting: why `size` and `apparent` disagree, split by
+        # direction because a filesystem inflates one directory and deflates the
+        # next. Files allocated MORE than their length are paying for a partly
+        # filled allocation unit; files allocated LESS are sparse, compressed, or
+        # small enough that the data lives in the inode.
+        self.padded_files = 0
+        self.padded_apparent = 0
+        self.padded_alloc = 0
+        self.under_files = 0
+        self.under_apparent = 0
+        self.under_alloc = 0
+        # Files whose whole allocation is under one block: the data lives in
+        # the inode. Counted apart from both classes above because it is
+        # neither padding nor sparseness, and because including it in the
+        # padded class set the measured allocation unit to 512 B.
+        self.inline_files = 0
+        # Bitwise OR of the allocated sizes of padded files. Every allocation is
+        # a whole number of allocation units, and the unit is a power of two, so
+        # the lowest set bit of the OR is the unit -- measured from the tree
+        # itself rather than assumed from the vendor. statvfs cannot supply it:
+        # on this GPFS it reports the 4 MiB *block* size while files actually
+        # allocate in 16 KiB subblocks, a 256x difference in the wrong direction.
+        self.alloc_bits = 0
         self.files = 0
         self.dirs = 0
         self.symlinks = 0
@@ -179,6 +222,28 @@ class WalkResult:
     def complete(self) -> bool:
         """False when anything was skipped, so the total is a floor not a total."""
         return not self.unreadable_dirs and not self.unstatable and not self.partial
+
+    @property
+    def alloc_unit(self) -> Optional[int]:
+        """The filesystem's allocation unit, measured from the padded files.
+
+        ``None`` when nothing in the tree was padded, which is the honest answer
+        rather than a guess: a tree of exactly-block-sized files carries no
+        evidence of the unit at all.
+        """
+        return (self.alloc_bits & -self.alloc_bits) or None
+
+    @property
+    def padding(self) -> int:
+        """Bytes charged for partly filled allocation units."""
+        return self.padded_alloc - self.padded_apparent
+
+    @property
+    def alloc_ratio(self) -> Optional[float]:
+        """Allocated over apparent. Above 1 the tree costs more than it holds."""
+        if not self.apparent:
+            return None
+        return self.size / float(self.apparent)
 
     @property
     def inodes(self) -> int:
@@ -263,11 +328,15 @@ def walk(
     complete. ``max_dirs_per_sec`` of 0 disables rate limiting.
 
     ``count_only`` skips ``stat`` entirely and counts directory entries from
-    ``getdents`` alone. Measured on 782k GPFS inodes that is **9.1x faster**
-    (2.99s against 27.09s), because ``stat`` is 90% of a normal walk's wall time
-    and ``d_type`` already distinguishes a directory from everything else. The
-    cost is that there are no sizes and hard links cannot be deduplicated -- both
-    of which the caller must report rather than paper over.
+    ``getdents`` alone. That is :data:`COUNT_SPEEDUP`\\ **x faster**, on both
+    trees it has been measured on -- 782k GPFS inodes at 27.3s against 3.4s, and
+    1.69M at 58.7s against 7.1s -- because ``stat`` is ~90% of a normal walk's
+    wall time and ``d_type`` already distinguishes a directory from everything
+    else. The cost is that there are no sizes and hard links cannot be
+    deduplicated, both of which the caller must report rather than paper over.
+
+    One figure, stated once, from :data:`COUNT_SPEEDUP`. This docstring used to
+    say "9.1x" while the ``--count`` help text said "8x" for the same claim.
     """
     root = os.path.abspath(root)
     nthreads = max(1, min(int(threads), MAX_THREADS))
@@ -329,12 +398,29 @@ def walk(
         seen_here = 0
         l_recent = l_recent_app = l_recent_size = 0
         l_extra = 0
+        l_padn = l_pada = l_padb = 0
+        l_inline = 0
+        l_undn = l_unda = l_undb = 0
+        l_bits = 0
         l_uid = {}  # type: Dict[int, List[int]]
         l_dev = {}  # type: Dict[int, List[int]]
         # key -> [bytes, files, dirs, is_dir]
         l_agg = {}  # type: Dict[str, List[int]]
         l_unreadable = []  # type: List[Tuple[str, str]]
         l_sample = []  # type: List[Tuple[str, int]]
+
+        # Hot-loop locals. Every one of these is touched once per inode on a
+        # million-inode walk, and a global lookup is a dict miss plus a builtins
+        # miss each time.
+        stop_is_set = stop_ev.is_set
+        scandir = os.scandir
+        sep = os.sep
+        agg_get = l_agg.get
+        uid_get = l_uid.get
+        dev_get = l_dev.get
+        S_IFMT, S_IFDIR, S_IFLNK = 0o170000, 0o040000, 0o120000
+        ofs = one_file_system
+        cap = _RECENT_SAMPLE_CAP
 
         while True:
             with cv:
@@ -348,37 +434,36 @@ def walk(
 
             children = []  # type: List[Tuple[str, Tuple[str, ...]]]
 
-            def charge(parts, blocks, is_file, self_is_dir):
-                """Add one object's cost to every reported ancestor, and to
-                itself when it sits within the reported depth."""
-                keys = _entry_keys(root, parts, depth)
-                if not keys:
-                    return
-                last = len(keys) - 1
-                for i, k in enumerate(keys):
-                    slot = l_agg.get(k)
-                    if slot is None:
-                        # The final key is the object itself only when the walk
-                        # has not been truncated by the depth limit.
-                        own = i == last and len(parts) <= depth
-                        slot = l_agg[k] = [0, 0, 0, 0 if (own and is_file) else 1]
-                    slot[0] += blocks
-                    if is_file:
-                        slot[1] += 1
-                    else:
-                        slot[2] += 1
+            # Every entry in this directory charges the same set of reported
+            # ancestors, so resolve their accumulator slots once here rather than
+            # rebuilding the key list and re-hashing it per inode.
+            ndp = len(d_parts)
+            own_level = ndp < depth
+            base = []  # type: List[List[int]]
+            acc = root
+            for i in range(ndp if own_level else depth):
+                acc = acc + sep + d_parts[i]
+                slot = agg_get(acc)
+                if slot is None:
+                    slot = l_agg[acc] = [0, 0, 0, 1]
+                base.append(slot)
+            nbase = len(base)
+            b0 = base[0] if nbase == 1 else None
+            dsep = d if d.endswith(sep) else d + sep
 
             if bucket is not None:
                 bucket.take()
 
+            k = 0
             try:
-                with os.scandir(d) as it:
+                with scandir(d) as it:
                     if count_only:
                         # No stat: d_type from getdents is enough to tell a
                         # directory from anything else, and that is all a count
-                        # needs. This is the 9x path.
+                        # needs. This is the fast path.
                         for entry in it:
-                            if stop_ev.is_set():
+                            k += 1
+                            if not (k & 1023) and stop_is_set():
                                 break
                             try:
                                 isdir = entry.is_dir(follow_symlinks=False)
@@ -386,13 +471,33 @@ def walk(
                                 l_unstat += 1
                                 continue
                             if isdir:
-                                child_parts = d_parts + (entry.name,)
-                                children.append((entry.path, child_parts))
-                                charge(child_parts, 0, False, True)
+                                name = entry.name
+                                children.append((dsep + name, d_parts + (name,)))
                                 l_dirs += 1
+                                if b0 is not None:
+                                    b0[2] += 1
+                                else:
+                                    for s in base:
+                                        s[2] += 1
+                                if own_level:
+                                    key = dsep + name
+                                    slot = agg_get(key)
+                                    if slot is None:
+                                        slot = l_agg[key] = [0, 0, 0, 1]
+                                    slot[2] += 1
                             else:
                                 l_files += 1
-                                charge(d_parts + (entry.name,), 0, True, False)
+                                if b0 is not None:
+                                    b0[1] += 1
+                                else:
+                                    for s in base:
+                                        s[1] += 1
+                                if own_level:
+                                    key = dsep + entry.name
+                                    slot = agg_get(key)
+                                    if slot is None:
+                                        slot = l_agg[key] = [0, 0, 0, 0]
+                                    slot[1] += 1
                         # NOTE: no `continue` here. It would target the worker's
                         # outer loop and skip the block that decrements the
                         # pending-directory counter, so the walk would never
@@ -401,7 +506,11 @@ def walk(
                     else:
                         entries = it
                     for entry in entries:
-                        if stop_ev.is_set():
+                        # Checked every 1024 entries rather than every entry:
+                        # Event.is_set is a Python-level call, and one directory
+                        # can hold a million names.
+                        k += 1
+                        if not (k & 1023) and stop_is_set():
                             break
                         try:
                             st = entry.stat(follow_symlinks=False)
@@ -411,25 +520,51 @@ def walk(
 
                         blocks = st.st_blocks * 512
                         mode = st.st_mode
+                        ftype = mode & S_IFMT
 
-                        if stat.S_ISDIR(mode):
-                            if one_file_system and st.st_dev != root_dev:
+                        if ftype == S_IFDIR:
+                            if ofs and st.st_dev != root_dev:
                                 continue
-                            child_parts = d_parts + (entry.name,)
-                            children.append((entry.path, child_parts))
-                            charge(child_parts, blocks, False, True)
+                            name = entry.name
+                            children.append((dsep + name, d_parts + (name,)))
+                            if b0 is not None:
+                                b0[0] += blocks
+                                b0[2] += 1
+                            else:
+                                for s in base:
+                                    s[0] += blocks
+                                    s[2] += 1
+                            if own_level:
+                                key = dsep + name
+                                slot = agg_get(key)
+                                if slot is None:
+                                    slot = l_agg[key] = [0, 0, 0, 1]
+                                slot[0] += blocks
+                                slot[2] += 1
                             l_size += blocks
                             l_app += st.st_size
                             l_dirs += 1
                             # A directory is an inode and a files-quota counts it.
-                            _bump(l_uid, st.st_uid, blocks, 1)
-                            _bump(l_dev, st.st_dev, blocks, 1)
+                            uid = st.st_uid
+                            slot = uid_get(uid)
+                            if slot is None:
+                                l_uid[uid] = [blocks, 1]
+                            else:
+                                slot[0] += blocks
+                                slot[1] += 1
+                            dev = st.st_dev
+                            slot = dev_get(dev)
+                            if slot is None:
+                                l_dev[dev] = [blocks, 1]
+                            else:
+                                slot[0] += blocks
+                                slot[1] += 1
                             continue
 
-                        if one_file_system and st.st_dev != root_dev:
+                        if ofs and st.st_dev != root_dev:
                             continue
 
-                        if stat.S_ISLNK(mode):
+                        if ftype == S_IFLNK:
                             l_sym += 1
 
                         l_files += 1
@@ -443,18 +578,59 @@ def walk(
                                     continue
                                 seen_links[ikey] = 1
 
+                        sz = st.st_size
                         l_size += blocks
-                        l_app += st.st_size
-                        charge(d_parts + (entry.name,), blocks, True, False)
-                        _bump(l_uid, st.st_uid, blocks, 1)
-                        _bump(l_dev, st.st_dev, blocks, 1)
+                        l_app += sz
+                        # Which way this file's allocation went, and by how much.
+                        # blocks == 0 is a fast symlink or an empty file and is
+                        # evidence of neither direction.
+                        if blocks:
+                            if blocks < MIN_ALLOC_UNIT:
+                                l_inline += 1
+                            elif blocks > sz:
+                                l_padn += 1
+                                l_pada += sz
+                                l_padb += blocks
+                                l_bits |= blocks
+                            elif blocks < sz:
+                                l_undn += 1
+                                l_unda += sz
+                                l_undb += blocks
+                        if b0 is not None:
+                            b0[0] += blocks
+                            b0[1] += 1
+                        else:
+                            for s in base:
+                                s[0] += blocks
+                                s[1] += 1
+                        if own_level:
+                            key = dsep + entry.name
+                            slot = agg_get(key)
+                            if slot is None:
+                                slot = l_agg[key] = [0, 0, 0, 0]
+                            slot[0] += blocks
+                            slot[1] += 1
+                        uid = st.st_uid
+                        slot = uid_get(uid)
+                        if slot is None:
+                            l_uid[uid] = [blocks, 1]
+                        else:
+                            slot[0] += blocks
+                            slot[1] += 1
+                        dev = st.st_dev
+                        slot = dev_get(dev)
+                        if slot is None:
+                            l_dev[dev] = [blocks, 1]
+                        else:
+                            slot[0] += blocks
+                            slot[1] += 1
 
                         if st.st_mtime >= recent_cutoff or st.st_ctime >= recent_cutoff:
                             l_recent += 1
                             l_recent_app += st.st_size
                             l_recent_size += blocks
-                            if len(l_sample) < _RECENT_SAMPLE_CAP:
-                                l_sample.append((entry.path, blocks))
+                            if len(l_sample) < cap:
+                                l_sample.append((dsep + entry.name, blocks))
             except OSError as exc:
                 l_unreadable.append((d, exc.strerror or "unreadable"))
 
@@ -477,7 +653,13 @@ def walk(
                     outstanding[top] -= 1
                     if outstanding[top] == 0:
                         finished_tops.add(top)
-                cv.notify_all()
+                # Wake one thread per directory actually queued. notify_all here
+                # woke every idle worker on every one of ~190k directories, and
+                # all but one found the queue empty again.
+                if children:
+                    cv.notify(len(children))
+                elif pending_box[0] == 0:
+                    cv.notify_all()
 
         with merge_lock:
             res.size += l_size
@@ -490,6 +672,14 @@ def walk(
             res.recent_files += l_recent
             res.recent_apparent += l_recent_app
             res.recent_size += l_recent_size
+            res.padded_files += l_padn
+            res.padded_apparent += l_pada
+            res.padded_alloc += l_padb
+            res.under_files += l_undn
+            res.under_apparent += l_unda
+            res.under_alloc += l_undb
+            res.inline_files += l_inline
+            res.alloc_bits |= l_bits
             res.unreadable_dirs.extend(l_unreadable)
             room = _RECENT_SAMPLE_CAP - len(res.recent_sample)
             if room > 0:
@@ -500,10 +690,10 @@ def walk(
             for dev, (b, f) in l_dev.items():
                 pb, pf = res.by_dev.get(dev, (0, 0))
                 res.by_dev[dev] = (pb + b, pf + f)
-            for k, (b, f, dcount, dir_flag) in l_agg.items():
-                ent = res.dir_agg.get(k)
+            for kk, (b, f, dcount, dir_flag) in l_agg.items():
+                ent = res.dir_agg.get(kk)
                 if ent is None:
-                    ent = res.dir_agg[k] = Entry(k, bool(dir_flag))
+                    ent = res.dir_agg[kk] = Entry(kk, bool(dir_flag))
                 elif dir_flag:
                     ent.is_dir = True
                 ent.add(b, f, dcount)
@@ -511,7 +701,7 @@ def walk(
     t0 = time.perf_counter()
     account_root()
     workers = [
-        threading.Thread(target=worker, args=(i,), name="slurmdisk-walk-%d" % i, daemon=True)
+        threading.Thread(target=worker, args=(i,), name="rapidu-walk-%d" % i, daemon=True)
         for i in range(nthreads)
     ]
     for w in workers:

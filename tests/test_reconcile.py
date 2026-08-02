@@ -8,10 +8,10 @@ into INCONCLUSIVE rather than into a finding (Constraint 20).
 import os
 import time
 
-from slurmdisk import reconcile as rc
-from slurmdisk.deleted import DeletedFile, DeletedScan
-from slurmdisk.quota import QuotaRow, QuotaSnapshot
-from slurmdisk.walk import SettleCheck, WalkResult
+from rapidu import reconcile as rc
+from rapidu.deleted import DeletedFile, DeletedScan
+from rapidu.quota import QuotaRow, QuotaSnapshot
+from rapidu.walk import SettleCheck, WalkResult
 
 MOUNT = "/mnt/fake"
 
@@ -71,7 +71,26 @@ def test_stale_snapshot_blocks_a_finding():
     )
     assert r.verdict == rc.INCONCLUSIVE
     assert any("snapshot" in b for b in r.blockers)
-    assert not r.candidates
+
+
+def test_a_blocked_verdict_still_offers_its_hypotheses():
+    """Blocking the *finding* must not also suppress the explanations.
+
+    Reaching GAP needs zero blockers, and on a real cluster the quota snapshot
+    alone is routinely half an hour old against a 300s threshold -- so gating
+    the candidate list on GAP made the module's entire explanatory payload
+    unreachable on essentially every run. The verdict stays INCONCLUSIVE,
+    because a stale number genuinely cannot support a finding; the candidates
+    are hypotheses and are printed as "not asserted".
+    """
+    r = rc.reconcile(
+        make_walk(1000), fresh_settle(), make_snap(50_000_000, age=1800.0), empty_scan(), "blocks"
+    )
+    assert r.verdict == rc.INCONCLUSIVE
+    assert r.blockers, "the refusal itself must survive"
+    assert r.candidates, "but the reader still gets somewhere to look"
+    assert any("snapshot" in c for c in r.candidates)
+    assert any("replication" in c for c in r.candidates)
 
 
 def test_unknown_snapshot_age_blocks_a_finding():

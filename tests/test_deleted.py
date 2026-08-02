@@ -8,8 +8,8 @@ is that it is invisible to anything that reads directory entries.
 
 import os
 
-from slurmdisk import deleted as D
-from slurmdisk.walk import walk
+from rapidu import deleted as D
+from rapidu.walk import walk
 
 SIZE = 8 << 20  # 8 MiB: big enough to be unambiguous, small enough to be quick
 
@@ -104,3 +104,31 @@ def test_under_preserves_incompleteness():
     narrowed = scan.under("/")
     assert narrowed.unreadable_pids == scan.unreadable_pids
     assert narrowed.scanned_pids == scan.scanned_pids
+
+
+def test_a_file_named_deleted_is_not_reported_as_deleted(tmp_path):
+    """`" (deleted)"` is a hint from the kernel, not proof, and a real filename
+    can end the same way. The authoritative test is ``st_nlink == 0`` on the fd
+    we already hold. Trusting the string attributed space to a file that was
+    never unlinked -- a fabricated finding, in the one section whose whole job
+    is to avoid making them."""
+    root = str(tmp_path)
+    # The name must *end* with the suffix for the readlink target to be
+    # ambiguous -- `report (deleted).pdf` is not, because ".pdf" follows it.
+    path = os.path.join(root, "quarterly report (deleted)")
+    fh = open(path, "wb")
+    try:
+        fh.write(b"\0" * SIZE)
+        fh.flush()
+        os.fsync(fh.fileno())
+        # Still linked. /proc/<pid>/fd/<n> resolves to a target ending in
+        # " (deleted)" purely because of the name.
+        assert os.lstat(path).st_nlink == 1
+        scan = D.scan(root)
+        assert scan.files == [], "a linked file must never be reported as unlinked"
+
+        # ...and unlinking the very same file must still be found.
+        os.unlink(path)
+        assert len(D.scan(root).files) == 1
+    finally:
+        fh.close()

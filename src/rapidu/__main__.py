@@ -1,4 +1,4 @@
-"""Allow ``python -m slurmdisk``."""
+"""Allow ``python -m rapidu``."""
 
 import sys
 

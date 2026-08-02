@@ -1,6 +1,6 @@
 """Terminal presentation: colour, bars, and column layout.
 
-Kept separate from :mod:`slurmdisk.report` so that *what* is reported and *how*
+Kept separate from :mod:`rapidu.report` so that *what* is reported and *how*
 it looks are not tangled together, and so the colour rules live in exactly one
 place.
 
@@ -183,6 +183,14 @@ _WASH_SEMANTIC = {"red": 124, "yellow": 136, "green": 28}
 # `dim` grey that ordinary de-emphasised *text* uses.
 _TRACK_256 = "c256:238"
 
+# Secondary *content*: a real measurement that is not what the listing was
+# ranked by. It must stay readable, which SGR `dim` does not reliably manage --
+# on a good many terminals faint grey on dark grey is close to invisible, and a
+# whole column of file counts rendered that way reads as decoration rather than
+# data. Where 256 colours are available this is a mid grey that is plainly
+# legible and still visibly quieter than a ramp tone.
+_MUTED_256 = "c256:247"
+
 
 # Full block / light shade, plus the seven partial blocks. The partials give a
 # bar eight times the horizontal resolution of its cell count, which is the
@@ -190,6 +198,10 @@ _TRACK_256 = "c256:238"
 _BAR_FULL, _BAR_EMPTY = "█", "░"
 _BAR_PARTIALS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
 _BAR_FULL_ASCII, _BAR_EMPTY_ASCII = "#", "-"
+# The remainder row's fill: medium shade, so it reads as "many things" against
+# the solid slab of a single directory. Partials are dropped with it -- a
+# sub-cell tail on a hatched bar is invisible and only costs alignment.
+_BAR_HATCH, _BAR_HATCH_ASCII = "▒", ":"
 
 
 class Style:
@@ -240,6 +252,17 @@ class Style:
     @property
     def track(self) -> str:
         return _TRACK_256 if self.depth >= 256 else "dim"
+
+    @property
+    def muted(self) -> str:
+        """A real number that is not the one this listing was ranked by.
+
+        Distinct from ``dim``, which means "context, not content" -- a snapshot
+        age, a caveat, a hint. A file count is content even when bytes are what
+        the rows were sorted on, and painting the two the same grey is what made
+        the count column read as furniture.
+        """
+        return _MUTED_256 if self.depth >= 256 else ""
 
     @property
     def bar_chars(self):
@@ -315,6 +338,7 @@ def bar(
     accent: str = "cyan",
     min_tick: bool = True,
     track: bool = True,
+    hatched: bool = False,
 ) -> str:
     """A proportional bar. ``fraction`` is clamped to [0, 1].
 
@@ -322,22 +346,36 @@ def bar(
     against -- the tree total, or a quota limit -- so a bar can be read as a
     fraction on its own, without comparing it to its neighbours.
 
-    ``track`` draws the unfilled remainder as shading. It belongs on a *gauge*,
-    where the track is a real thing (the quota limit) that the bar is creeping
-    up on. On a ranking it is ten boxes of grey behind ten short bars, heavier on
-    the page than the data, so the rows leave it off and the remainder is plain
-    space.
+    ``track`` draws the unfilled remainder as shading, so the bar occupies a
+    visible box of a fixed width rather than trailing off into blank space.
+
+    It is on everywhere. The rankings used to leave it off, on the argument that
+    ten boxes of grey behind ten short bars are heavier on the page than the
+    data. That was wrong about what the blank space costs: an 18-column channel
+    was reserved on every row and most of it read as nothing at all, so the eye
+    had no edge to measure a short bar against and the table looked as though it
+    had a hole in it. A track is what makes "4.0%" and "14.1%" comparable at a
+    glance -- the reader sees the same box each time and the fill within it. In
+    256 colours the track drops to a near-background grey (:data:`_TRACK_256`),
+    which is quiet enough that it frames the bar without competing with it.
 
     ``min_tick`` renders any non-zero share as at least one cell, so a small but
     real entry is not mistaken for nothing. Turn it off where the bar is a gauge
     against a limit rather than a comparison between rows: showing a filled cell
     for 0.04% of a quota reads as "some usage" when the honest answer is "none
     worth seeing".
+
+    ``hatched`` fills with shading instead of solid blocks. It marks a bar that
+    measures *several* things at once -- the everything-else remainder row -- so
+    that a quarter of the tree collapsed into one line is still drawn at its
+    real length, but cannot be misread as a single directory that size.
     """
     if width <= 0:
         return ""
     full_ch, empty_ch = style.bar_chars
-    partials = style.partials
+    if hatched:
+        full_ch = _BAR_HATCH if style.unicode else _BAR_HATCH_ASCII
+    partials = style.partials if not hatched else ("",)  # type: Tuple[str, ...]
     f = 0.0 if fraction < 0 else (1.0 if fraction > 1 else fraction)
 
     exact = f * width

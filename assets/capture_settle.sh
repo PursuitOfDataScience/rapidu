@@ -10,7 +10,7 @@
 # Measured on Midway3 scratch, 2026-08-02, with 6,000 x 8 KiB files:
 #   du -s immediately after the write   81 MB
 #   du -s once it settled              376 MB      <- 4.6x more
-# slurmdisk flags the first reading as still moving instead of reporting it.
+# rapidu flags the first reading as still moving instead of reporting it.
 set -euo pipefail
 
 TREE=${1:?usage: capture_settle.sh TREE OUTFILE}
@@ -32,7 +32,7 @@ for i in range(6000):
         fh.write(payload)
 PY
 
-# Exit 1 is the expected outcome, not a failure: slurmdisk returns
+# Exit 1 is the expected outcome, not a failure: rapidu returns
 # EXIT_ATTENTION when the tree is still drifting, which is the entire point of
 # this capture. Only 2 (a real error) is fatal here.
 rc=0
@@ -40,12 +40,12 @@ rc=0
 # label can never drift away from the flags -- or the path -- that produced it.
 # It was hardcoded to a stand-in path once, and the GIF then showed a command
 # that did not match the tree in its own output.
-printf '# sd %s -a --no-quota --no-deleted --settle-wait 60\n' "$TREE" >"$OUT"
+printf '# rdu %s -a --no-quota --no-deleted --settle-wait 60\n' "$TREE" >"$OUT"
 COLUMNS=96 TERM=xterm-256color PYTHONPATH="$REPO/src" \
-    python3 -m slurmdisk "$TREE" -a --no-quota --no-deleted --settle-wait 60 \
+    python3 -m rapidu "$TREE" -a --no-quota --no-deleted --settle-wait 60 \
     -n 6 --color always --no-progress >>"$OUT" || rc=$?
 if [ "$rc" -gt 1 ]; then
-    echo "slurmdisk failed with exit $rc" >&2
+    echo "rapidu failed with exit $rc" >&2
     exit "$rc"
 fi
 

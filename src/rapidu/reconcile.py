@@ -172,10 +172,12 @@ def reconcile(
     rec.gap = row.used - (rec.accounted or 0)
 
     # ---- does the walk even cover the same tree the quota counts? ----
-    mount = (row.mount or "").rstrip("/")
     root = os.path.abspath(res.root).rstrip("/")
-    covers_whole_tree = bool(mount) and root == mount
+    mounts = [m.rstrip("/") for m in (row.mounts or ([row.mount] if row.mount else []))]
+    mount = next((m for m in mounts if root == m), "")
+    covers_whole_tree = bool(mount)
     if not covers_whole_tree:
+        mount = (row.mount or "").rstrip("/")
         rec.verdict = SUBTREE
         rec.notes.append(
             "the {} quota covers {} ({}-scoped); this walk covers only {}, so "
@@ -183,6 +185,13 @@ def reconcile(
                 row.fileset, mount or "an unknown mount", row.scope or "un", root
             )
         )
+        # A subtree smaller than its quota needs no explanation: the rest of the
+        # mount is the explanation, and the note above just said so. A subtree
+        # *larger* than the whole quota figure is the interesting case -- it was
+        # the one this audit actually hit, at 146.7% of the fileset figure -- and
+        # there the candidates are worth having.
+        if (rec.gap or 0) < 0:
+            rec.candidates = _candidates(rec, res, deleted, kind)
         return rec
 
     # ---- anything that makes the comparison unsafe, before any verdict ----
@@ -194,7 +203,9 @@ def reconcile(
     elif age > max_snapshot_age:
         rec.blockers.append(
             "the quota figure is a snapshot taken {:.0f}s ago and may predate "
-            "recent writes or deletions".format(age)
+            "recent writes or deletions{}".format(
+                age, " -- though " + snap.time_note if snap.time_note else ""
+            )
         )
 
     if kind == "blocks":
@@ -253,6 +264,7 @@ def reconcile(
 
     if rec.blockers:
         rec.verdict = INCONCLUSIVE
+        rec.candidates = _candidates(rec, res, deleted, kind)
         return rec
 
     rec.verdict = GAP
@@ -263,7 +275,25 @@ def reconcile(
 def _candidates(
     rec: Reconciliation, res: "walkmod.WalkResult", deleted: DeletedScan, kind: str
 ) -> List[str]:
-    """Things that could explain a gap. Listed, never asserted."""
+    """Things that could explain a gap. Listed, never asserted.
+
+    **Reached from every verdict that has a gap to explain, not only ``GAP``.**
+    This list is the module's entire explanatory payload, and gating it behind
+    the strictest verdict made it almost unreachable in practice. Getting to
+    ``GAP`` needs the walk root to *be* the mount root -- so any walk of a
+    subdirectory, which is nearly every walk anyone runs, returned ``SUBTREE``
+    first -- and then needs zero blockers, while on this cluster the quota
+    snapshot alone is routinely half an hour old against a 300 s threshold, so
+    ``INCONCLUSIVE`` fires on essentially every run.
+
+    The verdict machinery is right: a stale quota genuinely cannot support a
+    *finding*. But snapshots, replication, other nodes' file descriptors and
+    group-owned files are worth *mentioning* whether or not the arithmetic
+    closes. They are hypotheses, and the module already labels them as such --
+    "possible cause (not asserted)". Withholding a hypothesis because the
+    evidence is not conclusive is what the blockers list is for; it is not a
+    reason to withhold the hypothesis as well.
+    """
     out = []  # type: List[str]
     if rec.gap is None:
         return out

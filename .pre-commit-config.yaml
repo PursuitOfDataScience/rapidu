@@ -12,5 +12,5 @@ repos:
     rev: v2.3.0
     hooks:
       - id: mypy
-        # slurmdisk has no runtime dependencies, so mypy needs no extras.
+        # rapidu has no runtime dependencies, so mypy needs no extras.
         additional_dependencies: []

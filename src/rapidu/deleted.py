@@ -147,6 +147,16 @@ def scan(prefix: Optional[str] = None) -> DeletedScan:
                 continue
             if not stat.S_ISREG(st.st_mode):
                 continue
+            # The suffix is a hint; nlink == 0 is the proof. The kernel appends
+            # " (deleted)" to the readlink target of an unlinked inode, and a
+            # file genuinely *named* `report (deleted).pdf` produces a target
+            # that ends the same way and is indistinguishable by string match.
+            # Trusting the string would attribute space to a file that is not
+            # unlinked at all -- a fabricated finding, in the one section of this
+            # tool whose entire job is to avoid making them. We already hold the
+            # fd, so the authoritative test costs nothing.
+            if st.st_nlink != 0:
+                continue
             key = (st.st_dev, st.st_ino)
             rec = by_inode.get(key)
             if rec is None:
