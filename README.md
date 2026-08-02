@@ -15,9 +15,15 @@
   <img src="assets/demo.gif" width="900" alt="rapiDU walking a project tree and explaining that it occupies 266.8 MiB to hold 75.5 MiB of data, ranking the same tree by file count, printing a quota table with the age of its snapshot, finding 512 MiB held by a deleted-but-open file descriptor, and catching a freshly written GPFS tree that loses 224 MiB while it settles.">
 </p>
 
+## Install
+
 ```bash
 pip install rapidu
+```
 
+## Use
+
+```bash
 rdu                      # this directory: how big, and what is big inside it
 rdu /project/mylab       # any other path
 rdu ~/scratch -n 20      # list 20 entries instead of 10
