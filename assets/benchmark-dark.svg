@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="232" viewBox="0 0 720 232" font-family="ui-sans-serif,-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="720" height="232" fill="#1a1a19"/>
+<text x="40" y="26" font-size="15" font-weight="600" fill="#ffffff">Cold walk of a GPFS tree, wall time</text>
+<text x="40" y="44" font-size="12" fill="#c3c2b7">lower is better · same byte total either way</text>
+<rect x="436" y="18" width="10" height="10" rx="2" fill="#3987e5"/>
+<text x="451" y="27" font-size="12" fill="#c3c2b7">du</text>
+<rect x="514" y="18" width="10" height="10" rx="2" fill="#d95926"/>
+<text x="529" y="27" font-size="12" fill="#c3c2b7">rapiDU</text>
+<text x="8" y="72" font-size="13" fill="#ffffff">a package cache</text>
+<text x="8" y="89" font-size="11" fill="#c3c2b7">792,225 files</text>
+<path d="M188,56 H406.9861333333333 a4,4 0 0 1 4,4 V78 a4,4 0 0 1 -4,4 H188 Z" fill="#3987e5"/>
+<text x="419.0" y="74" font-size="12" font-weight="600" fill="#ffffff">168.1s</text>
+<path d="M188,84 H217.69733333333335 a4,4 0 0 1 4,4 V106 a4,4 0 0 1 -4,4 H188 Z" fill="#d95926"/>
+<text x="229.7" y="102" font-size="12" font-weight="600" fill="#ffffff">25.4s</text>
+<text x="708" y="86" font-size="17" font-weight="700" fill="#d95926" text-anchor="end">6.6x</text>
+<text x="8" y="160" font-size="13" fill="#ffffff">a whole project directory</text>
+<text x="8" y="177" font-size="11" fill="#c3c2b7">1,686,589 files</text>
+<path d="M188,144 H579.9569333333333 a4,4 0 0 1 4,4 V166 a4,4 0 0 1 -4,4 H188 Z" fill="#3987e5"/>
+<text x="592.0" y="162" font-size="12" font-weight="600" fill="#ffffff">298.5s</text>
+<path d="M188,172 H260.1904666666667 a4,4 0 0 1 4,4 V194 a4,4 0 0 1 -4,4 H188 Z" fill="#d95926"/>
+<text x="272.2" y="190" font-size="12" font-weight="600" fill="#ffffff">57.4s</text>
+<text x="708" y="174" font-size="17" font-weight="700" fill="#d95926" text-anchor="end">5.2x</text>
+</svg>
