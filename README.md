@@ -1,7 +1,7 @@
 <h1 align="center">rapi<code>DU</code></h1>
 
 <p align="center">
-  <strong>A 5x faster <code>du</code> that tells you why your quota is full.</strong>
+  <strong>A much faster <code>du</code> that tells you why your quota is full.</strong>
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@ pip install rapidu
 
 rdu ~            # how big is this tree, and what is big inside it
 rdu ~ -i         # rank by file count -- what an inode quota actually limits
-rdu ~ -c         # count files only, no stat: 8x faster again
+rdu ~ -c         # count files only, no stat: ~8x again on GPFS
 rdu -Q           # the quota table, and the age of its figures
 rdu -D           # space held by files deleted while still open
 rdu ~ -a         # the full audit: quota + /proc scan + reconciliation
@@ -31,7 +31,7 @@ the moment you need this is the moment your home directory is full and `pip`
 cannot write to it. `git clone` plus `PYTHONPATH=…/src python3 -m rapidu .` works
 with nothing installed at all.
 
-## It is faster, and it is the same number
+## Faster, and the same number
 
 <p align="center">
   <picture>
@@ -47,26 +47,16 @@ aspiration.
 
 ## What rapiDU adds to `du`
 
-**1. It says when the number is still moving.** GPFS does not finalise
-`st_blocks` for tens of seconds. The same tree reads 81 MB right after a write
-and 376 MB once settled — and `du` hands you whichever you happened to ask for.
-
-**2. It prints the age of your quota figure.** Quota readings are snapshots. This
-one has been observed 28 minutes stale while a 512 MiB file was written, fsync'ed
-and deleted without the number moving. Where the backend publishes no timestamp
-the age prints `UNKNOWN`, never "now".
-
-**3. It finds space with no directory entry.** A file unlinked while a process
-holds it open is invisible to `ls`, to `du`, to `ncdu` and to rapiDU's own walk —
-but the quota still charges you for it. `rdu -D` names the pid.
-
-**4. It ranks by inodes, not just bytes.** One conda env is ~177,000 inodes
-against a 300,000 home quota; two exhaust it. Inode exhaustion blocks job
-submission and nobody connects the two.
-
-**5. It explains why the number is so big.** Every file smaller than the
-allocation unit pays for the whole unit — 64 KiB on scratch, 16 KiB on `/home`.
-So 3,000 files of 8 KiB hold 23.6 MiB and occupy 187.6 MiB:
+- **Why the number is so big.** Files smaller than the allocation unit pay for
+  the whole unit, so 3,000 files of 8 KiB hold 23.6 MiB and occupy 187.6 MiB.
+- **When the number is still moving.** GPFS does not finalise `st_blocks` for
+  tens of seconds; the same tree reads 81 MB after a write and 376 MB settled.
+- **How old your quota figure is.** It has been seen 28 minutes stale while a
+  512 MiB file was written and deleted without the number moving.
+- **Space with no directory entry.** A file unlinked while still open is
+  invisible to `ls`, `du` and rapiDU's own walk — but you are charged for it.
+- **Where the inodes are.** One conda env is ~177,000 against a 300,000 home
+  quota. Inode exhaustion blocks job submission and nobody connects the two.
 
 ```
 ! 187.6 MiB allocated for 23.6 MiB of data — 8.0x. Your quota is charged the first number.
@@ -74,10 +64,8 @@ So 3,000 files of 8 KiB hold 23.6 MiB and occupy 187.6 MiB:
     occupy 164.1 MiB of padding. Packing them (tar, squashfs) returns it.
 ```
 
-The unit is **measured**, not assumed: `statvfs` reports the 4 MiB GPFS *block*
-where files actually allocate in 16 KiB subblocks. It runs the other way too —
-below ~3.5 KiB the data lives in the inode, so the same filesystem stores 8.7 MiB
-in 1.6 MiB, and there the report points at inodes instead.
+The allocation unit is **measured**, not assumed: `statvfs` reports the 4 MiB
+GPFS *block* where files actually allocate in 16 KiB subblocks.
 
 ## Reading the table
 
@@ -88,47 +76,10 @@ in 1.6 MiB, and there the report points at inodes instead.
  470.9 GiB  ▒▒▒▒▒▒▒▒░░░░░░░░░░   22.9%      4,117  (84 more — use -n 0 for all)
 ```
 
-The bar is share of the **whole tree**, so it always agrees with the number
-beside it, and the track is that tree so short bars have a common edge. The
-hatched row is everything not listed. Colour is rank, and the column you sorted
-by is the one wearing it — under `-i`, `files` takes the tone and `size` steps
-back. Sizes are cumulative, so any row agrees with `du -s` on that path.
-
-## The ceiling, stated because it is owed
-
-**~29,000 stats/s is the filesystem's ceiling, not the tool's.** More threads do
-not help — 8 and 16 tie, 32 is worse, 128 much worse — and neither do more
-processes, since two move the same total as one. The pool caps at 16 and defaults
-to 8, which is also the polite setting: this walk is metadata load on a shared
-filesystem, the exact sin the tool exists to diagnose.
-
-So the comparison above is against a single-threaded 1971 program, *not* the
-state of the art. `dust`, `gdu`, `diskus` and `duc` exist and will land within a
-few percent of rapiDU on the same filesystem. **Speed is table stakes; items 1–5
-are the product.**
-
-## Limits
-
-- **Cross-user attribution needs root.** You can read only your own
-  `/proc/*/fd`, so in a shared group quota you can prove a gap exists but not
-  name the labmate holding it. The uninspectable count is printed.
-- **The deleted-fd scan is node-local.** A job holding a deleted file on a
-  compute node is invisible from a login node.
-- **Off-site, fields go absent, not zero** — each prints `n/a` with a reason.
-- **Interrupting is safe.** Ctrl+C prints the subtrees that finished and says the
-  rest is unknown, rather than ranking a half-counted tree.
-
-## Tests
-
-```bash
-pip install -e ".[dev]" && pytest
-```
-
-The suite pins the invariants that decide whether this beats `du` or embarrasses
-itself: byte-exact agreement, identical results across thread counts, hard-link
-dedup, sparse files not over-counted, a Python 3.6 parse floor — and, for most of
-the reconciliation tests, the refusals. The GIF and the chart are both generated
-from real output by [`assets/`](assets/); nothing in either is hand-drawn.
+The bar is share of the whole tree, so it always agrees with the number beside
+it. The hatched row is everything not listed. The column you sorted by is the one
+in colour — under `-i`, `files` takes the tone and `size` steps back. Sizes are
+cumulative, so any row agrees with `du -s` on that path.
 
 ---
 
