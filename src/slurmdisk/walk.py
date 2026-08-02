@@ -137,10 +137,6 @@ class Entry:
         return self.files + self.dirs
 
 
-# Backwards-compatible alias; the type grew beyond directories.
-DirAgg = Entry
-
-
 class WalkResult:
     """Everything one walk learned. All byte figures are allocated blocks."""
 
@@ -158,7 +154,7 @@ class WalkResult:
         # "files" quota charges.
         self.by_uid = {}  # type: Dict[int, Tuple[int, int]]
         self.by_dev = {}  # type: Dict[int, Tuple[int, int]]
-        self.dir_agg = {}  # type: Dict[str, DirAgg]
+        self.dir_agg = {}  # type: Dict[str, Entry]
         self.unreadable_dirs = []  # type: List[Tuple[str, str]]
         self.unstatable = 0
         self.recent_files = 0
@@ -194,7 +190,7 @@ class WalkResult:
         """
         return self.files + self.dirs - self.hardlink_extra_refs
 
-    def top_dirs(self, n: int, key: str = "size", finished_only: bool = False) -> List[DirAgg]:
+    def top_dirs(self, n: int, key: str = "size", finished_only: bool = False) -> List[Entry]:
         """Reported directories ranked by ``size``, ``files`` or ``density``.
 
         ``finished_only`` drops entries whose subtree was still being walked,
@@ -534,9 +530,12 @@ def walk(
     res.hardlinked_inodes = len(seen_links)
     res.finished_tops = finished_tops
     # A depth-1 plain file is complete the moment the root was scanned; only
-    # directories can be caught mid-walk.
+    # directories can be caught mid-walk. The dirname check is load-bearing: at
+    # depth > 1 dir_agg also holds deeper entries, and adding the basename of a
+    # file at `a/b` would mark a *different*, still-unfinished top-level
+    # directory named `b` as complete.
     for entry in res.dir_agg.values():
-        if entry.path != root and not entry.is_dir:
+        if not entry.is_dir and os.path.dirname(entry.path) == root:
             res.finished_tops.add(os.path.basename(entry.path))
     if progress is not None:
         progress.finished = True

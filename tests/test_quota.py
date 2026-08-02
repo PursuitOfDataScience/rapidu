@@ -198,3 +198,36 @@ def test_units_are_base_1024():
     assert parse_size("127.94M") == int(127.94 * (1 << 20))
     assert parse_size("1024.00G") == 1 << 40
     assert parse_size("1.10T") == int(1.10 * (1 << 40))
+
+
+# The `blocks` header means 1 KiB units; `space` means human-readable sizes.
+# Same numbers, same layout, only the header word differs.
+STOCK_BLOCKS_OUTPUT = """Disk quotas for user someone (uid 1000):
+     Filesystem  blocks   quota   limit   grace   files   quota   limit   grace
+      /dev/sda1  1048576 2097152 4194304            1000    5000   10000
+"""
+
+
+def test_stock_quota_blocks_column_is_kibibytes():
+    """`quota` prints 1 KiB blocks; `quota -s` prints sizes with a suffix.
+
+    Reading a `blocks` figure as bytes under-reported by 1024x -- a 4 GiB hard
+    limit printed as 4 MiB, which would make every reconciliation against it a
+    fabricated gap the size of the quota.
+    """
+    rows = _parse_stock_quota(STOCK_BLOCKS_OUTPUT)
+    blocks = [r for r in rows if r.kind == "blocks"]
+    assert len(blocks) == 1
+    assert blocks[0].used == 1024 * (1 << 20)  # 1048576 KiB == 1 GiB
+    assert blocks[0].soft == 2 * (1 << 30)
+    assert blocks[0].hard == 4 * (1 << 30)
+    # The file counts are plain integers under either header.
+    assert [r.used for r in rows if r.kind == "files"] == [1000]
+
+
+def test_stock_space_and_blocks_headers_agree_on_the_same_quota():
+    """Both spellings of the same quota must produce the same bytes."""
+    spaced = [r for r in _parse_stock_quota(STOCK_OUTPUT) if r.kind == "blocks"][0]
+    blocked = [r for r in _parse_stock_quota(STOCK_BLOCKS_OUTPUT) if r.kind == "blocks"][0]
+    assert spaced.used == blocked.used == 1 << 30
+    assert (spaced.soft, spaced.hard) == (blocked.soft, blocked.hard)

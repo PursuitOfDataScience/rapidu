@@ -166,3 +166,66 @@ def test_crossing_filesystems_blocks_a_finding():
     r = rc.reconcile(w, fresh_settle(), make_snap(50_000_000, age=1.0), empty_scan(), "blocks")
     assert r.verdict == rc.INCONCLUSIVE
     assert any("filesystem" in b for b in r.blockers)
+
+
+# ---- a stat-free walk has nothing to reconcile ---------------------------
+
+
+def count_only_walk(root=MOUNT):
+    """What `-c` leaves behind: counts, and no bytes or ownership at all.
+
+    `account_root` still records the root's own inode under the caller's uid,
+    which is exactly what made the bug convincing -- `by_uid` was non-empty, so
+    nothing downstream noticed the other 300 files were never stat'ed.
+    """
+    r = WalkResult(root)
+    r.count_only = True
+    r.files, r.dirs = 300, 20
+    r.by_uid = {os.getuid(): (512, 1)}
+    r.by_dev = {42: (512, 1)}
+    return r
+
+
+def test_count_mode_refuses_the_block_comparison():
+    """`sd <mount> -c -a` used to report the whole quota as an UNEXPLAINED GAP.
+
+    A -c walk never calls stat, so its byte total is 0. Comparing that against a
+    live quota figure manufactured a finding the size of the quota -- the exact
+    failure this module exists to prevent.
+    """
+    rec = rc.reconcile(
+        count_only_walk(), fresh_settle(), make_snap(used=700 << 20), empty_scan(), "blocks"
+    )
+    assert rec.verdict == rc.NOT_COMPARED
+    assert "-c" in rec.notes[0]
+    assert rec.gap is None
+
+
+def test_count_mode_refuses_a_user_scoped_file_comparison():
+    """-c cannot read who owns a file, so it cannot answer a user quota."""
+    rec = rc.reconcile(
+        count_only_walk(),
+        fresh_settle(),
+        make_snap(used=21638, kind="files", scope="user"),
+        empty_scan(),
+        "files",
+    )
+    assert rec.verdict == rc.NOT_COMPARED
+    assert "who owns" in rec.notes[0]
+
+
+def test_count_mode_file_comparison_is_blocked_by_hardlinks():
+    """A fileset-scoped file quota is comparable, but never conclusive.
+
+    -c counts one entry per name; the quota counts inodes. They differ by
+    however many hard links the tree holds, which -c cannot know.
+    """
+    rec = rc.reconcile(
+        count_only_walk(),
+        fresh_settle(),
+        make_snap(used=21638, kind="files", scope="fileset"),
+        empty_scan(),
+        "files",
+    )
+    assert rec.verdict == rc.INCONCLUSIVE
+    assert any("one entry per name" in b for b in rec.blockers)

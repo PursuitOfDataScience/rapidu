@@ -28,10 +28,6 @@ def _uname(uid: int) -> str:
         return str(uid)
 
 
-def _h(title: str) -> List[str]:
-    return ["", title, _RULE]
-
-
 def _counter(n: Optional[int]) -> str:
     """``human_count`` under the same signature as ``human_bytes``."""
     return human_count(n)
@@ -387,8 +383,14 @@ def render_compact(
     return out
 
 
-def _hard_warnings(res: WalkResult, settle: SettleCheck, style: ui.Style) -> List[str]:
-    """Only the things that change what the headline number means."""
+def _hard_warnings(
+    res: WalkResult, settle: SettleCheck, style: ui.Style, settling: bool = True
+) -> List[str]:
+    """Only the things that change what the headline number means.
+
+    ``settling`` is off for the full report, which follows this with the whole
+    SETTLING block and would otherwise state the drift twice.
+    """
     out = []  # type: List[str]
     if res.partial:
         out.append(
@@ -417,7 +419,7 @@ def _hard_warnings(res: WalkResult, settle: SettleCheck, style: ui.Style) -> Lis
         if res.unstatable:
             detail.append("{} entries unstatable".format(res.unstatable))
         out.append(ui.alarm("this is a FLOOR, not a total: " + ", ".join(detail), style))
-    if settle.moved:
+    if settling and settle.moved:
         # With --settle-wait 0 the re-stat is immediate, so "0s later" would be a
         # fabricated precision: the real observation window is however long the
         # walk itself took to reach the end.
@@ -444,26 +446,28 @@ def render_walk(
     style: Optional[ui.Style] = None,
     by_inodes: bool = False,
 ) -> List[str]:
-    """The walk block of the full report: headline, then facts worth a line each."""
+    """The walk block of the full report: headline, then facts worth a line each.
+
+    The headline carries only the path and the total. The breakdown moved down to
+    the facts line because a long scratch path plus the counts ran past 100
+    columns and got clipped -- and the clipped end was the number, not the path.
+    """
     style = style or ui.resolve_style("never")
     out = [
         "",
-        "{}  {}   {}   {}".format(
+        "{}  {}   {}".format(
             ui.heading("WALK", style),
-            style.paint(res.root, "bold"),
+            style.paint(ui.truncate(res.root, max(24, style.width - 28)), "bold"),
             style.paint(human_bytes(res.size), "bold_cyan"),
-            style.paint(
-                "{} files  ({} regular + {} directories)".format(
-                    human_count(res.inodes),
-                    human_count(res.files - res.hardlink_extra_refs),
-                    human_count(res.dirs),
-                ),
-                "dim",
-            ),
         ),
     ]
 
     facts = [
+        "{} files ({} regular + {} dirs)".format(
+            human_count(res.inodes),
+            human_count(res.files - res.hardlink_extra_refs),
+            human_count(res.dirs),
+        ),
         "{:.2f}s at {} threads ({:,.0f} files/s)".format(
             res.elapsed, res.threads, res.inodes / res.elapsed if res.elapsed > 0 else 0.0
         ),
@@ -483,19 +487,8 @@ def render_walk(
         )
     out.append(style.paint("  " + "  ".join(facts), "dim"))
 
-    out.extend(_hard_warnings(res, settle, style))
-    if res.recent_files and not settle.moved:
-        out.append(
-            style.paint(
-                "  {} file{} written in the last {} -- figure is provisional"
-                " (--settle-wait 60 to measure)".format(
-                    human_count(res.recent_files),
-                    "" if res.recent_files == 1 else "s",
-                    human_duration(res.settle_window),
-                ),
-                "dim",
-            )
-        )
+    out.extend(_hard_warnings(res, settle, style, settling=False))
+    out.extend(render_settle(res, settle, style))
 
     if not res.complete and res.unreadable_dirs:
         for path, why in res.unreadable_dirs[:3]:
@@ -525,20 +518,11 @@ def render_walk(
     return out
 
 
-def render_footer() -> List[str]:
-    """Kept for --about; deliberately not printed on every run."""
-    return [
-        "",
-        _RULE,
-        "slurmdisk agrees with `du -s --block-size=1` byte-for-byte on the same tree.",
-        "It is not more accurate than du; it is faster, and it reports three things du",
-        "cannot see: unsettled trees, unlinked-but-open space, and the age of the quota",
-        "number it is compared against.",
-    ]
-
-
-def render_settle(res: WalkResult, settle: SettleCheck) -> List[str]:
+def render_settle(
+    res: WalkResult, settle: SettleCheck, style: Optional[ui.Style] = None
+) -> List[str]:
     """The "this tree has not settled" warning -- a truth ``du`` cannot tell."""
+    style = style or ui.resolve_style("never")
     if not res.recent_files:
         return []
 
@@ -548,46 +532,67 @@ def render_settle(res: WalkResult, settle: SettleCheck) -> List[str]:
     # measurably moving or big enough to move things.
     if not settle.moved and not _settling_is_material(res):
         return [
-            "  {:<22}{} file{} written in the last {} -- figure is provisional"
-            " (--settle-wait 60 to measure)".format(
-                "settling",
-                human_count(res.recent_files),
-                "" if res.recent_files == 1 else "s",
-                human_duration(res.settle_window),
+            style.paint(
+                "  {:<22}{} file{} written in the last {} -- figure is provisional"
+                " (--settle-wait 60 to measure)".format(
+                    "settling",
+                    human_count(res.recent_files),
+                    "" if res.recent_files == 1 else "s",
+                    human_duration(res.settle_window),
+                ),
+                "dim",
             )
         ]
 
-    out = ["", "  SETTLING"]
+    out = ["", "  " + ui.heading("SETTLING", style)]
     out.append(
-        "      {} file{} written in the last {}".format(
-            human_count(res.recent_files),
-            " was" if res.recent_files == 1 else "s were",
-            human_duration(res.settle_window),
+        style.paint(
+            "      {} file{} written in the last {}".format(
+                human_count(res.recent_files),
+                " was" if res.recent_files == 1 else "s were",
+                human_duration(res.settle_window),
+            ),
+            "dim",
         )
     )
 
     if settle.moved:
         direction = "MORE" if settle.drift > 0 else "LESS"
         out.append(
-            "      ! a re-stat {} found {} {} allocated: this tree is still moving.".format(
-                "{:.0f}s later".format(settle.gap) if settle.gap >= 1 else "after the walk",
-                human_bytes(abs(settle.drift)),
-                direction,
+            "    "
+            + ui.warn(
+                "a re-stat {} found {} {} allocated: this tree is still moving.".format(
+                    "{:.0f}s later".format(settle.gap) if settle.gap >= 1 else "after the walk",
+                    human_bytes(abs(settle.drift)),
+                    direction,
+                ),
+                style,
             )
         )
-        out.append("        Any size you read right now -- from this tool or from du --")
-        out.append("        is provisional. Measured on GPFS, a freshly written tree has")
-        out.append("        settled both upward (5.58x) and downward (3.3x) over ~60s.")
+        out.append(
+            style.paint(
+                "        Any size you read right now -- from this tool or from du -- is\n"
+                "        provisional. Measured on GPFS, a freshly written tree has settled\n"
+                "        both upward (5.58x) and downward (3.3x) over ~60s.",
+                "dim",
+            )
+        )
         if settle.sampled:
             out.append(
-                "        (re-stat covered {} of {} recent files)".format(
-                    human_count(settle.checked), human_count(settle.sampled_of)
+                style.paint(
+                    "        (re-stat covered {} of {} recent files)".format(
+                        human_count(settle.checked), human_count(settle.sampled_of)
+                    ),
+                    "dim",
                 )
             )
     elif settle.conclusive:
         out.append(
-            "      re-stat {:.0f}s later found no change in {} of them; "
-            "the figure looks settled".format(settle.gap, human_count(settle.checked))
+            style.paint(
+                "      re-stat {:.0f}s later found no change in {} of them; "
+                "the figure looks settled".format(settle.gap, human_count(settle.checked)),
+                "dim",
+            )
         )
     else:
         # A re-stat taken immediately cannot see an effect that takes tens of
@@ -595,10 +600,17 @@ def render_settle(res: WalkResult, settle: SettleCheck) -> List[str]:
         # blind instrument -- but four lines of caveat for a handful of files in
         # a large tree is noise, so the long form is reserved for the case where
         # the unsettled files could actually move the total.
-        out.append("      figure is PROVISIONAL -- use --settle-wait 60 to measure the drift")
+        out.append(
+            style.paint(
+                "      figure is PROVISIONAL -- use --settle-wait 60 to measure the drift", "dim"
+            )
+        )
     if settle.gone:
         out.append(
-            "      {} of them disappeared between the walk and the re-stat".format(settle.gone)
+            style.paint(
+                "      {} of them disappeared between the walk and the re-stat".format(settle.gone),
+                "dim",
+            )
         )
     return out
 
@@ -614,96 +626,56 @@ def _settling_is_material(res: WalkResult) -> bool:
     return res.recent_files >= max(50, res.inodes // 100) or res.recent_apparent >= (256 << 20)
 
 
-def render_top(res: WalkResult, top: int) -> List[str]:
-    if top < 0:
-        return []
-    out = []  # type: List[str]
-    by_size = res.top_dirs(top, "size")
-    if by_size:
-        out.extend(["", "  LARGEST SUBTREES"])
-        for a in by_size:
-            out.append(
-                "      {:>10}  {:>10} inodes  {}".format(
-                    human_bytes(a.size), human_count(a.inodes), os.path.relpath(a.path, res.root)
-                )
-            )
-
-    # Ranked by inodes, with density as a *column* rather than its own ranking.
-    #
-    # There used to be a third "DENSEST" section sorted by files/GiB. It was
-    # worse than useless: a ratio is won by the smallest denominator, so it
-    # nominated a 260 KiB .git directory as the "best candidate to pack" ahead of
-    # one holding ten times the inodes. Packing a directory reclaims the inodes
-    # it holds, so the absolute count is the ranking and density only says how
-    # cheap the tar will be.
-    by_files = res.top_dirs(top, "files")
-    if by_files and [a.path for a in by_files] != [a.path for a in by_size]:
-        out.extend(["", "  MOST INODES  (density is what a tar would cost you)"])
-        for a in by_files:
-            d = files_per_gib(a.size, a.inodes)
-            out.append(
-                "      {:>10} inodes  {:>10}  {:>12}  {}".format(
-                    human_count(a.inodes),
-                    human_bytes(a.size),
-                    "n/a" if d is None else "{:,.0f}/GiB".format(d),
-                    os.path.relpath(a.path, res.root),
-                )
-            )
-    return out
-
-
-def render_deleted_oneline(scan: DeletedScan) -> List[str]:
-    """One line for the combined report when the scan found nothing.
-
-    The full section exists to describe space that was found. Printing seven
-    lines of scope caveats to announce a null result buries the rest of the
-    report, and "incomplete" is unconditionally true on a shared login node
-    where every other user's processes are unreadable.
-    """
-    if not scan.available or scan.files:
-        return []
-    return [
-        "  {:<22}none on this node ({} of {} processes inspectable)".format(
-            "unlinked-but-open", scan.scanned_pids, scan.scanned_pids + scan.unreadable_pids
-        )
-    ]
-
-
-def render_deleted(scan: DeletedScan, top: int = 10) -> List[str]:
-    out = _h("UNLINKED BUT STILL OPEN")
+def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] = None) -> List[str]:
+    """Space with no directory entry. Every other section honours --color; so
+    does this one -- and here the headline figure is genuinely an alarm, because
+    it is quota being charged for something no walker can show you."""
+    style = style or ui.resolve_style("never")
+    out = ["", ui.heading("UNLINKED BUT STILL OPEN", style), style.paint(_RULE, "dim")]
     if not scan.available:
         out.append("  n/a - {}".format(scan.reason))
         return out
     if not scan.files:
         out.append(
-            "  none found in {} inspectable processes on this node".format(scan.scanned_pids)
+            style.paint(
+                "  none found in {} inspectable processes on this node".format(scan.scanned_pids),
+                "dim",
+            )
         )
     else:
         out.append(
-            "  {} held by open file descriptors in {} inodes".format(
-                human_bytes(scan.total_size), len(scan.files)
+            "  {} {}".format(
+                style.paint(human_bytes(scan.total_size), "bold_red"),
+                style.paint(
+                    "held by open file descriptors in {} inodes".format(len(scan.files)), "bold"
+                ),
             )
         )
-        out.append("  (invisible to du, to ls, and to this tool's own walk)")
+        out.append(style.paint("  (invisible to du, to ls, and to this tool's own walk)", "dim"))
         out.append("")
         for f in scan.files[:top]:
             holders = ", ".join(
                 "{} {}".format(p, c.split()[0] if c else "?") for p, c in f.holders[:3]
             )
-            out.append("      {:>10}  pid {}".format(human_bytes(f.size), holders))
+            out.append(
+                "      {}  {}".format(
+                    style.paint("{:>10}".format(human_bytes(f.size)), "bold_yellow"),
+                    style.paint("pid {}".format(holders), "cyan"),
+                )
+            )
             out.append("                  {}".format(f.path))
         if len(scan.files) > top:
-            out.append("      ... and {} more".format(len(scan.files) - top))
-    out.append("")
-    out.append("  scope: this node only, {} processes inspected".format(scan.scanned_pids))
+            out.append(style.paint("      ... and {} more".format(len(scan.files) - top), "dim"))
+    scope = ["", "  scope: this node only, {} processes inspected".format(scan.scanned_pids)]
     if scan.unreadable_pids:
-        out.append(
+        scope.append(
             "         {} processes belong to other users and cannot be inspected".format(
                 scan.unreadable_pids
             )
         )
-        out.append("         without root, so this figure is a floor.")
-    out.append("         A job holding a deleted file on a compute node is not visible here.")
+        scope.append("         without root, so this figure is a floor.")
+    scope.append("         A job holding a deleted file on a compute node is not visible here.")
+    out.extend(style.paint(ln, "dim") if ln else ln for ln in scope)
     return out
 
 

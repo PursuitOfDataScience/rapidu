@@ -368,3 +368,46 @@ def test_count_only_still_terminates(tmp_path):
     r = walk(root, threads=4, count_only=True)
     assert r.dirs == 1 + 6 * 3
     assert r.files == 6
+
+
+def test_finished_tops_holds_only_top_level_names(tmp_path):
+    """A file below the top level must not put its basename in the set.
+
+    ``finished_tops`` is keyed by depth-1 name, and ``is_finished`` matches an
+    entry's first path component against it. A file at ``a/ghost`` adding
+    ``ghost`` would vouch for a *different*, still-unfinished top-level
+    directory of that name -- so an interrupted walk would rank a half-counted
+    subtree as though it were complete.
+    """
+    root = tmp_path / "ft"
+    (root / "a").mkdir(parents=True)
+    (root / "a" / "ghost").write_bytes(b"x" * 4096)
+    (root / "top.bin").write_bytes(b"x" * 4096)
+
+    r = walk(str(root), threads=2, depth=2)
+    assert "a" in r.finished_tops
+    assert "top.bin" in r.finished_tops, "a depth-1 file is finished the moment the root is read"
+    assert "ghost" not in r.finished_tops
+
+
+def test_a_deep_file_cannot_vouch_for_a_same_named_top_directory(tmp_path):
+    """The consequence, spelled out: same name, two different depths."""
+    root = tmp_path / "clash"
+    (root / "b").mkdir(parents=True)  # a top-level DIRECTORY named b
+    (root / "b" / "payload").write_bytes(b"x" * 4096)
+    (root / "a").mkdir()
+    (root / "a" / "b").write_bytes(b"x" * 4096)  # a depth-2 FILE also named b
+
+    r = walk(str(root), threads=2, depth=2)
+    # On a complete walk everything is finished, which is what makes the bug
+    # invisible here -- so check the entry that would have been the false
+    # witness is not a top-level name at all.
+    files_at_top = {
+        os.path.basename(e.path)
+        for e in r.dir_agg.values()
+        if not e.is_dir and os.path.dirname(e.path) == r.root
+    }
+    assert files_at_top == set(), "this fixture has no top-level plain files"
+    r.partial = True
+    r.finished_tops = set()
+    assert r.top_dirs(50, finished_only=True) == []

@@ -24,7 +24,7 @@ import re
 import socket
 import subprocess
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple  # noqa: F401  (`# type:` use)
 
 # Site wrappers can be slow (they may query the filesystem's quota manager).
 DEFAULT_TIMEOUT_S = 45.0
@@ -321,10 +321,15 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
     """Stock ``quota`` layout: a ``Filesystem`` header then one row per fs.
 
     The block column is headed ``blocks`` by plain ``quota`` and ``space`` by
-    ``quota -s``. Grace columns are printed only when a limit is exceeded, so a
-    data row carries 7 fields normally and 9 when both graces are present. An
-    8-field row is ambiguous -- which of the two graces is present cannot be
-    determined -- and is skipped rather than guessed at.
+    ``quota -s``. **That header also states the unit**: under ``blocks`` the
+    figures are raw 1 KiB blocks, under ``space`` they are human-readable with a
+    suffix. Reading a ``blocks`` figure as bytes under-reports by 1024x -- a
+    30 GiB home quota would print as 30 MiB -- so the header decides the scale.
+
+    Grace columns are printed only when a limit is exceeded, so a data row
+    carries 7 fields normally and 9 when both graces are present. An 8-field row
+    is ambiguous -- which of the two graces is present cannot be determined --
+    and is skipped rather than guessed at.
     """
     rows = []  # type: List[QuotaRow]
     lines = out.splitlines()
@@ -333,6 +338,14 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
             continue
         if "blocks" not in line and "space" not in line:
             continue
+        kib_units = "space" not in line
+
+        def block_bytes(tok, kib=kib_units):
+            v = parse_size(tok.rstrip("*"))
+            if v is None:
+                return None
+            return v * 1024 if kib else v
+
         for nxt in lines[i + 1 :]:
             parts = nxt.split()
             if len(parts) < 7 or not parts[0].startswith("/"):
@@ -344,9 +357,9 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
             else:
                 continue
             fs = parts[0]
-            blocks = parse_size(parts[bidx].rstrip("*"))
-            bsoft = parse_size(parts[bidx + 1])
-            bhard = parse_size(parts[bidx + 2])
+            blocks = block_bytes(parts[bidx])
+            bsoft = block_bytes(parts[bidx + 1])
+            bhard = block_bytes(parts[bidx + 2])
             files = None  # type: Optional[int]
             fsoft = None  # type: Optional[int]
             fhard = None  # type: Optional[int]
@@ -485,23 +498,3 @@ def read_best(path: str, timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapshot:
         "{}: {}".format(a.source, a.reason or "unavailable") for a in attempts
     )
     return merged
-
-
-def statvfs_used(path: str) -> Optional[Dict[str, int]]:
-    """Filesystem-wide usage. Not a quota -- context only.
-
-    On a shared cluster filesystem this describes the whole device, not the
-    caller, so it must never be presented as "your usage".
-    """
-    try:
-        s = os.statvfs(path)
-    except OSError:
-        return None
-    return {
-        "total": s.f_blocks * s.f_frsize,
-        "free": s.f_bfree * s.f_frsize,
-        "used": (s.f_blocks - s.f_bfree) * s.f_frsize,
-        "inodes_total": s.f_files,
-        "inodes_free": s.f_ffree,
-        "inodes_used": s.f_files - s.f_ffree,
-    }

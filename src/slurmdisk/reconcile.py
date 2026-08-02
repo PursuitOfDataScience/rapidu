@@ -127,6 +127,25 @@ def reconcile(
     rec.row = row
     rec.quota_value = row.used
 
+    # ---- can this walk answer this question at all? ----
+    # A -c walk never calls stat, so it has no bytes and no per-file ownership.
+    # Comparing its zeroes against a real quota figure produced an UNEXPLAINED
+    # GAP the size of the entire quota -- a fabricated finding, which is the one
+    # thing this module exists to prevent.
+    if res.count_only:
+        if kind == "blocks":
+            rec.notes.append(
+                "the walk was run with -c, which skips stat entirely, so it "
+                "measured no bytes; there is nothing to compare against a block quota"
+            )
+            return rec
+        if row.scope == "user":
+            rec.notes.append(
+                "the walk was run with -c, so it could not read who owns each "
+                "file; a user-scoped file quota cannot be reconciled against it"
+            )
+            return rec
+
     # ---- what the walk saw, restricted to the same population as the quota ----
     my_uid = os.getuid()
     if kind == "blocks":
@@ -200,6 +219,15 @@ def reconcile(
                     "drift; use --settle-wait)",
                 )
             )
+
+    if res.count_only:
+        # Only the fileset/group-scoped files comparison reaches here. -c counts
+        # names, and a quota counts inodes; the two differ by however many hard
+        # links the tree holds, which -c cannot know.
+        rec.blockers.append(
+            "the walk was run with -c, which counts one entry per name; a hard-linked "
+            "file is one inode to the quota and several names to this count"
+        )
 
     if res.unreadable_dirs:
         rec.blockers.append(

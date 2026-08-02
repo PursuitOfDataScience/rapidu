@@ -261,7 +261,11 @@ def cmd_deleted(args: argparse.Namespace) -> int:
         if args.as_json:
             print(json.dumps(report.to_json(None, None, None, scan, None, args.top), indent=2))
         else:
-            print("\n".join(report.render_deleted(scan, args.top)))
+            print(
+                "\n".join(
+                    report.render_deleted(scan, args.top, ui.resolve_style(args.color, args.ascii))
+                )
+            )
         if scan.files:
             rcode = EXIT_ATTENTION
     return rcode
@@ -401,7 +405,7 @@ def cmd_walk(args: argparse.Namespace) -> int:
                 )
             )
             if path_scan.available and path_scan.files:
-                lines.extend(report.render_deleted(path_scan, args.top))
+                lines.extend(report.render_deleted(path_scan, args.top, style))
             if recs:
                 lines.extend(report.render_reconcile(recs, style))
             print("\n".join(lines))
