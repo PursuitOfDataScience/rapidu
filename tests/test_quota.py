@@ -165,15 +165,12 @@ def test_render_disambiguates_same_named_filesets(monkeypatch):
     from slurmdisk.report import render_quota
 
     text = "\n".join(render_quota(_parse(monkeypatch, SITE_OUTPUT)))
-    assert "filesystem" in text
     rcc_lines = [ln for ln in text.splitlines() if ln.strip().startswith("rcc ")]
     assert len(rcc_lines) == 2
     assert any("/project" in ln for ln in rcc_lines)
-    # Every row must say which filesystem it is, or say it does not know.
+    # Every data row must name its filesystem, or say it does not know.
     for ln in text.splitlines():
-        if " blocks " in ln or " files  " in ln or " files " in ln:
-            if "fileset" in ln:
-                continue
+        if " blocks " in ln or " files " in ln:
             assert ln.rstrip().split()[-1].startswith(("/", "?")), ln
 
 

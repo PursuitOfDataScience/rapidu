@@ -92,7 +92,7 @@ select = ["E", "F", "W", "I", "B", "C4", "SIM"]
 quote-style = "double"
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"   # mypy's own floor; the runtime floor is 3.6, guarded by tests/test_py36_compat.py
 ignore_missing_imports = true
 warn_unused_ignores = false
 exclude = "src/slurmdisk/_version.py"

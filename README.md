@@ -173,38 +173,55 @@ discrepancy.
   unparseable format — each prints `n/a` with a reason, and nothing downstream
   breaks.
 
-## Speed
+## Speed — and the axis that actually matters
 
-`du` is single-threaded and spends ~95% of its wall time blocked on filesystem
-latency, so concurrency is the whole lever — not language. Measured on 787k GPFS
-inodes / 370 GB from a 6-core login node:
+**Bytes do not predict how long a walk takes; inodes do.** Measured on this
+cluster, same filesystem, same day:
+
+| tree | size | inodes | `du` | `slurmdisk` | |
+|---|---|---|---|---|---|
+| `.cache/huggingface` | 161.7 GiB | 3,286 | 0.44s | 0.03s | 14x |
+| `.cache` | 350.0 GiB | 781,772 | 162.25s | 25.28s | **6.4x** |
+
+Twice the bytes, **370x the wall time.** A 1 TB directory of a few large
+checkpoint shards walks in milliseconds; a 1 GB directory of two million tiny
+files takes minutes. If you want to know how long `sd` will take on a tree, ask
+how many inodes are in it, not how many gigabytes.
+
+**Where the speedup comes from, and where it does not.** `du` on that 780k-inode
+tree spent 165.9s wall against 8.5s of CPU — **94.9% of it blocked on filesystem
+latency**, not computing. Concurrency hides that latency; that is the entire
+mechanism, and it is why the language does not matter (`getdents`/`stat` release
+the GIL).
+
+It follows that when there is no latency to hide, there is no win:
 
 ```
-du -s --block-size=1     164.18s          <- first pass
-scandir threads=1        151.75s   1.08x
-scandir threads=4         45.32s   3.62x
-scandir threads=8         27.71s   5.93x   <- default
-scandir threads=16        26.67s   6.16x   <- knee; the cap
-du -s --block-size=1     168.75s          <- AFTER all four walks
+/home/researcher, 21,556 inodes, metadata fully cached
+  du 0.140s | slurmdisk 0.164s     0.85x   <- slower
+same tree, cold
+  du 4.778s | slurmdisk 0.163s    29.3x
 ```
 
-**The last line is the control.** A warmed metadata cache would have made that
-final `du` fast. It did not — 168.75s against 164.18s, after four complete walks
-of the same inodes — so the speedup is attributable to concurrency alone.
+**On a warm cache slurmdisk is about 15% slower than `du`**, because threaded
+Python loses to single-threaded C when both are CPU-bound. That is the honest
+shape of it: this is a tool for cold, large, networked trees — which is what a
+scratch or project filesystem is in practice — and it has nothing to offer on a
+small warm one.
 
-Past the knee the walk gets *slower*, so the pool is hard-capped at 16 and
+Past 16 threads the walk gets *slower*, so the pool is hard-capped at 16 and
 defaults to 8. The fast setting and the polite setting turn out to be the same
 setting, which matters because this walk is metadata load on a shared
 filesystem: the exact sin the tool exists to diagnose. `--max-dirs-per-sec`
 throttles it further on a busy day.
 
-> **Prior-art caveat, stated because it is still owed.** The speed comparison
-> above is against `du`, a single-threaded 1971 program — *not* against the
-> state of the art. Parallel disk-usage walkers already exist (`dust`, `gdu`,
-> `diskus`, `duc`) and a Rust one will very likely match or beat threaded
-> Python. A full PyPI/GitHub sweep has **not** been run, so assume the parallel
-> walk is a solved problem until shown otherwise. **Speed is table stakes here;
-> the quota-age, settling and deleted-fd reporting are the product.**
+> **Prior-art caveat, stated because it is still owed.** The comparison above is
+> against `du`, a single-threaded 1971 program — *not* against the state of the
+> art. Parallel disk-usage walkers already exist (`dust`, `gdu`, `diskus`,
+> `duc`) and a Rust one will very likely match or beat threaded Python. A full
+> PyPI/GitHub sweep has **not** been run, so assume the parallel walk is a
+> solved problem until shown otherwise. **Speed is table stakes here; the
+> quota-age, settling and deleted-fd reporting are the product.**
 
 ## Install
 

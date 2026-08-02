@@ -65,13 +65,26 @@ class TokenBucket:
             time.sleep(min(deficit, 0.25))
 
 
-class DirAgg:
-    """Rolled-up totals for one reported directory."""
+class Entry:
+    """One reported child of the walked tree: a directory or a large file.
 
-    __slots__ = ("path", "size", "files", "dirs")
+    ``size`` is **cumulative** for a directory -- it includes everything beneath
+    it, which is what ``du`` reports and what anyone reading a disk-usage list
+    expects. An earlier version charged a directory only with the entries
+    immediately inside it, so ``notebooks`` read 70.6 MiB against ``du``'s
+    94.3 MiB and a parent could rank *below* its own child. Worse, a directory
+    whose bulk lived one level down vanished from the listing entirely while its
+    children appeared, which reads exactly like missing data.
 
-    def __init__(self, path: str) -> None:
+    Plain files are entries too. Three 63.3 MiB ``.db`` files sitting directly in
+    a home directory are 27% of it, and a directory-only listing cannot see them.
+    """
+
+    __slots__ = ("path", "size", "files", "dirs", "is_dir")
+
+    def __init__(self, path: str, is_dir: bool) -> None:
         self.path = path
+        self.is_dir = is_dir
         self.size = 0
         self.files = 0
         self.dirs = 0
@@ -85,6 +98,10 @@ class DirAgg:
     def inodes(self) -> int:
         """Directories are inodes too, and a files-quota charges for them."""
         return self.files + self.dirs
+
+
+# Backwards-compatible alias; the type grew beyond directories.
+DirAgg = Entry
 
 
 class WalkResult:
@@ -149,20 +166,27 @@ class WalkResult:
         return aggs[:n]
 
 
-def _rollup_key(root: str, path: str, depth: int) -> str:
-    """The depth-limited ancestor of ``path`` that aggregates should land on.
+def _entry_keys(root: str, rel_parts: Tuple[str, ...], depth: int) -> List[str]:
+    """Every reported ancestor of an object, plus the object itself if shallow.
 
-    Computed per directory rather than storing every directory, which keeps
-    memory proportional to the number of *reported* directories instead of the
-    number of walked ones (100k+ on a real cache tree).
+    For an object at ``a/b/c`` with ``depth=2`` this returns ``[a, a/b]``: its
+    bytes are charged to both, which is what makes directory totals cumulative.
+    For ``a`` it returns ``[a]`` -- the object is its own entry because it sits
+    within the reported depth.
+
+    Relative parts are carried on the work queue rather than recovered with
+    ``os.path.relpath`` per object, which would be a string operation per inode
+    on a million-inode walk.
     """
-    if path == root or depth <= 0:
-        return root
-    rel = os.path.relpath(path, root)
-    if rel == os.curdir:
-        return root
-    parts = rel.split(os.sep)
-    return os.path.join(root, *parts[:depth])
+    n = min(len(rel_parts), depth)
+    if n <= 0:
+        return []
+    keys = []
+    acc = root
+    for i in range(n):
+        acc = acc + os.sep + rel_parts[i]
+        keys.append(acc)
+    return keys
 
 
 def walk(
@@ -200,7 +224,9 @@ def walk(
     now = time.time()
     recent_cutoff = now - settle_window
 
-    queue = deque([root])
+    # (abspath, parts relative to root) -- the parts are what make the
+    # cumulative ancestor keys cheap to compute.
+    queue = deque([(root, ())])  # type: deque
     # Directories queued but not yet fully processed. The walk is done when the
     # queue is empty AND this reaches zero -- a worker holding the last directory
     # may still be about to enqueue children, so an empty queue alone is not
@@ -221,8 +247,7 @@ def walk(
         res.size += root_st.st_blocks * 512
         res.apparent += root_st.st_size
         res.dirs += 1
-        agg = res.dir_agg.setdefault(root, DirAgg(root))
-        agg.add(root_st.st_blocks * 512, 0, 1)
+        # The root is not itself a reported entry -- it is the total.
         res.by_uid[root_st.st_uid] = (root_st.st_blocks * 512, 1)
         res.by_dev[root_dev] = (root_st.st_blocks * 512, 1)
 
@@ -232,6 +257,7 @@ def walk(
         l_extra = 0
         l_uid = {}  # type: Dict[int, List[int]]
         l_dev = {}  # type: Dict[int, List[int]]
+        # key -> [bytes, files, dirs, is_dir]
         l_agg = {}  # type: Dict[str, List[int]]
         l_unreadable = []  # type: List[Tuple[str, str]]
         l_sample = []  # type: List[Tuple[str, int]]
@@ -243,11 +269,29 @@ def walk(
                 if stop_ev.is_set() or (not queue and pending_box[0] == 0):
                     cv.notify_all()
                     break
-                d = queue.popleft()
+                d, d_parts = queue.popleft()
 
-            children = []  # type: List[str]
-            key = _rollup_key(root, d, depth)
-            slot = l_agg.setdefault(key, [0, 0, 0])
+            children = []  # type: List[Tuple[str, Tuple[str, ...]]]
+
+            def charge(parts, blocks, is_file, self_is_dir):
+                """Add one object's cost to every reported ancestor, and to
+                itself when it sits within the reported depth."""
+                keys = _entry_keys(root, parts, depth)
+                if not keys:
+                    return
+                last = len(keys) - 1
+                for i, k in enumerate(keys):
+                    slot = l_agg.get(k)
+                    if slot is None:
+                        # The final key is the object itself only when the walk
+                        # has not been truncated by the depth limit.
+                        own = i == last and len(parts) <= depth
+                        slot = l_agg[k] = [0, 0, 0, 0 if (own and is_file) else 1]
+                    slot[0] += blocks
+                    if is_file:
+                        slot[1] += 1
+                    else:
+                        slot[2] += 1
 
             if bucket is not None:
                 bucket.take()
@@ -269,13 +313,9 @@ def walk(
                         if stat.S_ISDIR(mode):
                             if one_file_system and st.st_dev != root_dev:
                                 continue
-                            children.append(entry.path)
-                            # A directory's own inode is charged to the subtree
-                            # it heads, matching du.
-                            child_key = _rollup_key(root, entry.path, depth)
-                            cslot = l_agg.setdefault(child_key, [0, 0, 0])
-                            cslot[0] += blocks
-                            cslot[2] += 1
+                            child_parts = d_parts + (entry.name,)
+                            children.append((entry.path, child_parts))
+                            charge(child_parts, blocks, False, True)
                             l_size += blocks
                             l_app += st.st_size
                             l_dirs += 1
@@ -303,8 +343,7 @@ def walk(
 
                         l_size += blocks
                         l_app += st.st_size
-                        slot[0] += blocks
-                        slot[1] += 1
+                        charge(d_parts + (entry.name,), blocks, True, False)
                         _bump(l_uid, st.st_uid, blocks, 1)
                         _bump(l_dev, st.st_dev, blocks, 1)
 
@@ -345,8 +384,13 @@ def walk(
             for dev, (b, f) in l_dev.items():
                 pb, pf = res.by_dev.get(dev, (0, 0))
                 res.by_dev[dev] = (pb + b, pf + f)
-            for k, (b, f, dcount) in l_agg.items():
-                res.dir_agg.setdefault(k, DirAgg(k)).add(b, f, dcount)
+            for k, (b, f, dcount, isdir) in l_agg.items():
+                ent = res.dir_agg.get(k)
+                if ent is None:
+                    ent = res.dir_agg[k] = Entry(k, bool(isdir))
+                elif isdir:
+                    ent.is_dir = True
+                ent.add(b, f, dcount)
 
     t0 = time.perf_counter()
     account_root()

@@ -27,7 +27,7 @@ from typing import List, Optional
 from . import deleted as deletedmod
 from . import quota as quotamod
 from . import reconcile as rc
-from . import report
+from . import report, ui
 from . import walk as walkmod
 
 EXIT_OK = 0
@@ -84,8 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
         "-d",
         "--depth",
         type=int,
-        default=2,
-        help="directory depth to aggregate for reporting (default: %(default)s)",
+        default=1,
+        help="how deep to break the tree down. 1 lists the immediate children, "
+        "like `du -d1` (default: %(default)s)",
     )
     p.add_argument(
         "-n",
@@ -175,6 +176,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="a quota snapshot older than this cannot support a finding (default: %(default)s)",
     )
+    p.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="colourise output. auto = only when stdout is a terminal, and never "
+        "when NO_COLOR is set (default: %(default)s)",
+    )
+    p.add_argument(
+        "--ascii", action="store_true", help="draw bars with ASCII instead of block glyphs"
+    )
     p.add_argument("-V", "--version", action="store_true", help="print version and exit")
     return p
 
@@ -219,7 +230,11 @@ def cmd_quota(args: argparse.Namespace) -> int:
     if args.as_json:
         print(json.dumps(report.to_json(None, None, snap, None, None), indent=2))
     else:
-        print("\n".join(report.render_quota(snap, paths or None)))
+        print(
+            "\n".join(
+                report.render_quota(snap, paths or None, ui.resolve_style(args.color, args.ascii))
+            )
+        )
     return EXIT_OK if snap.available else EXIT_ATTENTION
 
 
@@ -246,6 +261,7 @@ def cmd_walk(args: argparse.Namespace) -> int:
     # --json is for tooling, which wants the complete document rather than
     # whichever subset the terminal view happens to show.
     full = args.full or args.as_json
+    style = ui.resolve_style(args.color, args.ascii)
 
     snap = None
     # Both of these are work the default view does not use: the quota backend
@@ -296,16 +312,20 @@ def cmd_walk(args: argparse.Namespace) -> int:
         if args.as_json:
             docs.append(report.to_json(res, settle, snap, path_scan, recs, args.top))
         elif not full:
-            print("\n".join(report.render_compact(res, settle, args.top, args.inodes)))
+            print("\n".join(report.render_compact(res, settle, args.top, args.inodes, style)))
         else:
             lines = []  # type: List[str]
             if snap is not None:
-                lines.extend(report.render_quota(snap, [path]))
-            lines.extend(report.render_walk(res, settle, args.top, scan=path_scan))
+                lines.extend(report.render_quota(snap, [path], style))
+            lines.extend(
+                report.render_walk(
+                    res, settle, args.top, scan=path_scan, style=style, by_inodes=args.inodes
+                )
+            )
             if path_scan.available and path_scan.files:
                 lines.extend(report.render_deleted(path_scan, args.top))
             if recs:
-                lines.extend(report.render_reconcile(recs))
+                lines.extend(report.render_reconcile(recs, style))
             print("\n".join(lines))
 
         if not res.complete or settle.moved:

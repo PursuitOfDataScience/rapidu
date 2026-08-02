@@ -91,10 +91,10 @@ def test_default_answers_how_big_and_nothing_else(small_tree, capsys):
     # delayed-allocation blocks, which is the effect this package reports
     # elsewhere and has no business making a CLI test flaky.
     assert "inodes" in out
-    for section in ("QUOTA", "WALK", "RECONCILIATION", "UNLINKED", "SETTLING"):
+    for section in ("QUOTA", "WALK", "RECONCILE", "UNLINKED"):
         assert section not in out, section
-    # Headline plus a blank line plus one line per subdirectory.
-    assert len(out.strip().splitlines()) <= 6
+    # Headline, blank, column header, then one line per child.
+    assert len(out.strip().splitlines()) <= 8
 
 
 def test_full_flag_restores_the_whole_report(small_tree, capsys):

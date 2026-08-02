@@ -12,6 +12,7 @@ import pwd
 from typing import Any, Dict, List, Optional
 
 from . import reconcile as rc
+from . import ui
 from .deleted import DeletedScan
 from .fmt import files_per_gib, human_bytes, human_count, human_duration, pct
 from .quota import QuotaSnapshot
@@ -36,27 +37,27 @@ def _counter(n: Optional[int]) -> str:
     return human_count(n)
 
 
-def render_quota(snap: QuotaSnapshot, paths: Optional[List[str]] = None) -> List[str]:
-    out = _h("QUOTA")
+def render_quota(
+    snap: QuotaSnapshot, paths: Optional[List[str]] = None, style: Optional[ui.Style] = None
+) -> List[str]:
+    style = style or ui.resolve_style("never")
     if not snap.available:
-        out.append("  n/a - {}".format(snap.reason or "no quota backend available"))
-        return out
+        return [
+            ui.heading("QUOTA", style),
+            "  n/a - {}".format(snap.reason or "no quota backend available"),
+        ]
 
     age = snap.age_seconds
     if age is None:
-        out.append(
-            "  source {}   figures published without a timestamp; age UNKNOWN".format(snap.source)
-        )
+        stamp = style.paint("age UNKNOWN (backend published no timestamp)", "yellow")
     else:
-        out.append(
-            "  source {}   figures are a snapshot {} old".format(snap.source, human_duration(age))
+        text = "snapshot {} old".format(human_duration(age))
+        stale = age > rc.DEFAULT_MAX_SNAPSHOT_AGE_S
+        stamp = style.paint(
+            text + (" -- predates anything you just did" if stale else ""),
+            "yellow" if stale else "dim",
         )
-        if age > rc.DEFAULT_MAX_SNAPSHOT_AGE_S:
-            out.append(
-                "  ! this number predates anything you did in the last {}.".format(
-                    human_duration(age)
-                )
-            )
+    out = ["{}  {}".format(ui.heading("QUOTA", style), stamp)]
 
     rows = snap.rows
     if paths:
@@ -68,16 +69,6 @@ def render_quota(snap: QuotaSnapshot, paths: Optional[List[str]] = None) -> List
         if keep:
             rows = keep
 
-    out.append("")
-    # The filesystem column is not decoration. A fileset name is unique only
-    # within one filesystem: on this site "rcc-staff" names four different
-    # quotas and "rcc" two, and without the mount the rows are indistinguishable
-    # from each other.
-    out.append(
-        "  {:<18}{:<8}{:<7}{:>12}{:>12}{:>8}  {}".format(
-            "fileset", "type", "scope", "used", "soft limit", "use%", "filesystem"
-        )
-    )
     for r in rows:
         used = human_count(r.used) if r.kind == "files" else human_bytes(r.used)
         soft = (
@@ -85,36 +76,156 @@ def render_quota(snap: QuotaSnapshot, paths: Optional[List[str]] = None) -> List
             if r.soft is None
             else (human_count(r.soft) if r.kind == "files" else human_bytes(r.soft))
         )
-        # An unmapped mount prints as "?" rather than blank: the row is real and
-        # its numbers are real, we just could not tie it to a path on this host.
-        where = r.mount or "?"
+        frac = r.usage_fraction
+        # Colour is the only thing that makes a near-full quota jump out of a
+        # table of thirty rows.
+        tone = "green"
+        if frac is not None and frac >= 0.90:
+            tone = "red"
+        elif frac is not None and frac >= 0.75:
+            tone = "yellow"
+        bar = ui.bar(frac if frac is not None else 0.0, 10, style, accent=tone, min_tick=False)
         grace = ""
         if r.grace and r.grace.lower() not in ("none", "-", ""):
-            # A running grace timer means the soft limit is already exceeded and
-            # writes stop when it expires. That is the most urgent thing on the
-            # line and it must not be hidden in a column nobody reads.
-            grace = "  ! IN GRACE, {} left".format(r.grace)
+            # An expired soft limit stops writes; it cannot sit in a quiet column.
+            grace = style.paint("  ! IN GRACE, {} left".format(r.grace), "red")
         out.append(
-            "  {:<18}{:<8}{:<7}{:>12}{:>12}{:>8}  {}{}".format(
-                r.fileset[:17],
-                r.kind,
-                r.scope or "-",
-                used,
-                soft,
-                pct(r.usage_fraction, 1.0) if r.usage_fraction is not None else "n/a",
-                where,
+            "  {}  {}  {}  {}  {}  {}{}".format(
+                style.paint("{:<16}".format(r.fileset[:16]), "bold"),
+                style.paint("{:<6}".format(r.kind), "dim"),
+                "{:>11} / {:<11}".format(used, soft),
+                bar,
+                style.paint("{:>6}".format(pct(frac, 1.0) if frac is not None else "n/a"), tone),
+                style.paint(r.mount or "?", "dim"),
                 grace,
             )
         )
 
-    unmapped = [r for r in rows if not r.mount]
-    if unmapped:
+    if any(not r.mount for r in rows):
         for note in snap.mapping_notes():
-            out.append("  ? {}".format(note))
+            out.append(style.paint("  ? " + note, "dim"))
     return out
 
 
-def render_compact(res: WalkResult, settle: SettleCheck, top: int, by_inodes: bool) -> List[str]:
+def render_entries(
+    res: WalkResult, top: int, by_inodes: bool, style: ui.Style, indent: str = "  "
+) -> List[str]:
+    """The ranked table: size, proportional bar, share of tree, inodes, name.
+
+    Sizes are cumulative subtree totals, so any row agrees with ``du -s`` on that
+    path. Plain files appear alongside directories -- three 63 MiB ``.db`` files
+    in a home directory are a quarter of it, and a directory-only listing cannot
+    show them.
+
+    The name comes last and is never truncated: it is the only variable-width
+    column, and putting it at the end keeps every numeric column aligned no
+    matter how deep the paths go. It is also the order ``du`` prints.
+    """
+    ranked = res.top_dirs(top, "files" if by_inodes else "size")
+    if not ranked:
+        return []
+
+    rest_size = max(0, res.size - sum(e.size for e in ranked))
+    rest_inodes = max(0, res.inodes - sum(e.inodes for e in ranked))
+    # A remainder row is only well defined when the listed entries are siblings
+    # that partition the tree. At depth > 1 rows nest and it would double-count.
+    show_rest = rest_size > 0 and _entries_partition_tree(res)
+
+    # The bar and the share must measure whatever the rows were ranked by, or a
+    # -i listing shows an inode ordering with byte-length bars and reads as
+    # though it were mis-sorted.
+    def metric(e):
+        return e.inodes if by_inodes else e.size
+
+    # Scaled to the largest listed entry, not to the total: the bar exists to
+    # discriminate between the rows on screen. The remainder row is deliberately
+    # left barless -- it is an aggregate of things not shown, and giving it the
+    # longest bar would make "everything else" look like the top offender.
+    peak = max(metric(e) for e in ranked) or 1
+    total = (res.inodes if by_inodes else res.size) or 1
+
+    rows = [
+        _entry_line(
+            os.path.relpath(e.path, res.root) + ("/" if e.is_dir else ""),
+            e.size,
+            e.inodes,
+            metric(e),
+            peak,
+            total,
+            style,
+            indent,
+            dim=not e.is_dir,
+        )
+        for e in ranked
+    ]
+    if show_rest:
+        label = "({} more)".format(human_count(_other_count(res, ranked)))
+        rows.append(
+            _entry_line(
+                label,
+                rest_size,
+                rest_inodes,
+                rest_inodes if by_inodes else rest_size,
+                None,
+                total,
+                style,
+                indent,
+                dim=True,
+            )
+        )
+    return rows
+
+
+_BAR_W = 18
+
+
+def _entry_line(
+    name: str,
+    size: int,
+    inodes: int,
+    value: int,
+    peak: Optional[int],
+    total: int,
+    style: ui.Style,
+    indent: str,
+    dim: bool,
+) -> str:
+    """``value`` is the ranked metric; it drives the bar and the share."""
+    bar = " " * _BAR_W if peak is None else ui.bar(value / float(peak), _BAR_W, style)
+    return "{}{}  {}  {}  {}  {}".format(
+        indent,
+        style.paint(human_bytes(size).rjust(10), "bold_cyan"),
+        bar,
+        style.paint("{:>6}".format(pct(value, total)), "dim"),
+        style.paint("{:>9}".format(human_count(inodes)), "dim"),
+        style.paint(name, "dim") if dim else style.paint(name, "bold"),
+    )
+
+
+def _entries_header(style: ui.Style, indent: str = "  ") -> str:
+    return "{}{}  {}  {}  {}  {}".format(
+        indent,
+        style.paint("{:>10}".format("size"), "dim"),
+        " " * _BAR_W,
+        style.paint("{:>6}".format("share"), "dim"),
+        style.paint("{:>9}".format("inodes"), "dim"),
+        style.paint("name", "dim"),
+    )
+
+
+def _other_count(res: WalkResult, shown: List[Any]) -> int:
+    return max(0, len([e for e in res.dir_agg.values() if e.path != res.root]) - len(shown))
+
+
+def _entries_partition_tree(res: WalkResult) -> bool:
+    """True when every reported entry is a direct child of the root."""
+    parents = {os.path.dirname(e.path) for e in res.dir_agg.values() if e.path != res.root}
+    return parents == {res.root}
+
+
+def render_compact(
+    res: WalkResult, settle: SettleCheck, top: int, by_inodes: bool, style: ui.Style
+) -> List[str]:
     """The default view: how big is this tree, and what is big inside it.
 
     That is the question ``sd .`` is asked, and answering it should look like
@@ -128,12 +239,25 @@ def render_compact(res: WalkResult, settle: SettleCheck, top: int, by_inodes: bo
     every run is not a warning, it is furniture.
     """
     out = [
-        "{}   {}   {} inodes   {:.2f}s".format(
-            res.root, human_bytes(res.size), human_count(res.inodes), res.elapsed
+        "{}   {}   {}   {}".format(
+            style.paint(res.root, "bold"),
+            style.paint(human_bytes(res.size), "bold_cyan"),
+            style.paint("{} inodes".format(human_count(res.inodes)), "dim"),
+            style.paint("{:.2f}s".format(res.elapsed), "dim"),
         )
     ]
+    out.extend(_hard_warnings(res, settle, style))
+    body = render_entries(res, top, by_inodes, style)
+    if body:
+        out.append("")
+        out.append(_entries_header(style))
+        out.extend(body)
+    return out
 
-    warn = []  # type: List[str]
+
+def _hard_warnings(res: WalkResult, settle: SettleCheck, style: ui.Style) -> List[str]:
+    """Only the things that change what the headline number means."""
+    out = []  # type: List[str]
     if not res.complete:
         detail = []
         if res.unreadable_dirs:
@@ -142,26 +266,18 @@ def render_compact(res: WalkResult, settle: SettleCheck, top: int, by_inodes: bo
             detail.append("{} entries unstatable".format(res.unstatable))
         if res.partial:
             detail.append("interrupted")
-        warn.append("! this is a FLOOR, not a total: {}".format(", ".join(detail)))
+        out.append(ui.alarm("this is a FLOOR, not a total: " + ", ".join(detail), style))
     if settle.moved:
-        warn.append(
-            "! still settling: re-stat {:.0f}s later found {} {} allocated".format(
-                settle.gap,
-                human_bytes(abs(settle.drift)),
-                "more" if settle.drift > 0 else "less",
+        out.append(
+            ui.warn(
+                "still settling: re-stat {:.0f}s later found {} {} allocated".format(
+                    settle.gap,
+                    human_bytes(abs(settle.drift)),
+                    "more" if settle.drift > 0 else "less",
+                ),
+                style,
             )
         )
-    out.extend(warn)
-
-    ranked = res.top_dirs(top, "files" if by_inodes else "size")
-    if ranked:
-        out.append("")
-        for a in ranked:
-            out.append(
-                "  {:>10}  {:>9} inodes  {}".format(
-                    human_bytes(a.size), human_count(a.inodes), os.path.relpath(a.path, res.root)
-                )
-            )
     return out
 
 
@@ -171,67 +287,85 @@ def render_walk(
     top: int = 10,
     show_uids: bool = True,
     scan: Optional[DeletedScan] = None,
+    style: Optional[ui.Style] = None,
+    by_inodes: bool = False,
 ) -> List[str]:
-    out = _h("WALK  {}".format(res.root))
-    rate = res.inodes / res.elapsed if res.elapsed > 0 else 0.0
-    out.append("  {:<22}{}".format("allocated size", human_bytes(res.size)))
-    out.append(
-        "  {:<22}{}  ({} files, {} dirs)".format(
-            "inodes", human_count(res.inodes), human_count(res.files), human_count(res.dirs)
-        )
-    )
-    out.append(
-        "  {:<22}{:.2f}s at {} threads ({:,.0f} inodes/s)".format(
-            "walked in", res.elapsed, res.threads, rate
-        )
-    )
+    """The walk block of the full report: headline, then facts worth a line each."""
+    style = style or ui.resolve_style("never")
+    out = [
+        "",
+        "{}  {}   {}   {}".format(
+            ui.heading("WALK", style),
+            style.paint(res.root, "bold"),
+            style.paint(human_bytes(res.size), "bold_cyan"),
+            style.paint(
+                "{} inodes  ({} files, {} dirs)".format(
+                    human_count(res.inodes), human_count(res.files), human_count(res.dirs)
+                ),
+                "dim",
+            ),
+        ),
+    ]
 
-    if res.apparent != res.size:
-        out.append(
-            "  {:<22}{}  (st_size; differs from allocated by {})".format(
-                "apparent size", human_bytes(res.apparent), human_bytes(res.apparent - res.size)
-            )
-        )
+    facts = [
+        "{:.2f}s at {} threads ({:,.0f} inodes/s)".format(
+            res.elapsed, res.threads, res.inodes / res.elapsed if res.elapsed > 0 else 0.0
+        ),
+        "apparent {}".format(human_bytes(res.apparent)),
+    ]
     if res.hardlinked_inodes:
+        facts.append(
+            "{} hard-linked inodes, {} refs deduped".format(
+                human_count(res.hardlinked_inodes), human_count(res.hardlink_extra_refs)
+            )
+        )
+    if scan is not None and scan.available and not scan.files:
+        facts.append(
+            "no unlinked-but-open space ({} of {} pids inspectable)".format(
+                scan.scanned_pids, scan.scanned_pids + scan.unreadable_pids
+            )
+        )
+    out.append(style.paint("  " + "  ".join(facts), "dim"))
+
+    out.extend(_hard_warnings(res, settle, style))
+    if res.recent_files and not settle.moved:
         out.append(
-            "  {:<22}{} inodes, {} extra references deduped".format(
-                "hard links",
-                human_count(res.hardlinked_inodes),
-                human_count(res.hardlink_extra_refs),
+            style.paint(
+                "  {} file{} written in the last {} -- figure is provisional"
+                " (--settle-wait 60 to measure)".format(
+                    human_count(res.recent_files),
+                    "" if res.recent_files == 1 else "s",
+                    human_duration(res.settle_window),
+                ),
+                "dim",
             )
         )
 
-    if not res.complete:
-        out.append("")
-        out.append("  ! this total is a FLOOR, not a total:")
-        if res.unreadable_dirs:
-            out.append("      {} directories were unreadable".format(len(res.unreadable_dirs)))
-            for path, why in res.unreadable_dirs[:3]:
-                out.append("        {} ({})".format(path, why))
-            if len(res.unreadable_dirs) > 3:
-                out.append("        ... and {} more".format(len(res.unreadable_dirs) - 3))
-        if res.unstatable:
-            out.append("      {} entries could not be stat'ed".format(res.unstatable))
-        if res.partial:
-            out.append("      the walk was interrupted")
+    if not res.complete and res.unreadable_dirs:
+        for path, why in res.unreadable_dirs[:3]:
+            out.append(style.paint("      {} ({})".format(path, why), "dim"))
+        if len(res.unreadable_dirs) > 3:
+            out.append(
+                style.paint("      ... and {} more".format(len(res.unreadable_dirs) - 3), "dim")
+            )
 
     if show_uids and len(res.by_uid) > 1:
         out.append("")
-        out.append("  owners (a group quota charges all of these):")
-        ranked = sorted(res.by_uid.items(), key=lambda kv: kv[1][0], reverse=True)
-        for uid, (size, inodes) in ranked[:6]:
+        out.append(style.paint("  owners (a group quota charges all of these):", "dim"))
+        for uid, (size, inodes) in sorted(
+            res.by_uid.items(), key=lambda kv: kv[1][0], reverse=True
+        )[:6]:
             out.append(
                 "      {:<16}{:>12}  {:>12} inodes".format(
                     _uname(uid), human_bytes(size), human_count(inodes)
                 )
             )
 
-    out.extend(render_settle(res, settle))
-    # Belongs with the other one-line facts about this tree, not after the
-    # rankings. The full section only appears when something was found.
-    if scan is not None:
-        out.extend(render_deleted_oneline(scan))
-    out.extend(render_top(res, top))
+    body = render_entries(res, top, by_inodes, style)
+    if body:
+        out.append("")
+        out.append(_entries_header(style))
+        out.extend(body)
     return out
 
 
@@ -414,44 +548,74 @@ def render_deleted(scan: DeletedScan, top: int = 10) -> List[str]:
     return out
 
 
-def render_reconcile(recs: List[rc.Reconciliation]) -> List[str]:
-    out = _h("RECONCILIATION")
+def render_reconcile(recs: List[rc.Reconciliation], style: Optional[ui.Style] = None) -> List[str]:
+    """One line per comparison when it closes; the full account when it does not.
+
+    A reconciliation that agrees needs to say so and get out of the way. One that
+    is blocked or unexplained is the whole reason the section exists, and gets
+    the numbers, the blockers and the candidate causes.
+    """
+    style = style or ui.resolve_style("never")
+    out = ["", ui.heading("RECONCILE", style)]
     for r in recs:
-        label = "bytes" if r.kind == "blocks" else "inodes"
-        out.append("  {}: {}".format(label, rc.verdict_line(r)))
-
-        if r.verdict == rc.NOT_COMPARED:
-            for n in r.notes:
-                out.append("      {}".format(n))
-            continue
-
+        label = "bytes " if r.kind == "blocks" else "inodes"
         show = _counter if r.kind == "files" else human_bytes
 
-        out.append("      {:<26}{:>14}".format("walked", show(r.walk_value)))
-        if r.deleted_value:
-            out.append("      {:<26}{:>14}".format("+ unlinked-but-open", show(r.deleted_value)))
-        out.append("      {:<26}{:>14}".format("= accounted for", show(r.accounted)))
-        out.append("      {:<26}{:>14}".format("quota says", show(r.quota_value)))
-        if r.gap:
-            out.append("      {:<26}{:>14}".format("difference", show(r.gap)))
-
-        for n in r.notes:
-            out.append("      note: {}".format(n))
-        if r.blockers:
-            # The same facts are caveats on a comparison that closed and
-            # disqualifiers for one that did not.
+        if r.verdict == rc.NOT_COMPARED:
             out.append(
-                "      caveats:"
-                if r.verdict == rc.CLOSES
-                else "      cannot call this a finding because:"
+                "  {}  {}".format(
+                    label, style.paint(r.notes[0] if r.notes else "not compared", "dim")
+                )
+            )
+            continue
+
+        if r.verdict == rc.CLOSES:
+            out.append(
+                "  {}  {}  {}".format(
+                    label,
+                    style.paint("reconciles", "green"),
+                    style.paint(
+                        "{} vs quota {}, difference {} (within {})".format(
+                            show(r.accounted), show(r.quota_value), show(r.gap), show(r.tolerance)
+                        ),
+                        "dim",
+                    ),
+                )
             )
             for b in r.blockers:
-                out.append("        - {}".format(b))
-        if r.candidates:
-            out.append("      candidate explanations (none of these is asserted):")
-            for c in r.candidates:
-                out.append("        - {}".format(c))
-        out.append("")
+                out.append(style.paint("      caveat: " + b, "dim"))
+            continue
+
+        if r.verdict == rc.SUBTREE:
+            out.append("  {}  {}".format(label, style.paint(rc.verdict_line(r), "dim")))
+            continue
+
+        tone = "yellow" if r.verdict == rc.INCONCLUSIVE else "red"
+        headline = "INCONCLUSIVE" if r.verdict == rc.INCONCLUSIVE else "UNEXPLAINED GAP"
+        out.append(
+            "  {}  {}  {}".format(
+                label,
+                style.paint(headline, tone),
+                style.paint(
+                    "{} accounted for vs quota {}, difference {}".format(
+                        show(r.accounted), show(r.quota_value), show(r.gap)
+                    ),
+                    "dim",
+                ),
+            )
+        )
+        if r.deleted_value:
+            out.append(
+                style.paint(
+                    "      ({} of that is unlinked-but-open)".format(show(r.deleted_value)), "dim"
+                )
+            )
+        for b in r.blockers:
+            out.append(style.paint("      cannot call this a finding: " + b, "dim"))
+        for c in r.candidates:
+            out.append(style.paint("      possible cause (not asserted): " + c, "dim"))
+        for n in r.notes:
+            out.append(style.paint("      " + n, "dim"))
     return out
 
 
