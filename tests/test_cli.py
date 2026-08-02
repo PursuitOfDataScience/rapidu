@@ -239,7 +239,33 @@ def test_interrupted_output_states_no_total_and_no_shares(small_tree, capsys, mo
     cli.main([small_tree, "--no-progress"])
     out = capsys.readouterr().out
     assert "INTERRUPTED" in out
-    assert "partial:" in out
+    assert "PARTIAL" in out
     assert "no total and no share" in out
     # No percentage may be printed, because there is no denominator.
     assert "%" not in out
+
+
+def test_n_zero_shows_everything_and_no_phantom_remainder(small_tree, capsys):
+    """-n 0 means all. With nothing hidden there is no "(N more)" row.
+
+    The leftover with everything shown is exactly the root directory's own
+    inode, which belongs to no child; reporting it as "(0 more)" is noise.
+    """
+    cli.main([small_tree, "-n", "0"])
+    out = capsys.readouterr().out
+    assert "more" not in out
+
+
+def test_truncated_listing_says_how_to_expand(tmp_path, capsys):
+    """A listing that hides rows without saying so is just missing data."""
+    root = str(tmp_path / "many")
+    import os
+
+    for i in range(12):
+        d = os.path.join(root, "d%02d" % i)
+        os.makedirs(d)
+        with open(os.path.join(d, "f"), "wb") as fh:
+            fh.write(b"x" * (4096 * (i + 1)))
+    cli.main([root, "-n", "3"])
+    out = capsys.readouterr().out
+    assert "more" in out and "-n 0" in out

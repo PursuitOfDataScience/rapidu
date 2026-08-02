@@ -5,38 +5,47 @@ number you are comparing against actually is.
 
 ```
 $ sd .
-/home/researcher   716.3 MiB   21,592 files   0.16s
+ 716.5 MiB   /home/researcher
+             21,640 files  ·  94 entries  ·  0.17s
 
+  ──────────────────────────────────────────────────────────────────────
         size                       share      files  name
-   102.7 MiB  ██████████████████   14.3%      5,059  project-alpha/
-    94.3 MiB  █████████████████░   13.2%      2,484  notebooks/
+   102.8 MiB  ██████████████████   14.3%      5,062  project-alpha/
+    94.3 MiB  ████████████████▌░   13.2%      2,484  notebooks/
     63.3 MiB  ███████████░░░░░░░    8.8%          1  archive-a.db
-   329.3 MiB                       46.0%     14,046  (89 more)
+    50.1 MiB  ████████▊░░░░░░░░░    7.0%      1,686  uchicago-workshops/
+   392.8 MiB                       54.8%     14,092  (90 more — use -n 0 for all)
 ```
 
-Sizes are cumulative, so any row agrees with `du -s` on that path. Plain files
-appear alongside directories. Colour grades by share, so the rows worth looking
-at are the ones that stand out. A long walk paints a spinner on stderr with live
-throughput; **Ctrl+C** prints the subtrees that finished, and says plainly that
-the rest is unknown rather than showing a ranking it cannot justify.
+Sizes are cumulative, so any row agrees with `du -s` on that path, and plain
+files are listed alongside directories. Bar length and bar colour encode the
+same thing — this row against the largest — so they always agree; the share
+column carries the absolute figure. There is no red in that ramp: the top row is
+the hottest colour on *every* listing, so red there would cry wolf on every run.
+Red is kept for a near-full quota, an interrupted walk, or a total that is only
+a floor.
 
-The count column is headed **files**, not "inodes". An inode is the on-disk
-structure a file or directory occupies and it is the resource that runs out, but
-your quota calls them files (`files (user) 21,553 / 300,000`) -- so the tool uses
-the quota's word and the two numbers compare without translation. Directories
-count, exactly as they do in the quota.
-
-That is the default, and it is all the default does: how big is this tree, and
-what is big inside it. Everything below is behind a flag, because none of it is
-needed to answer that question and all of it costs time.
+Colour is off unless stdout is a terminal, honours `NO_COLOR`, and falls back
+from 256 colours to 8 and from block glyphs to ASCII when the terminal says so.
 
 ```
-sd . -i        # rank by inode count instead of bytes
+sd . -c        # count files only, no sizes — 8x faster (see Speed)
+sd . -i        # rank by file count instead of bytes
+sd . -n 0      # every entry, not just the top 10
 sd . -a        # the full report: quota + /proc scan + reconciliation
 sd -Q          # just the quota table, and the age of its figures
 sd -D          # space held by unlinked-but-open files
 sd . --json    # the complete document, for tooling
 ```
+
+A long walk paints a spinner on stderr with live throughput; **Ctrl+C** prints
+the subtrees that finished and says plainly that the rest is unknown, rather
+than ranking a half-counted tree.
+
+The count column is headed **files**, not "inodes". An inode is the on-disk
+structure a file or directory occupies and it is the resource that runs out, but
+your quota calls them files (`files (user) 21,580 / 300,000`) — so the tool uses
+the quota's word and the two numbers compare without translation.
 
 No dependencies, no root, no daemon, no config. Stdlib only, down to the
 `/usr/bin/python3` that RHEL8 login nodes ship — because the moment you need
@@ -186,55 +195,70 @@ discrepancy.
   unparseable format — each prints `n/a` with a reason, and nothing downstream
   breaks.
 
-## Speed — and the axis that actually matters
+## Speed
 
-**Bytes do not predict how long a walk takes; inodes do.** Measured on this
+**Bytes do not predict how long a walk takes; files do.** Measured on this
 cluster, same filesystem, same day:
 
-| tree | size | inodes | `du` | `slurmdisk` | |
+| tree | size | files | `du` | `slurmdisk` | |
 |---|---|---|---|---|---|
 | `.cache/huggingface` | 161.7 GiB | 3,286 | 0.44s | 0.03s | 14x |
 | `.cache` | 350.0 GiB | 781,772 | 162.25s | 25.28s | **6.4x** |
 
 Twice the bytes, **370x the wall time.** A 1 TB directory of a few large
 checkpoint shards walks in milliseconds; a 1 GB directory of two million tiny
-files takes minutes. If you want to know how long `sd` will take on a tree, ask
-how many inodes are in it, not how many gigabytes.
+files takes minutes.
 
-**Where the speedup comes from, and where it does not.** `du` on that 780k-inode
-tree spent 165.9s wall against 8.5s of CPU — **94.9% of it blocked on filesystem
-latency**, not computing. Concurrency hides that latency; that is the entire
-mechanism, and it is why the language does not matter (`getdents`/`stat` release
-the GIL).
+### Where the time actually goes
 
-It follows that when there is no latency to hide, there is no win:
+An earlier version of this section claimed concurrency was the lever. That was
+measured against `du` and does not describe this walker. Measured against
+itself, on 782k GPFS files:
 
 ```
-/home/researcher, 21,556 inodes, metadata fully cached
-  du 0.140s | slurmdisk 0.164s     0.85x   <- slower
-same tree, cold
-  du 4.778s | slurmdisk 0.163s    29.3x
+scandir + stat (what a sizing walk does)   27.09s     28,900 files/s
+scandir alone, no stat                      2.99s    261,800 files/s
+this package's own bookkeeping                          +0.5%
 ```
 
-**On a warm cache slurmdisk is about 15% slower than `du`**, because threaded
-Python loses to single-threaded C when both are CPU-bound. That is the honest
-shape of it: this is a tool for cold, large, networked trees — which is what a
-scratch or project filesystem is in practice — and it has nothing to offer on a
-small warm one.
+**`stat` is 90% of the wall time and our Python costs half a percent**, so
+tuning the inner loop is pointless. Two obvious levers were tried and both are
+dead ends:
 
-Past 16 threads the walk gets *slower*, so the pool is hard-capped at 16 and
-defaults to 8. The fast setting and the polite setting turn out to be the same
-setting, which matters because this walk is metadata load on a shared
-filesystem: the exact sin the tool exists to diagnose. `--max-dirs-per-sec`
-throttles it further on a busy day.
+```
+stat via dir_fd instead of a full path     26.89s vs 26.65s   no difference
+4 or 8 processes instead of threads         41.9s vs  27.0s   35% WORSE
+```
 
-> **Prior-art caveat, stated because it is still owed.** The comparison above is
-> against `du`, a single-threaded 1971 program — *not* against the state of the
-> art. Parallel disk-usage walkers already exist (`dust`, `gdu`, `diskus`,
-> `duc`) and a Rust one will very likely match or beat threaded Python. A full
-> PyPI/GitHub sweep has **not** been run, so assume the parallel walk is a
-> solved problem until shown otherwise. **Speed is table stakes here; the
-> quota-age, settling and deleted-fd reporting are the product.**
+Processes being *worse* places the limit in the GPFS client per node, not per
+process, and thread scaling agrees: 8 → 16 buys 5%, and 24/32/48/64 all get
+slower. **~29,000 stats/s is this filesystem's metadata ceiling** and no
+client-side change moves it. The pool is capped at 16 and defaults to 8, which
+is also the polite setting — this walk is metadata load on a shared filesystem,
+the exact sin the tool exists to diagnose. `--max-dirs-per-sec` throttles it
+further on a busy day.
+
+### The one real speedup: don't call stat
+
+Counting files needs no `stat` at all — `d_type` from `getdents` already
+separates directories from everything else. `-c` uses that:
+
+```
+1.7M-file tree     sizing walk 55s      sd . -c  6.9s      8x
+782k-file tree     sizing walk 27.3s    sd . -c  3.4s      8x
+```
+
+Exact on counts, no sizes, and hard links counted once per name — all three
+stated in the output rather than implied. For inode-quota pressure, which is
+what this column of the tool is for, that is the whole answer.
+
+> **Prior-art caveat, stated because it is still owed.** The `du` comparison is
+> against a single-threaded 1971 program — *not* against the state of the art.
+> Parallel walkers already exist (`dust`, `gdu`, `diskus`, `duc`). Given the
+> ceiling measured above, any of them will land within a few percent of this
+> one on the same filesystem, because none of them can make GPFS answer `stat`
+> faster. A full PyPI/GitHub sweep has **not** been run. **Speed is table stakes
+> here; the quota-age, settling and deleted-fd reporting are the product.**
 
 ## Install
 
@@ -262,7 +286,9 @@ The only positional argument is a path. Modes are flags, not subcommands:
 must mean "measure ./deleted" and nothing else.
 
 -a, --full               quota + /proc scan + reconciliation
--i, --inodes             rank directories by inode count, not bytes
+-c, --count              count files only, no stat -- 8x faster
+-i, --inodes             rank by file count, not bytes
+-n 0                     show every entry
 -Q, --quota-only         quota table only; walk nothing
 -D, --deleted-only       unlinked-but-open space only
 -t, --threads N          walk concurrency, clamped to 16 (default 8)

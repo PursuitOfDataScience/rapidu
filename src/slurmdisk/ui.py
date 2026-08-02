@@ -24,61 +24,104 @@ _CODES = {
     "blue": "\033[34m",
     "cyan": "\033[36m",
     "bold_red": "\033[1;31m",
+    "bold_green": "\033[1;32m",
+    "bold_yellow": "\033[1;33m",
     "bold_cyan": "\033[1;36m",
     "bold_blue": "\033[1;34m",
 }
 
-# Share-of-tree thresholds for the heat ramp, largest first.
+# Heat ramps, coolest first.
 #
-# A single accent colour for every row wastes the one channel that carries
-# information for free: a reader scanning the list wants to know where the space
-# went, and identical hues for a 30% row and a 2% row make them look equally
-# worth investigating. Only the basic 8 ANSI colours are used, because TERM is
-# often `screen` or `xterm` over ssh and bright/256-colour codes are not
-# universally honoured.
-HEAT = (
-    (0.25, "bold_red"),  # dominant: this is where the space went
-    (0.10, "yellow"),  # substantial
-    (0.03, "green"),  # ordinary
-    (0.0, "cyan"),  # negligible
+# Four discrete bands were not enough: on a real listing six of ten rows landed
+# in the same green, which is the complaint that "some text has the same colour".
+# These ramps are fine enough that adjacent rows differ, and rows that are
+# genuinely equal still look equal.
+#
+# The 8-colour ramp is the one that matters, because TERM is frequently `screen`
+# or a bare `xterm` over ssh, which advertise 8. Ten distinguishable steps are
+# available there by pairing each hue with its bold variant.
+# No red at either end. The ramp encodes "largest of what is shown", which is
+# relative -- so the top row is the hottest colour on *every* listing, including
+# a perfectly balanced tree. If that top colour were red, the tool would cry wolf
+# every single run. Red is reserved for things that are actually wrong: a quota
+# near its limit, an interrupted walk, a floor instead of a total.
+RAMP_8 = (
+    "blue",
+    "bold_blue",
+    "cyan",
+    "bold_cyan",
+    "green",
+    "bold_green",
+    "yellow",
+    "bold_yellow",
 )
 
-
-def heat(fraction: Optional[float]) -> str:
-    """Tone for a share of the whole. ``None`` -> the calmest tone."""
-    if fraction is None:
-        return HEAT[-1][1]
-    for threshold, tone in HEAT:
-        if fraction >= threshold:
-            return tone
-    return HEAT[-1][1]
+# xterm-256 indices, even perceived steps from deep blue up to amber.
+RAMP_256 = (26, 32, 39, 45, 44, 49, 78, 113, 148, 184, 220, 214)
 
 
-# Full block / light shade. Falls back to ASCII where the encoding cannot
-# represent them -- a mojibake bar is worse than a plain one.
+def _ramp_index(fraction: Optional[float], n: int) -> int:
+    if not fraction or fraction <= 0:
+        return 0
+    if fraction >= 1:
+        return n - 1
+    return min(n - 1, int(fraction * n))
+
+
+def heat(fraction: Optional[float], depth: int = 8) -> str:
+    """Tone name for a 0..1 position on the ramp.
+
+    The caller passes ``value / largest_value``, not share-of-total. That is the
+    same quantity the bar length encodes, so colour and length always agree and
+    the whole ramp gets used on every listing. Absolute share is not lost -- it
+    is printed as a number in its own column.
+    """
+    if depth >= 256:
+        return "c256:{}".format(RAMP_256[_ramp_index(fraction, len(RAMP_256))])
+    return RAMP_8[_ramp_index(fraction, len(RAMP_8))]
+
+
+# Full block / light shade, plus the seven partial blocks. The partials give a
+# bar eight times the horizontal resolution of its cell count, which is the
+# difference between a bar that looks measured and one that looks rounded off.
 _BAR_FULL, _BAR_EMPTY = "█", "░"
+_BAR_PARTIALS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
 _BAR_FULL_ASCII, _BAR_EMPTY_ASCII = "#", "-"
 
 
 class Style:
     """Resolved presentation settings for one run."""
 
-    def __init__(self, color: bool, unicode_ok: bool, width: int) -> None:
+    def __init__(self, color: bool, unicode_ok: bool, width: int, depth: int = 8) -> None:
         self.color = color
         self.unicode = unicode_ok
         self.width = width
+        self.depth = depth  # advertised colour count: 8 or 256
 
     def paint(self, text: str, *styles: str) -> str:
         if not self.color or not styles:
             return text
-        prefix = "".join(_CODES.get(s, "") for s in styles)
+        parts = []
+        for name in styles:
+            if name.startswith("c256:"):
+                parts.append("\033[38;5;{}m".format(name[5:]))
+            else:
+                parts.append(_CODES.get(name, ""))
+        prefix = "".join(parts)
         return prefix + text + _RESET if prefix else text
+
+    def heat(self, fraction: Optional[float]) -> str:
+        return heat(fraction, self.depth)
 
     @property
     def bar_chars(self):
         if self.unicode:
             return _BAR_FULL, _BAR_EMPTY
         return _BAR_FULL_ASCII, _BAR_EMPTY_ASCII
+
+    @property
+    def partials(self):
+        return _BAR_PARTIALS if self.unicode else ("",)
 
 
 def _supports_unicode(stream) -> bool:
@@ -108,7 +151,22 @@ def resolve_style(mode: str = "auto", ascii_only: bool = False, stream=None) -> 
         color=color,
         unicode_ok=not ascii_only and _supports_unicode(stream),
         width=terminal_width(),
+        depth=color_depth(),
     )
+
+
+def color_depth() -> int:
+    """8 or 256, from what the terminal advertises.
+
+    Deliberately conservative: emitting 256-colour codes to a terminal that
+    cannot render them produces visible garbage, and the 8-colour ramp is fine.
+    """
+    if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit"):
+        return 256
+    term = os.environ.get("TERM", "")
+    if "256color" in term or "direct" in term or term in ("xterm-kitty", "alacritty"):
+        return 256
+    return 8
 
 
 def terminal_width(default: int = 100) -> int:
@@ -136,11 +194,34 @@ def bar(
     if width <= 0:
         return ""
     full_ch, empty_ch = style.bar_chars
+    partials = style.partials
     f = 0.0 if fraction < 0 else (1.0 if fraction > 1 else fraction)
-    filled = int(round(f * width))
-    if min_tick and filled == 0 and f > 0:
-        filled = 1
-    return style.paint(full_ch * filled, accent) + style.paint(empty_ch * (width - filled), "dim")
+
+    exact = f * width
+    filled = int(exact)
+    remainder = exact - filled
+    tail = ""
+    if len(partials) > 1 and filled < width:
+        step = int(remainder * len(partials))
+        tail = partials[step]
+    elif filled < width and int(round(remainder)):
+        filled += 1
+
+    if min_tick and filled == 0 and not tail and f > 0:
+        tail = partials[1] if len(partials) > 1 else full_ch
+    used = filled + (1 if tail else 0)
+    return style.paint(full_ch * filled + tail, accent) + style.paint(
+        empty_ch * max(0, width - used), "dim"
+    )
+
+
+def sep(style: Style) -> str:
+    """Separator between header facts. Degrades where UTF-8 is unavailable."""
+    return "\u00b7" if style.unicode else "|"
+
+
+def dash(style: Style) -> str:
+    return "\u2014" if style.unicode else "--"
 
 
 def truncate(text: str, width: int) -> str:

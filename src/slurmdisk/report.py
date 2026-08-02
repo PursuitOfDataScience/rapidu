@@ -125,7 +125,9 @@ def render_entries(
     # ranked. A directory caught mid-walk carries an arbitrary fraction of its
     # contents, and placing that in an ordered table is not an approximation --
     # it is the wrong answer, presented with the authority of the right one.
-    ranked = res.top_dirs(top, "files" if by_inodes else "size", finished_only=res.partial)
+    # -n 0 means "all of them", not "none".
+    limit = top if top > 0 else 10**9
+    ranked = res.top_dirs(limit, "files" if by_inodes else "size", finished_only=res.partial)
     if not ranked:
         return []
 
@@ -135,7 +137,12 @@ def render_entries(
     # that partition the tree. At depth > 1 rows nest and it would double-count;
     # after an interrupt the unscanned part is unknown, so there is no remainder
     # to state.
-    show_rest = rest_size > 0 and not res.partial and _entries_partition_tree(res)
+    #
+    # It also requires something to actually be hidden. With everything shown the
+    # leftover is exactly the root directory's own inode -- which belongs to no
+    # child -- and reporting that as "(0 more)" is noise.
+    hidden = _other_count(res, ranked)
+    show_rest = hidden > 0 and rest_size > 0 and not res.partial and _entries_partition_tree(res)
 
     # The bar and the share must measure whatever the rows were ranked by, or a
     # -i listing shows an inode ordering with byte-length bars and reads as
@@ -173,7 +180,9 @@ def render_entries(
         for e in ranked
     ]
     if show_rest:
-        label = "({} more)".format(human_count(_other_count(res, ranked)))
+        # Say how to see them. A truncated listing that does not tell you it is
+        # truncated, or how to expand it, is just missing data.
+        label = "({} more {} use -n 0 for all)".format(human_count(hidden), ui.dash(style))
         rows.append(
             _entry_line(
                 label,
@@ -219,10 +228,11 @@ def _entry_line(
     Directories are marked by a trailing slash and a blue name, the way ``ls``
     does it -- shape, not emphasis.
     """
-    share = value / float(total) if total else 0.0
-    tone = "dim" if aggregate else ui.heat(share)
-    if total <= 0:
-        tone = "dim"
+    # Colour is indexed by the same quantity the bar length encodes -- this row
+    # against the largest row -- so the two always agree and the full ramp is
+    # used on every listing. Share-of-total keeps its own column.
+    rel = (value / float(peak)) if peak else 0.0
+    tone = "dim" if aggregate else style.heat(rel)
     bar = " " * _BAR_W if peak is None else ui.bar(value / float(peak), _BAR_W, style, accent=tone)
     # In count mode there are no sizes at all, so the column is omitted rather
     # than left as ten blank characters the eye has to step over.
@@ -242,6 +252,24 @@ def _entry_line(
         style.paint("{:>9}".format(human_count(inodes)), "dim"),
         style.paint(name, *name_style),
     )
+
+
+# indent + size(10) + 2 + bar + 2 + share(6) + 2 + files(9) + 2
+_FIXED_COLS = 2 + 10 + 2 + 2 + 6 + 2 + 9 + 2
+
+
+def _entries_rule(style: ui.Style, names: List[str], indent: str = "  ") -> str:
+    """A hairline between the header and the table, sized to the table.
+
+    One dim rule is enough structure to separate the two blocks; a box would be
+    heavier than a du replacement warrants and breaks when pasted into a ticket.
+    Sized to the widest row rather than to the terminal, because a rule running
+    forty characters past the last column looks like a mistake.
+    """
+    glyph = "\u2500" if style.unicode else "-"
+    widest = max([len(n) for n in names] or [8])
+    span = min(style.width - len(indent) - 1, _FIXED_COLS + _BAR_W + widest)
+    return style.paint(indent + glyph * max(20, span), "dim")
 
 
 def _entries_header(style: ui.Style, indent: str = "  ", size_label: str = "size") -> str:
@@ -275,6 +303,38 @@ def _entries_partition_tree(res: WalkResult) -> bool:
     return parents == {res.root}
 
 
+def _entry_names(res: WalkResult, top: int, by_inodes: bool) -> List[str]:
+    limit = top if top > 0 else 10**9
+    key = "files" if (by_inodes or res.count_only) else "size"
+    return [
+        os.path.relpath(e.path, res.root) + ("/" if e.is_dir else "")
+        for e in res.top_dirs(limit, key, finished_only=res.partial)
+    ]
+
+
+def _entry_total(res: WalkResult) -> int:
+    return len([e for e in res.dir_agg.values() if e.path != res.root])
+
+
+def _header(style: ui.Style, headline: str, path: str, subtitle: str) -> List[str]:
+    """Lead with the answer, then the path, then the metadata.
+
+    ``du -sh`` prints the size first and everyone reads it that way, so the size
+    goes first and carries the visual weight. The path is the subject and gets
+    bold. Counts, entry total and timing are context and are dimmed -- putting
+    all four values at the same weight, as this used to, left nothing for the eye
+    to land on.
+    """
+    return [
+        "{}   {}".format(
+            style.paint(headline.rjust(10), "bold_cyan"),
+            style.paint(path, "bold"),
+        ),
+        style.paint("{}   {}".format(" " * 10, subtitle), "dim"),
+        "",
+    ]
+
+
 def render_compact(
     res: WalkResult, settle: SettleCheck, top: int, by_inodes: bool, style: ui.Style
 ) -> List[str]:
@@ -291,42 +351,37 @@ def render_compact(
     every run is not a warning, it is furniture.
     """
     if res.count_only:
-        out = [
-            "{}   {}   {}".format(
-                style.paint(res.root, "bold"),
-                style.paint("{} files".format(human_count(res.inodes)), "bold_cyan"),
-                style.paint("{:.2f}s".format(res.elapsed), "dim"),
+        out = _header(
+            style,
+            "{} files".format(human_count(res.inodes)),
+            res.root,
+            "counts only, no sizes  {sep}  {} entries  {sep}  {:.2f}s".format(
+                human_count(_entry_total(res)), res.elapsed, sep=ui.sep(style)
             ),
-            style.paint(
-                "  counts only (-c): no sizes, and hard links count once per name",
-                "dim",
-            ),
-        ]
+        )
     elif res.partial:
-        out = [
-            "{}   {}".format(
-                style.paint(res.root, "bold"),
-                style.paint(
-                    "partial: {} in {} files scanned before the interrupt".format(
-                        human_bytes(res.size), human_count(res.inodes)
-                    ),
-                    "dim",
-                ),
-            )
-        ]
+        out = _header(
+            style,
+            human_bytes(res.size),
+            res.root,
+            "PARTIAL \u2014 {} files scanned before the interrupt".format(human_count(res.inodes)),
+        )
     else:
-        out = [
-            "{}   {}   {}   {}".format(
-                style.paint(res.root, "bold"),
-                style.paint(human_bytes(res.size), "bold_cyan"),
-                style.paint("{} files".format(human_count(res.inodes)), "dim"),
-                style.paint("{:.2f}s".format(res.elapsed), "dim"),
-            )
-        ]
+        out = _header(
+            style,
+            human_bytes(res.size),
+            res.root,
+            "{} files  {sep}  {} entries  {sep}  {:.2f}s".format(
+                human_count(res.inodes),
+                human_count(_entry_total(res)),
+                res.elapsed,
+                sep=ui.sep(style),
+            ),
+        )
     out.extend(_hard_warnings(res, settle, style))
     body = render_entries(res, top, by_inodes, style)
     if body:
-        out.append("")
+        out.append(_entries_rule(style, _entry_names(res, top, by_inodes)))
         out.append(_entries_header(style, size_label="" if res.count_only else "size"))
         out.extend(body)
     return out
@@ -464,7 +519,7 @@ def render_walk(
 
     body = render_entries(res, top, by_inodes, style)
     if body:
-        out.append("")
+        out.append(_entries_rule(style, _entry_names(res, top, by_inodes)))
         out.append(_entries_header(style, size_label="" if res.count_only else "size"))
         out.extend(body)
     return out
@@ -560,7 +615,7 @@ def _settling_is_material(res: WalkResult) -> bool:
 
 
 def render_top(res: WalkResult, top: int) -> List[str]:
-    if top <= 0:
+    if top < 0:
         return []
     out = []  # type: List[str]
     by_size = res.top_dirs(top, "size")
