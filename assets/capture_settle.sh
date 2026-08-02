@@ -37,8 +37,10 @@ PY
 # this capture. Only 2 (a real error) is fatal here.
 rc=0
 # The first line is the command the GIF should show above the output, so the
-# label can never drift away from the flags that produced it.
-printf '# sd $SCRATCH/run-217 -a --no-quota --no-deleted --settle-wait 60\n' >"$OUT"
+# label can never drift away from the flags -- or the path -- that produced it.
+# It was hardcoded to a stand-in path once, and the GIF then showed a command
+# that did not match the tree in its own output.
+printf '# sd %s -a --no-quota --no-deleted --settle-wait 60\n' "$TREE" >"$OUT"
 COLUMNS=96 TERM=xterm-256color PYTHONPATH="$REPO/src" \
     python3 -m slurmdisk "$TREE" -a --no-quota --no-deleted --settle-wait 60 \
     -n 6 --color always --no-progress >>"$OUT" || rc=$?
