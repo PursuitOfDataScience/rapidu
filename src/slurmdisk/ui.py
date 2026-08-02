@@ -23,9 +23,36 @@ _CODES = {
     "yellow": "\033[33m",
     "blue": "\033[34m",
     "cyan": "\033[36m",
+    "bold_red": "\033[1;31m",
     "bold_cyan": "\033[1;36m",
     "bold_blue": "\033[1;34m",
 }
+
+# Share-of-tree thresholds for the heat ramp, largest first.
+#
+# A single accent colour for every row wastes the one channel that carries
+# information for free: a reader scanning the list wants to know where the space
+# went, and identical hues for a 30% row and a 2% row make them look equally
+# worth investigating. Only the basic 8 ANSI colours are used, because TERM is
+# often `screen` or `xterm` over ssh and bright/256-colour codes are not
+# universally honoured.
+HEAT = (
+    (0.25, "bold_red"),  # dominant: this is where the space went
+    (0.10, "yellow"),  # substantial
+    (0.03, "green"),  # ordinary
+    (0.0, "cyan"),  # negligible
+)
+
+
+def heat(fraction: Optional[float]) -> str:
+    """Tone for a share of the whole. ``None`` -> the calmest tone."""
+    if fraction is None:
+        return HEAT[-1][1]
+    for threshold, tone in HEAT:
+        if fraction >= threshold:
+            return tone
+    return HEAT[-1][1]
+
 
 # Full block / light shade. Falls back to ASCII where the encoding cannot
 # represent them -- a mojibake bar is worse than a plain one.
@@ -167,3 +194,69 @@ def columns(rows: List[List[str]], aligns: str) -> List[str]:
             cells.append(cell.rjust(widths[i]) if aligns[i] == "r" else cell.ljust(widths[i]))
         out.append(" ".join(cells).rstrip())
     return out
+
+
+# Spinner frames. Braille reads as smooth motion at 100 ms; the ASCII fallback
+# is for the same terminals that get ASCII bars.
+_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPIN_ASCII = "|/-\\"
+
+# A walk shorter than this finishes before a human registers the spinner, and
+# painting one would only produce a flicker.
+PROGRESS_DELAY_S = 0.4
+PROGRESS_INTERVAL_S = 0.1
+
+
+class Spinner:
+    """Single-line progress on stderr, erased when the work finishes.
+
+    **stderr, not stdout.** The report is meant to be piped into a file or a
+    support ticket, and a progress line interleaved with it would corrupt that.
+    Redirecting stdout still shows progress on the terminal; redirecting both
+    shows none, because stderr is then not a tty.
+    """
+
+    def __init__(self, style: Style, stream=None) -> None:
+        self.style = style
+        self.stream = stream if stream is not None else sys.stderr
+        self.frames = _SPIN if style.unicode else _SPIN_ASCII
+        self._i = 0
+        self._painted = 0
+        self.enabled = bool(getattr(self.stream, "isatty", lambda: False)())
+
+    def frame(self) -> str:
+        ch = self.frames[self._i % len(self.frames)]
+        self._i += 1
+        return ch
+
+    def paint(self, text: str) -> None:
+        if not self.enabled:
+            return
+        line = "{} {}".format(self.frame(), text)
+        # Truncate rather than wrap: a wrapped progress line cannot be erased
+        # with a single carriage return and leaves debris behind.
+        line = line[: max(0, self.style.width - 1)]
+        pad = " " * max(0, self._painted - len(line))
+        self.stream.write("\r" + self.style.paint(line, "dim") + pad)
+        self.stream.flush()
+        self._painted = len(line)
+
+    def clear(self) -> None:
+        if not self.enabled or not self._painted:
+            return
+        self.stream.write("\r" + " " * self._painted + "\r")
+        self.stream.flush()
+        self._painted = 0
+
+
+def progress_text(path: str, inodes: int, dirs: int, rate: float, elapsed: float) -> str:
+    """What to say while walking. No percentage: the total is unknowable.
+
+    A walk cannot know how many inodes it will find until it has found them, so a
+    progress *bar* would have to invent a denominator. Throughput and elapsed
+    time are both real, and together they answer the question the user actually
+    has, which is "is this moving, and roughly how fast".
+    """
+    return "scanning {}  {:,} files  {:,} dirs  {:,.0f}/s  {:.0f}s".format(
+        path, inodes, dirs, rate, elapsed
+    )

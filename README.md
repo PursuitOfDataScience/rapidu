@@ -5,13 +5,26 @@ number you are comparing against actually is.
 
 ```
 $ sd .
-/home/researcher   700.6 MiB   21,526 inodes   0.18s
+/home/researcher   716.3 MiB   21,592 files   0.16s
 
-    70.6 MiB        283 inodes  notebooks
-    46.3 MiB      2,581 inodes  project-alpha/midtraining
-    43.7 MiB      2,328 inodes  slurmwatch/.git
-    ...
+        size                       share      files  name
+   102.7 MiB  ██████████████████   14.3%      5,059  project-alpha/
+    94.3 MiB  █████████████████░   13.2%      2,484  notebooks/
+    63.3 MiB  ███████████░░░░░░░    8.8%          1  archive-a.db
+   329.3 MiB                       46.0%     14,046  (89 more)
 ```
+
+Sizes are cumulative, so any row agrees with `du -s` on that path. Plain files
+appear alongside directories. Colour grades by share, so the rows worth looking
+at are the ones that stand out. A long walk paints a spinner on stderr with live
+throughput; **Ctrl+C** prints the subtrees that finished, and says plainly that
+the rest is unknown rather than showing a ranking it cannot justify.
+
+The count column is headed **files**, not "inodes". An inode is the on-disk
+structure a file or directory occupies and it is the resource that runs out, but
+your quota calls them files (`files (user) 21,553 / 300,000`) -- so the tool uses
+the quota's word and the two numbers compare without translation. Directories
+count, exactly as they do in the quota.
 
 That is the default, and it is all the default does: how big is this tree, and
 what is big inside it. Everything below is behind a flag, because none of it is
@@ -115,8 +128,8 @@ checkpoint, pure inode cost. So directories are ranked three ways, and the third
 is the one that tells you what to pack:
 
 ```
-LARGEST SUBTREES   by allocated bytes -- the classic du question
-MOST INODES        by inode count, with files/GiB as a column
+sd .      by allocated bytes -- the classic du question
+sd . -i   by file count -- what an inode quota limits
 ```
 
 Packing a directory reclaims the inodes it holds, so the absolute count is the

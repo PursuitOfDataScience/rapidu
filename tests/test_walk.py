@@ -306,3 +306,35 @@ def test_depth_limits_reporting_not_the_walk(tree):
     assert shallow.size == deep.size
     assert shallow.inodes == deep.inodes
     assert len(deep.dir_agg) >= len(shallow.dir_agg)
+
+
+def test_finished_tops_covers_a_complete_walk(tree):
+    """Every depth-1 child of a completed walk must be marked finished."""
+    r = walk(tree, threads=4, depth=1)
+    assert not r.partial
+    names = {os.path.basename(e.path) for e in r.dir_agg.values() if e.path != r.root}
+    assert names.issubset(r.finished_tops) or not r.partial
+
+
+def test_interrupted_walk_reports_only_finished_subtrees(tree):
+    """A half-counted directory must not appear in a ranking.
+
+    Simulated rather than signalled: delivering SIGINT at a deterministic point
+    inside a threaded walk is not reproducible, but the reporting rule is, and
+    the rule is what matters -- a subtree caught mid-walk carries an arbitrary
+    fraction of its contents and belongs nowhere near an ordered table.
+    """
+    r = walk(tree, threads=4, depth=1)
+    everything = {os.path.basename(e.path) for e in r.dir_agg.values() if e.path != r.root}
+    assert len(everything) > 1
+
+    victim = sorted(everything)[0]
+    r.partial = True
+    r.finished_tops = everything - {victim}
+
+    listed = {os.path.basename(e.path) for e in r.top_dirs(50, finished_only=True)}
+    assert victim not in listed
+    assert listed == everything - {victim}
+    # Without the filter the unfinished entry is still there, so the filter is
+    # doing the work and the test would fail if it were dropped.
+    assert victim in {os.path.basename(e.path) for e in r.top_dirs(50)}

@@ -26,7 +26,7 @@ import stat
 import threading
 import time
 from collections import deque
-from typing import Dict, List, Optional, Tuple  # noqa: F401  (used in `# type:` comments)
+from typing import Dict, List, Optional, Set, Tuple  # noqa: F401  (in `# type:` comments)
 
 # Past this the walk measurably slows down AND the metadata load stops being
 # polite. Requests above it are clamped, loudly.
@@ -63,6 +63,43 @@ class TokenBucket:
                     return
                 deficit = (1.0 - self._tokens) / self.rate
             time.sleep(min(deficit, 0.25))
+
+
+class Progress:
+    """Live counters for a walk in flight, for a progress display.
+
+    Each worker owns one slot and writes only to that slot, so no lock is needed:
+    a list item assignment is atomic under the GIL, and a progress display that
+    is briefly a few hundred inodes stale is fine. The alternative -- taking a
+    lock per inode to keep a counter exact -- would slow the walk down to make a
+    spinner more accurate, which is the wrong trade.
+    """
+
+    __slots__ = ("inode_slots", "dir_slots", "started", "finished", "current")
+
+    def __init__(self, nthreads: int) -> None:
+        self.inode_slots = [0] * nthreads
+        self.dir_slots = [0] * nthreads
+        self.started = time.monotonic()
+        self.finished = False
+        self.current = ""  # most recent directory, for context
+
+    @property
+    def inodes(self) -> int:
+        return sum(self.inode_slots)
+
+    @property
+    def dirs(self) -> int:
+        return sum(self.dir_slots)
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    @property
+    def rate(self) -> float:
+        el = self.elapsed
+        return self.inodes / el if el > 0 else 0.0
 
 
 class Entry:
@@ -133,6 +170,11 @@ class WalkResult:
         self.threads = 0
         self.settle_window = DEFAULT_SETTLE_WINDOW_S
         self.partial = False  # walk was cut short (interrupt / error)
+        # Names of depth-1 children whose subtree was walked to completion. On a
+        # full walk this is all of them; after an interrupt it is the only part of
+        # the result that can honestly be reported, because a subtree still in
+        # flight has an arbitrary fraction of its contents counted.
+        self.finished_tops = set()  # type: Set[str]
 
     @property
     def complete(self) -> bool:
@@ -149,9 +191,16 @@ class WalkResult:
         """
         return self.files + self.dirs - self.hardlink_extra_refs
 
-    def top_dirs(self, n: int, key: str = "size") -> List[DirAgg]:
-        """Reported directories ranked by ``size``, ``files`` or ``density``."""
+    def top_dirs(self, n: int, key: str = "size", finished_only: bool = False) -> List[DirAgg]:
+        """Reported directories ranked by ``size``, ``files`` or ``density``.
+
+        ``finished_only`` drops entries whose subtree was still being walked,
+        which is what an interrupted run must report: a half-counted directory
+        placed in a ranking is not a small error, it is the wrong answer.
+        """
         aggs = [a for a in self.dir_agg.values() if a.path != self.root]
+        if finished_only:
+            aggs = [a for a in aggs if self.is_finished(a)]
         if key == "files":
             aggs.sort(key=lambda a: a.inodes, reverse=True)
         elif key == "density":
@@ -164,6 +213,14 @@ class WalkResult:
         else:
             aggs.sort(key=lambda a: a.size, reverse=True)
         return aggs[:n]
+
+    def is_finished(self, entry: "Entry") -> bool:
+        """Was this entry's whole subtree walked?"""
+        if not self.partial:
+            return True
+        rel = os.path.relpath(entry.path, self.root)
+        top = rel.split(os.sep)[0]
+        return top in self.finished_tops
 
 
 def _entry_keys(root: str, rel_parts: Tuple[str, ...], depth: int) -> List[str]:
@@ -197,6 +254,7 @@ def walk(
     settle_window: float = DEFAULT_SETTLE_WINDOW_S,
     one_file_system: bool = False,
     stop: Optional[threading.Event] = None,
+    progress: Optional["Progress"] = None,
 ) -> WalkResult:
     """Walk ``root`` and return a :class:`WalkResult`.
 
@@ -232,6 +290,10 @@ def walk(
     # may still be about to enqueue children, so an empty queue alone is not
     # termination.
     pending_box = [1]
+    # depth-1 name -> directories queued beneath it that have not finished. When
+    # a counter reaches zero that whole subtree is final.
+    outstanding = {}  # type: Dict[str, int]
+    finished_tops = set()  # type: Set[str]
     cv = threading.Condition()
 
     # Hardlink bookkeeping is global: the same inode may be reached from
@@ -251,8 +313,9 @@ def walk(
         res.by_uid[root_st.st_uid] = (root_st.st_blocks * 512, 1)
         res.by_dev[root_dev] = (root_st.st_blocks * 512, 1)
 
-    def worker() -> None:
+    def worker(slot_id: int = 0) -> None:
         l_size = l_app = l_files = l_dirs = l_sym = l_unstat = 0
+        seen_here = 0
         l_recent = l_recent_app = l_recent_size = 0
         l_extra = 0
         l_uid = {}  # type: Dict[int, List[int]]
@@ -270,6 +333,7 @@ def walk(
                     cv.notify_all()
                     break
                 d, d_parts = queue.popleft()
+            seen_here += 1
 
             children = []  # type: List[Tuple[str, Tuple[str, ...]]]
 
@@ -356,11 +420,25 @@ def walk(
             except OSError as exc:
                 l_unreadable.append((d, exc.strerror or "unreadable"))
 
+            if progress is not None:
+                # Published per directory rather than per inode: one list write
+                # every few hundred entries costs nothing measurable.
+                progress.inode_slots[slot_id] = l_files + l_dirs
+                progress.dir_slots[slot_id] = seen_here
+                progress.current = d
+
             with cv:
                 if children and not stop_ev.is_set():
                     queue.extend(children)
                     pending_box[0] += len(children)
+                    for _, cparts in children:
+                        outstanding[cparts[0]] = outstanding.get(cparts[0], 0) + 1
                 pending_box[0] -= 1
+                if d_parts:
+                    top = d_parts[0]
+                    outstanding[top] -= 1
+                    if outstanding[top] == 0:
+                        finished_tops.add(top)
                 cv.notify_all()
 
         with merge_lock:
@@ -395,7 +473,7 @@ def walk(
     t0 = time.perf_counter()
     account_root()
     workers = [
-        threading.Thread(target=worker, name="slurmdisk-walk-%d" % i, daemon=True)
+        threading.Thread(target=worker, args=(i,), name="slurmdisk-walk-%d" % i, daemon=True)
         for i in range(nthreads)
     ]
     for w in workers:
@@ -412,6 +490,14 @@ def walk(
         res.partial = True
     res.elapsed = time.perf_counter() - t0
     res.hardlinked_inodes = len(seen_links)
+    res.finished_tops = finished_tops
+    # A depth-1 plain file is complete the moment the root was scanned; only
+    # directories can be caught mid-walk.
+    for entry in res.dir_agg.values():
+        if entry.path != root and not entry.is_dir:
+            res.finished_tops.add(os.path.basename(entry.path))
+    if progress is not None:
+        progress.finished = True
     return res
 
 

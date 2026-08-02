@@ -6,6 +6,7 @@ import os
 import pytest
 
 from slurmdisk import cli
+from slurmdisk import walk as walkmod
 from slurmdisk.fmt import human_bytes, human_count, human_duration, pct
 
 
@@ -40,7 +41,7 @@ def test_a_directory_named_like_an_old_subcommand_is_measured(tmp_path, capsys):
             os.chdir(cwd)
         out = capsys.readouterr().out
         assert name in out, name
-        assert "inodes" in out, name
+        assert "files" in out, name
         assert "UNLINKED" not in out, "%s was taken as a subcommand" % name
 
 
@@ -90,7 +91,8 @@ def test_default_answers_how_big_and_nothing_else(small_tree, capsys):
     # Byte totals are not asserted: on GPFS a just-written fixture reports
     # delayed-allocation blocks, which is the effect this package reports
     # elsewhere and has no business making a CLI test flaky.
-    assert "inodes" in out
+    # "files", not "inodes": the quota the reader is up against uses that word.
+    assert "files" in out
     for section in ("QUOTA", "WALK", "RECONCILE", "UNLINKED"):
         assert section not in out, section
     # Headline, blank, column header, then one line per child.
@@ -220,3 +222,24 @@ def test_pct_guards_zero_denominator():
     assert pct(1, 0) == "n/a"
     assert pct(None, 10) == "n/a"
     assert pct(0.5, 1.0) == "50.0%"
+
+
+def test_interrupted_output_states_no_total_and_no_shares(small_tree, capsys, monkeypatch):
+    """An interrupted walk must not present itself as a measurement."""
+    real_walk = walkmod.walk
+
+    def interrupted(*a, **kw):
+        res = real_walk(*a, **kw)
+        res.partial = True
+        # Nothing finished, the harshest case.
+        res.finished_tops = set()
+        return res
+
+    monkeypatch.setattr(walkmod, "walk", interrupted)
+    cli.main([small_tree, "--no-progress"])
+    out = capsys.readouterr().out
+    assert "INTERRUPTED" in out
+    assert "partial:" in out
+    assert "no total and no share" in out
+    # No percentage may be printed, because there is no denominator.
+    assert "%" not in out

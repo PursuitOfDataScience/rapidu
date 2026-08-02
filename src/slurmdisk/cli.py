@@ -22,6 +22,7 @@ import contextlib
 import json
 import os
 import sys
+import threading
 from typing import List, Optional
 
 from . import deleted as deletedmod
@@ -55,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="examples:\n"
         "  sd .                  how big is this tree, and what is big inside it\n"
         "  sd ~/scratch -n 20    the same, listing 20 directories\n"
-        "  sd . -i               rank by inode count instead of bytes\n"
+        "  sd . -i               rank by file count instead of bytes\n"
         "  sd . -a               the full report: quota, /proc scan, reconciliation\n"
         "  sd -Q                 just the quota table and the age of its figures\n"
         "  sd -D                 unlinked-but-open space held on this node\n"
@@ -127,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-i",
         "--inodes",
         action="store_true",
-        help="rank directories by inode count instead of bytes",
+        help="rank by file count instead of bytes -- what an inode quota limits",
     )
     p.add_argument(
         "-Q",
@@ -175,6 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=rc.DEFAULT_MAX_SNAPSHOT_AGE_S,
         metavar="SECONDS",
         help="a quota snapshot older than this cannot support a finding (default: %(default)s)",
+    )
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="do not draw the progress spinner while walking (it is on stderr, "
+        "and already suppressed when stderr is not a terminal)",
     )
     p.add_argument(
         "--color",
@@ -252,6 +259,67 @@ def cmd_deleted(args: argparse.Namespace) -> int:
     return rcode
 
 
+def _walk_with_progress(
+    path: str, args: argparse.Namespace, style: ui.Style
+) -> "walkmod.WalkResult":
+    """Run the walk, painting a spinner on stderr while it is in flight.
+
+    The results are printed only when the walk finishes, and that is deliberate.
+    A ranking cannot be streamed: you do not know which directory is largest
+    until you have seen them all, so emitting rows as they arrive would show an
+    order that keeps changing and is wrong until the last moment. Progress is
+    the honest thing to stream; conclusions are not.
+    """
+    nthreads = max(1, min(int(args.threads), walkmod.MAX_THREADS))
+    spinner = ui.Spinner(style)
+    if args.no_progress or not spinner.enabled:
+        return walkmod.walk(
+            path,
+            threads=args.threads,
+            depth=args.depth,
+            max_dirs_per_sec=args.max_dirs_per_sec,
+            settle_window=args.settle_window,
+            one_file_system=args.one_file_system,
+        )
+
+    progress = walkmod.Progress(nthreads)
+    stop = threading.Event()
+
+    def paint() -> None:
+        # Nothing is drawn for a fast walk: below the delay the spinner would be
+        # a flicker between the prompt and the output.
+        if stop.wait(ui.PROGRESS_DELAY_S):
+            return
+        while not stop.is_set():
+            spinner.paint(
+                ui.progress_text(
+                    ui.truncate(progress.current or path, max(20, style.width // 3)),
+                    progress.inodes,
+                    progress.dirs,
+                    progress.rate,
+                    progress.elapsed,
+                )
+            )
+            stop.wait(ui.PROGRESS_INTERVAL_S)
+
+    painter = threading.Thread(target=paint, name="slurmdisk-progress", daemon=True)
+    painter.start()
+    try:
+        return walkmod.walk(
+            path,
+            threads=args.threads,
+            depth=args.depth,
+            max_dirs_per_sec=args.max_dirs_per_sec,
+            settle_window=args.settle_window,
+            one_file_system=args.one_file_system,
+            progress=progress,
+        )
+    finally:
+        stop.set()
+        painter.join(timeout=1.0)
+        spinner.clear()
+
+
 def cmd_walk(args: argparse.Namespace) -> int:
     paths = _resolve_paths(args.paths)
     if not paths:
@@ -278,14 +346,7 @@ def cmd_walk(args: argparse.Namespace) -> int:
     rcode = EXIT_OK
     for path in paths:
         try:
-            res = walkmod.walk(
-                path,
-                threads=args.threads,
-                depth=args.depth,
-                max_dirs_per_sec=args.max_dirs_per_sec,
-                settle_window=args.settle_window,
-                one_file_system=args.one_file_system,
-            )
+            res = _walk_with_progress(path, args, style)
         except OSError as exc:
             sys.stderr.write("slurmdisk: {}\n".format(exc))
             rcode = EXIT_ERROR

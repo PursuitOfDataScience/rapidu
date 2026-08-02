@@ -181,9 +181,9 @@ def reconcile(
     if kind == "blocks":
         if settle.moved:
             rec.blockers.append(
-                "the tree has not settled: a re-stat {:.0f}s later found {} "
-                "{} allocated than the walk read".format(
-                    settle.gap,
+                "the tree has not settled: a re-stat {} found {} {} allocated "
+                "than the walk read".format(
+                    "{:.0f}s later".format(settle.gap) if settle.gap >= 1 else "after the walk",
                     human_bytes(abs(settle.drift)),
                     "more" if settle.drift > 0 else "less",
                 )

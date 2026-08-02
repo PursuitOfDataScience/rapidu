@@ -121,15 +121,21 @@ def render_entries(
     column, and putting it at the end keeps every numeric column aligned no
     matter how deep the paths go. It is also the order ``du`` prints.
     """
-    ranked = res.top_dirs(top, "files" if by_inodes else "size")
+    # After an interrupt, only subtrees that were walked to completion can be
+    # ranked. A directory caught mid-walk carries an arbitrary fraction of its
+    # contents, and placing that in an ordered table is not an approximation --
+    # it is the wrong answer, presented with the authority of the right one.
+    ranked = res.top_dirs(top, "files" if by_inodes else "size", finished_only=res.partial)
     if not ranked:
         return []
 
     rest_size = max(0, res.size - sum(e.size for e in ranked))
     rest_inodes = max(0, res.inodes - sum(e.inodes for e in ranked))
     # A remainder row is only well defined when the listed entries are siblings
-    # that partition the tree. At depth > 1 rows nest and it would double-count.
-    show_rest = rest_size > 0 and _entries_partition_tree(res)
+    # that partition the tree. At depth > 1 rows nest and it would double-count;
+    # after an interrupt the unscanned part is unknown, so there is no remainder
+    # to state.
+    show_rest = rest_size > 0 and not res.partial and _entries_partition_tree(res)
 
     # The bar and the share must measure whatever the rows were ranked by, or a
     # -i listing shows an inode ordering with byte-length bars and reads as
@@ -142,7 +148,9 @@ def render_entries(
     # left barless -- it is an aggregate of things not shown, and giving it the
     # longest bar would make "everything else" look like the top offender.
     peak = max(metric(e) for e in ranked) or 1
-    total = (res.inodes if by_inodes else res.size) or 1
+    # A share needs a denominator. After an interrupt there is no tree total, so
+    # the column is blanked rather than filled with a fraction of an accident.
+    total = 0 if res.partial else ((res.inodes if by_inodes else res.size) or 1)
 
     rows = [
         _entry_line(
@@ -154,7 +162,7 @@ def render_entries(
             total,
             style,
             indent,
-            dim=not e.is_dir,
+            is_dir=e.is_dir,
         )
         for e in ranked
     ]
@@ -170,7 +178,8 @@ def render_entries(
                 total,
                 style,
                 indent,
-                dim=True,
+                is_dir=False,
+                aggregate=True,
             )
         )
     return rows
@@ -188,27 +197,58 @@ def _entry_line(
     total: int,
     style: ui.Style,
     indent: str,
-    dim: bool,
+    is_dir: bool,
+    aggregate: bool = False,
 ) -> str:
-    """``value`` is the ranked metric; it drives the bar and the share."""
-    bar = " " * _BAR_W if peak is None else ui.bar(value / float(peak), _BAR_W, style)
+    """``value`` is the ranked metric; it drives the bar, the share and the tone.
+
+    The tone is a function of share-of-tree, so the colour of a row says how much
+    it matters. Size and bar carry the same tone: whichever column the eye lands
+    on gives the same answer.
+
+    Files are *not* dimmed. A 63 MiB file that is 9% of a home directory is more
+    worth looking at than a 3% directory, and greying it out said the opposite.
+    Directories are marked by a trailing slash and a blue name, the way ``ls``
+    does it -- shape, not emphasis.
+    """
+    share = value / float(total) if total else 0.0
+    tone = "dim" if aggregate else ui.heat(share)
+    if total <= 0:
+        tone = "dim"
+    bar = " " * _BAR_W if peak is None else ui.bar(value / float(peak), _BAR_W, style, accent=tone)
+    name_style = []  # type: List[str]
+    if aggregate:
+        name_style = ["dim"]
+    elif is_dir:
+        name_style = ["bold_blue"]
     return "{}{}  {}  {}  {}  {}".format(
         indent,
-        style.paint(human_bytes(size).rjust(10), "bold_cyan"),
+        style.paint(human_bytes(size).rjust(10), tone),
         bar,
-        style.paint("{:>6}".format(pct(value, total)), "dim"),
+        style.paint(
+            "{:>6}".format(pct(value, total) if total else ""), "dim" if aggregate else tone
+        ),
         style.paint("{:>9}".format(human_count(inodes)), "dim"),
-        style.paint(name, "dim") if dim else style.paint(name, "bold"),
+        style.paint(name, *name_style),
     )
 
 
 def _entries_header(style: ui.Style, indent: str = "  ") -> str:
+    """Column labels.
+
+    The count column is headed ``files``, not ``inodes``. "inode" is the correct
+    term -- it is the on-disk structure a file or directory occupies, and it is
+    the resource that runs out -- but the quota the reader is up against calls
+    them files (``files (user) 21,553 / 300,000``), so using the quota's own word
+    lets the two numbers be compared without a translation step. Directories are
+    included in the count, exactly as the quota includes them.
+    """
     return "{}{}  {}  {}  {}  {}".format(
         indent,
         style.paint("{:>10}".format("size"), "dim"),
         " " * _BAR_W,
         style.paint("{:>6}".format("share"), "dim"),
-        style.paint("{:>9}".format("inodes"), "dim"),
+        style.paint("{:>9}".format("files"), "dim"),
         style.paint("name", "dim"),
     )
 
@@ -238,14 +278,27 @@ def render_compact(
     incomplete walk, or drift that was actually measured. A caveat that fires on
     every run is not a warning, it is furniture.
     """
-    out = [
-        "{}   {}   {}   {}".format(
-            style.paint(res.root, "bold"),
-            style.paint(human_bytes(res.size), "bold_cyan"),
-            style.paint("{} inodes".format(human_count(res.inodes)), "dim"),
-            style.paint("{:.2f}s".format(res.elapsed), "dim"),
-        )
-    ]
+    if res.partial:
+        out = [
+            "{}   {}".format(
+                style.paint(res.root, "bold"),
+                style.paint(
+                    "partial: {} in {} files scanned before the interrupt".format(
+                        human_bytes(res.size), human_count(res.inodes)
+                    ),
+                    "dim",
+                ),
+            )
+        ]
+    else:
+        out = [
+            "{}   {}   {}   {}".format(
+                style.paint(res.root, "bold"),
+                style.paint(human_bytes(res.size), "bold_cyan"),
+                style.paint("{} files".format(human_count(res.inodes)), "dim"),
+                style.paint("{:.2f}s".format(res.elapsed), "dim"),
+            )
+        ]
     out.extend(_hard_warnings(res, settle, style))
     body = render_entries(res, top, by_inodes, style)
     if body:
@@ -258,20 +311,42 @@ def render_compact(
 def _hard_warnings(res: WalkResult, settle: SettleCheck, style: ui.Style) -> List[str]:
     """Only the things that change what the headline number means."""
     out = []  # type: List[str]
-    if not res.complete:
+    if res.partial:
+        out.append(
+            ui.alarm(
+                "INTERRUPTED after {:.0f}s -- this is not a measurement of the tree.".format(
+                    res.elapsed
+                ),
+                style,
+            )
+        )
+        out.append(
+            style.paint(
+                "  {} of {} top-level entries were walked to completion and are"
+                " listed below; the rest is unknown, so there is no total and no"
+                " share of anything.".format(
+                    len(res.top_dirs(10**6, finished_only=True)),
+                    len([e for e in res.dir_agg.values() if e.path != res.root]),
+                ),
+                "dim",
+            )
+        )
+    elif not res.complete:
         detail = []
         if res.unreadable_dirs:
             detail.append("{} dirs unreadable".format(len(res.unreadable_dirs)))
         if res.unstatable:
             detail.append("{} entries unstatable".format(res.unstatable))
-        if res.partial:
-            detail.append("interrupted")
         out.append(ui.alarm("this is a FLOOR, not a total: " + ", ".join(detail), style))
     if settle.moved:
+        # With --settle-wait 0 the re-stat is immediate, so "0s later" would be a
+        # fabricated precision: the real observation window is however long the
+        # walk itself took to reach the end.
+        when = "{:.0f}s later".format(settle.gap) if settle.gap >= 1 else "after the walk"
         out.append(
             ui.warn(
-                "still settling: re-stat {:.0f}s later found {} {} allocated".format(
-                    settle.gap,
+                "still settling: a re-stat {} found {} {} allocated".format(
+                    when,
                     human_bytes(abs(settle.drift)),
                     "more" if settle.drift > 0 else "less",
                 ),
@@ -299,8 +374,10 @@ def render_walk(
             style.paint(res.root, "bold"),
             style.paint(human_bytes(res.size), "bold_cyan"),
             style.paint(
-                "{} inodes  ({} files, {} dirs)".format(
-                    human_count(res.inodes), human_count(res.files), human_count(res.dirs)
+                "{} files  ({} regular + {} directories)".format(
+                    human_count(res.inodes),
+                    human_count(res.files - res.hardlink_extra_refs),
+                    human_count(res.dirs),
                 ),
                 "dim",
             ),
@@ -308,14 +385,14 @@ def render_walk(
     ]
 
     facts = [
-        "{:.2f}s at {} threads ({:,.0f} inodes/s)".format(
+        "{:.2f}s at {} threads ({:,.0f} files/s)".format(
             res.elapsed, res.threads, res.inodes / res.elapsed if res.elapsed > 0 else 0.0
         ),
         "apparent {}".format(human_bytes(res.apparent)),
     ]
     if res.hardlinked_inodes:
         facts.append(
-            "{} hard-linked inodes, {} refs deduped".format(
+            "{} hard-linked files, {} extra names deduped".format(
                 human_count(res.hardlinked_inodes), human_count(res.hardlink_extra_refs)
             )
         )
@@ -356,7 +433,7 @@ def render_walk(
             res.by_uid.items(), key=lambda kv: kv[1][0], reverse=True
         )[:6]:
             out.append(
-                "      {:<16}{:>12}  {:>12} inodes".format(
+                "      {:<16}{:>12}  {:>12} files".format(
                     _uname(uid), human_bytes(size), human_count(inodes)
                 )
             )
@@ -413,8 +490,11 @@ def render_settle(res: WalkResult, settle: SettleCheck) -> List[str]:
     if settle.moved:
         direction = "MORE" if settle.drift > 0 else "LESS"
         out.append(
-            "      ! re-stat {:.0f}s later found {} {} allocated: this tree is "
-            "still moving.".format(settle.gap, human_bytes(abs(settle.drift)), direction)
+            "      ! a re-stat {} found {} {} allocated: this tree is still moving.".format(
+                "{:.0f}s later".format(settle.gap) if settle.gap >= 1 else "after the walk",
+                human_bytes(abs(settle.drift)),
+                direction,
+            )
         )
         out.append("        Any size you read right now -- from this tool or from du --")
         out.append("        is provisional. Measured on GPFS, a freshly written tree has")
@@ -558,7 +638,7 @@ def render_reconcile(recs: List[rc.Reconciliation], style: Optional[ui.Style] = 
     style = style or ui.resolve_style("never")
     out = ["", ui.heading("RECONCILE", style)]
     for r in recs:
-        label = "bytes " if r.kind == "blocks" else "inodes"
+        label = "bytes" if r.kind == "blocks" else "files"
         show = _counter if r.kind == "files" else human_bytes
 
         if r.verdict == rc.NOT_COMPARED:
