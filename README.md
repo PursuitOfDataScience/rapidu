@@ -1,4 +1,4 @@
-<h1 align="center">rapi<code>DU</code></h1>
+<h1 align="center">rapiDU</h1>
 
 <p align="center">
   <strong>A much faster <code>du</code> that tells you why your quota is full.</strong>
