@@ -85,13 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
         "how old the quota number you are comparing against is.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
-        "  rdu .                  how big is this tree, and what is big inside it\n"
-        "  rdu ~/scratch -n 20    the same, listing 20 directories\n"
-        "  rdu . -i               rank by file count instead of bytes\n"
-        "  rdu . -a               the full report: quota, /proc scan, reconciliation\n"
+        "  rdu                    how big is this tree, and what is big inside it\n"
+        "  rdu ~/scratch -n 20    another tree, listing 20 directories\n"
+        "  rdu -i                 rank by file count instead of bytes\n"
+        "  rdu -a                 the full report: quota, /proc scan, reconciliation\n"
         "  rdu -Q                 just the quota table and the age of its figures\n"
         "  rdu -D                 unlinked-but-open space held on this node\n"
-        "  rdu . -a --settle-wait 60   measure how far a fresh tree is still drifting\n"
+        "  rdu -a --settle-wait 60     measure how far a fresh tree is still drifting\n"
         "\n"
         "rapidu agrees with `du -s --block-size=1` byte-for-byte on the\n"
         "same tree. It is faster, not more accurate.",

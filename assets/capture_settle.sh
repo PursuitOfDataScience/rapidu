@@ -43,7 +43,7 @@ rc=0
 printf '# rdu %s -a --no-quota --no-deleted --settle-wait 60\n' "$TREE" >"$OUT"
 COLUMNS=96 TERM=xterm-256color PYTHONPATH="$REPO/src" \
     python3 -m rapidu "$TREE" -a --no-quota --no-deleted --settle-wait 60 \
-    -n 6 --color always --no-progress >>"$OUT" || rc=$?
+    -n 3 --color always --no-progress >>"$OUT" || rc=$?
 if [ "$rc" -gt 1 ]; then
     echo "rapidu failed with exit $rc" >&2
     exit "$rc"

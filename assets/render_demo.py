@@ -566,7 +566,11 @@ def main():
             )
         )
 
-    rows = max(len(to_cells(out)) + 3 for _, out in scenes) + 1
+    # One canvas has to hold every scene, so its height is the tallest one plus
+    # the prompt line and a single blank after the output. It used to carry four
+    # rows of slack, which the tallest scene needed and the other four did not --
+    # so most of the running time was spent showing an empty band at the bottom.
+    rows = max(len(to_cells(out)) for _, out in scenes) + 2
     painter = Painter(rows)
     screen = Screen(rows)
     movie = Movie(painter)
