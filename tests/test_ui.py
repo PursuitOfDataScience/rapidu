@@ -247,7 +247,7 @@ def test_separators_degrade_to_ascii():
 
 FAKE_HELP = "\n".join(
     (
-        "usage: sd [PATH ...] [options]",
+        "usage: rdu [PATH ...] [options]",
         "",
         "options:",
         "  -n N, --top N         how many to list (default: 10)",
@@ -255,7 +255,7 @@ FAKE_HELP = "\n".join(
         "                        try `du -s --block-size=1` and --no-quota first",
         "",
         "examples:",
-        "  sd . -i               rank by file count",
+        "  rdu . -i               rank by file count",
         "",
     )
 )
@@ -307,7 +307,7 @@ def test_an_example_is_a_command_plus_a_dim_explanation():
 
 
 def test_color_never_survives_into_help(capsys):
-    """`sd --help > ticket.txt` must not paste escape codes into a ticket."""
+    """`rdu --help > ticket.txt` must not paste escape codes into a ticket."""
     parser = cli.build_parser()
     parser.style = ui.resolve_style("never", stream=FakeTTY())
     assert "\033[" not in parser.format_help()

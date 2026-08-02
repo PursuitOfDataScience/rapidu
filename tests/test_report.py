@@ -111,7 +111,7 @@ def test_the_full_report_states_the_drift_exactly_once():
 
 
 def test_the_compact_view_keeps_the_one_line_warning():
-    """`sd .` was asked a size question, and drift changes what the size means."""
+    """`rdu .` was asked a size question, and drift changes what the size means."""
     res = make_walk(recent=6000)
     out = "\n".join(
         report.render_compact(res, make_settle(drift=80 << 20, gap=75.0), 10, False, PLAIN)

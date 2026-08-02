@@ -171,7 +171,7 @@ jobs:
         run: |
           pip install -e .
           set +e
-          out=$(sd --quota-only 2>&1); code=$?
+          out=$(rdu --quota-only 2>&1); code=$?
           set -e
           echo "$out"
           test $code -eq 1 || { echo "::error::expected exit 1 (attention), got $code"; exit 1; }
@@ -183,18 +183,18 @@ jobs:
 
       - name: Output is clean when redirected -- no escape codes in a support ticket
         run: |
-          sd . > plain.txt
+          rdu . > plain.txt
           if grep -qP '\x1b\[' plain.txt; then
             echo "::error::colour escapes leaked into non-TTY output"; exit 1
           fi
-          NO_COLOR=1 sd . --color auto > nocolor.txt
+          NO_COLOR=1 rdu . --color auto > nocolor.txt
           if grep -qP '\x1b\[' nocolor.txt; then
             echo "::error::NO_COLOR was ignored"; exit 1
           fi
           # --help is painted after argparse has laid it out, which is a second
-          # place colour can leak from -- and `sd --help > usage.txt` is exactly
+          # place colour can leak from -- and `rdu --help > usage.txt` is exactly
           # what someone does before pasting it into a ticket.
-          sd --help > help.txt
+          rdu --help > help.txt
           if grep -qP '\x1b\[' help.txt; then
             echo "::error::colour escapes leaked into redirected --help"; exit 1
           fi
@@ -204,7 +204,7 @@ jobs:
       # quota -- the exact failure the reconciler exists to prevent.
       - name: A stat-free walk never manufactures a finding
         run: |
-          sd . -c --json > count.json
+          rdu . -c --json > count.json
           python3 - <<'PY'
           import json
           doc = json.load(open("count.json"))
@@ -239,8 +239,8 @@ jobs:
           python -m venv /tmp/check
           /tmp/check/bin/pip install --quiet dist/*.whl
           /tmp/check/bin/rapidu --version
-          /tmp/check/bin/sd --version          # the short alias must be there too
-          /tmp/check/bin/sd /tmp --json | python3 -m json.tool > /dev/null
+          /tmp/check/bin/rdu --version          # the short alias must be there too
+          /tmp/check/bin/rdu /tmp --json | python3 -m json.tool > /dev/null
           /tmp/check/bin/python -c "import rapidu, pathlib; \
             assert (pathlib.Path(rapidu.__file__).parent / 'py.typed').is_file(), \
             'py.typed missing from the wheel'"

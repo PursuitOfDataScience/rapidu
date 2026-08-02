@@ -23,7 +23,7 @@ def small_tree(tmp_path):
 def test_a_directory_named_like_an_old_subcommand_is_measured(tmp_path, capsys):
     """The reason subcommands were removed: these are ordinary directory names.
 
-    `sd deleted` used to mean "scan for unlinked-but-open files" even when
+    `rdu deleted` used to mean "scan for unlinked-but-open files" even when
     ./deleted was a real directory the user wanted measured. A path is now
     always a path.
     """
@@ -65,7 +65,7 @@ def test_conflicting_only_flags_rejected():
 
 
 def test_removed_subcommand_word_gets_a_pointer(tmp_path, capsys):
-    """`sd quota` with no ./quota directory should say what to type instead."""
+    """`rdu quota` with no ./quota directory should say what to type instead."""
     import os
 
     cwd = os.getcwd()
@@ -80,7 +80,7 @@ def test_removed_subcommand_word_gets_a_pointer(tmp_path, capsys):
 
 
 def test_default_answers_how_big_and_nothing_else(small_tree, capsys):
-    """`sd .` was asked a size question. It must not run an audit.
+    """`rdu .` was asked a size question. It must not run an audit.
 
     The quota backend shells out to a site wrapper and the /proc sweep visits
     every pid on the node; neither is used to answer "how big is this tree".

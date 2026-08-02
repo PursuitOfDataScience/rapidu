@@ -416,7 +416,7 @@ def render_compact(
 ) -> List[str]:
     """The default view: how big is this tree, and what is big inside it.
 
-    That is the question ``sd .`` is asked, and answering it should look like
+    That is the question ``rdu .`` is asked, and answering it should look like
     ``du -sh`` with a breakdown -- not like a diagnostic report. Everything this
     tool knows that ``du`` does not (quota and its age, the reconciliation, the
     /proc scan) is real work the user did not ask for here, costs latency, and

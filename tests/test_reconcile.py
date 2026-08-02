@@ -206,7 +206,7 @@ def count_only_walk(root=MOUNT):
 
 
 def test_count_mode_refuses_the_block_comparison():
-    """`sd <mount> -c -a` used to report the whole quota as an UNEXPLAINED GAP.
+    """`rdu <mount> -c -a` used to report the whole quota as an UNEXPLAINED GAP.
 
     A -c walk never calls stat, so its byte total is 0. Comparing that against a
     live quota figure manufactured a finding the size of the quota -- the exact
