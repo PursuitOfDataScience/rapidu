@@ -141,7 +141,7 @@ def render_entries(
     # -i listing shows an inode ordering with byte-length bars and reads as
     # though it were mis-sorted.
     def metric(e):
-        return e.inodes if by_inodes else e.size
+        return e.inodes if (by_inodes or res.count_only) else e.size
 
     # Scaled to the largest listed entry, not to the total: the bar exists to
     # discriminate between the rows on screen. The remainder row is deliberately
@@ -150,7 +150,12 @@ def render_entries(
     peak = max(metric(e) for e in ranked) or 1
     # A share needs a denominator. After an interrupt there is no tree total, so
     # the column is blanked rather than filled with a fraction of an accident.
-    total = 0 if res.partial else ((res.inodes if by_inodes else res.size) or 1)
+    if res.partial:
+        total = 0
+    elif by_inodes or res.count_only:
+        total = res.inodes or 1
+    else:
+        total = res.size or 1
 
     rows = [
         _entry_line(
@@ -163,6 +168,7 @@ def render_entries(
             style,
             indent,
             is_dir=e.is_dir,
+            size_hidden=res.count_only,
         )
         for e in ranked
     ]
@@ -180,6 +186,7 @@ def render_entries(
                 indent,
                 is_dir=False,
                 aggregate=True,
+                size_hidden=res.count_only,
             )
         )
     return rows
@@ -199,6 +206,7 @@ def _entry_line(
     indent: str,
     is_dir: bool,
     aggregate: bool = False,
+    size_hidden: bool = False,
 ) -> str:
     """``value`` is the ranked metric; it drives the bar, the share and the tone.
 
@@ -216,14 +224,17 @@ def _entry_line(
     if total <= 0:
         tone = "dim"
     bar = " " * _BAR_W if peak is None else ui.bar(value / float(peak), _BAR_W, style, accent=tone)
+    # In count mode there are no sizes at all, so the column is omitted rather
+    # than left as ten blank characters the eye has to step over.
+    size_cell = "" if size_hidden else style.paint(human_bytes(size).rjust(10), tone) + "  "
     name_style = []  # type: List[str]
     if aggregate:
         name_style = ["dim"]
     elif is_dir:
         name_style = ["bold_blue"]
-    return "{}{}  {}  {}  {}  {}".format(
+    return "{}{}{}  {}  {}  {}".format(
         indent,
-        style.paint(human_bytes(size).rjust(10), tone),
+        size_cell,
         bar,
         style.paint(
             "{:>6}".format(pct(value, total) if total else ""), "dim" if aggregate else tone
@@ -233,7 +244,7 @@ def _entry_line(
     )
 
 
-def _entries_header(style: ui.Style, indent: str = "  ") -> str:
+def _entries_header(style: ui.Style, indent: str = "  ", size_label: str = "size") -> str:
     """Column labels.
 
     The count column is headed ``files``, not ``inodes``. "inode" is the correct
@@ -243,9 +254,10 @@ def _entries_header(style: ui.Style, indent: str = "  ") -> str:
     lets the two numbers be compared without a translation step. Directories are
     included in the count, exactly as the quota includes them.
     """
-    return "{}{}  {}  {}  {}  {}".format(
+    head = "" if not size_label else style.paint("{:>10}".format(size_label), "dim") + "  "
+    return "{}{}{}  {}  {}  {}".format(
         indent,
-        style.paint("{:>10}".format("size"), "dim"),
+        head,
         " " * _BAR_W,
         style.paint("{:>6}".format("share"), "dim"),
         style.paint("{:>9}".format("files"), "dim"),
@@ -278,7 +290,19 @@ def render_compact(
     incomplete walk, or drift that was actually measured. A caveat that fires on
     every run is not a warning, it is furniture.
     """
-    if res.partial:
+    if res.count_only:
+        out = [
+            "{}   {}   {}".format(
+                style.paint(res.root, "bold"),
+                style.paint("{} files".format(human_count(res.inodes)), "bold_cyan"),
+                style.paint("{:.2f}s".format(res.elapsed), "dim"),
+            ),
+            style.paint(
+                "  counts only (-c): no sizes, and hard links count once per name",
+                "dim",
+            ),
+        ]
+    elif res.partial:
         out = [
             "{}   {}".format(
                 style.paint(res.root, "bold"),
@@ -303,7 +327,7 @@ def render_compact(
     body = render_entries(res, top, by_inodes, style)
     if body:
         out.append("")
-        out.append(_entries_header(style))
+        out.append(_entries_header(style, size_label="" if res.count_only else "size"))
         out.extend(body)
     return out
 
@@ -441,7 +465,7 @@ def render_walk(
     body = render_entries(res, top, by_inodes, style)
     if body:
         out.append("")
-        out.append(_entries_header(style))
+        out.append(_entries_header(style, size_label="" if res.count_only else "size"))
         out.extend(body)
     return out
 
