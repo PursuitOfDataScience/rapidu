@@ -44,10 +44,7 @@ rdu -a                   # the full audit: quota + /proc scan + reconciliation
   </picture>
 </p>
 
-A faster answer is only worth having if it is the same answer. On a tree with
-hard links, a sparse file and 12-deep nesting, `du -s --block-size=1` and rapiDU
-at 1/2/4/8/16 threads all return **655,474,688 B** — a test in this repo, not an
-aspiration.
+Same total as `du`, to the byte. That is checked on every commit.
 
 ## Reading the table
 
