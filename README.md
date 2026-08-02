@@ -1,63 +1,49 @@
-# slurmdisk
+<h1 align="center">slurmdisk</h1>
 
-Where your bytes and inodes are, what `du` cannot see, and how old the quota
-number you are comparing against actually is.
+<p align="center">
+  <strong>Where your bytes and inodes went, what <code>du</code> cannot see, and how old the quota number you are arguing with really is.</strong>
+</p>
 
-```
-$ sd .
- 716.5 MiB   /home/researcher
-             21,640 files  ·  94 entries  ·  0.17s
+<p align="center">
+  <a href="https://github.com/PursuitOfDataScience/slurmdisk/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmdisk/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/python-3.6%2B-blue.svg" alt="Python 3.6+">
+  <img src="https://img.shields.io/badge/dependencies-none-brightgreen.svg" alt="No dependencies">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
+  <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/lint-ruff-261230.svg" alt="Ruff"></a>
+</p>
 
-  ──────────────────────────────────────────────────────────────────────
-        size                       share      files  name
-   102.8 MiB  ██████████████████   14.3%      5,062  project-alpha/
-    94.3 MiB  ████████████████▌░   13.2%      2,484  notebooks/
-    63.3 MiB  ███████████░░░░░░░    8.8%          1  archive-a.db
-    50.1 MiB  ████████▊░░░░░░░░░    7.0%      1,686  uchicago-workshops/
-   392.8 MiB                       54.8%     14,092  (90 more — use -n 0 for all)
-```
+<p align="center">
+  <img src="assets/demo.gif" width="900" alt="slurmdisk walking a home directory, ranking it by file count, printing a quota table with the age of its snapshot, finding 512 MiB held by a deleted-but-open file descriptor, and catching a freshly written GPFS tree while its allocation is still moving.">
+</p>
 
-Sizes are cumulative, so any row agrees with `du -s` on that path, and plain
-files are listed alongside directories. Bar length and bar colour encode the
-same thing — this row against the largest — so they always agree; the share
-column carries the absolute figure. There is no red in that ramp: the top row is
-the hottest colour on *every* listing, so red there would cry wolf on every run.
-Red is kept for a near-full quota, an interrupted walk, or a total that is only
-a floor.
-
-Colour is off unless stdout is a terminal, honours `NO_COLOR`, and falls back
-from 256 colours to 8 and from block glyphs to ASCII when the terminal says so.
-
-```
-sd . -c        # count files only, no sizes — 8x faster (see Speed)
-sd . -i        # rank by file count instead of bytes
-sd . -n 0      # every entry, not just the top 10
-sd . -a        # the full report: quota + /proc scan + reconciliation
-sd -Q          # just the quota table, and the age of its figures
-sd -D          # space held by unlinked-but-open files
-sd . --json    # the complete document, for tooling
+```bash
+sd ~            # how big is this tree, and what is big inside it
+sd ~ -i         # rank by file count -- what an inode quota actually limits
+sd ~ -c         # count files only, no stat: 8x faster
+sd -Q           # the quota table, and the age of its figures
+sd -D           # space held by files that were deleted while still open
+sd ~ -a         # the full audit: quota + /proc scan + reconciliation
 ```
 
-A long walk paints a spinner on stderr with live throughput; **Ctrl+C** prints
-the subtrees that finished and says plainly that the rest is unknown, rather
-than ranking a half-counted tree.
+No dependencies, no root, no daemon, no config — stdlib only, down to the
+`/usr/bin/python3` that RHEL8 login nodes ship. Because the moment you need this
+is the moment your home directory is full and `pip` cannot write to it.
 
-The count column is headed **files**, not "inodes". An inode is the on-disk
-structure a file or directory occupies and it is the resource that runs out, but
-your quota calls them files (`files (user) 21,580 / 300,000`) — so the tool uses
-the quota's word and the two numbers compare without translation.
+```bash
+# nothing to install
+git clone https://github.com/PursuitOfDataScience/slurmdisk
+PYTHONPATH=slurmdisk/src python3 -m slurmdisk .
 
-No dependencies, no root, no daemon, no config. Stdlib only, down to the
-`/usr/bin/python3` that RHEL8 login nodes ship — because the moment you need
-this is the moment your home directory is full and `pip` cannot write to it.
+# or packaged, which gives you `slurmdisk` and the short alias `sd`
+pip install git+https://github.com/PursuitOfDataScience/slurmdisk
+```
 
 ---
 
-## What it is not
+## It is not more accurate than `du`
 
-**It is not more accurate than `du`.** A correct walker agrees with
-`du -s --block-size=1` byte-for-byte, and any claim to beat it is a bug. That
-agreement is a test in this repo, not an aspiration:
+A correct walker agrees with `du -s --block-size=1` byte-for-byte, and any claim
+to beat it is a bug. That agreement is a test in this repo, not an aspiration:
 
 ```
 tree with 208 files, 5 hard links to one inode, a 1 GiB sparse file, 12-deep nesting
@@ -65,64 +51,67 @@ tree with 208 files, 5 hard links to one inode, a 1 GiB sparse file, 12-deep nes
   slurmdisk, 1/2/4/8/16 thr   655,474,688 B    +0, and identical to each other
 ```
 
-`du` is right about bytes. What it cannot tell you is *when* it is right.
+`du` is right about bytes. What it cannot tell you is **when** it is right.
 
-## What it is
+## Four things `du` structurally cannot report
 
-Four things `du` structurally cannot report.
+### 1. A freshly written tree has not settled, and `du` will not warn you
 
-### 1. Your quota number has an age, and it is usually not now
+Measured on Midway3 scratch on 2026-08-02, 6,000 × 8 KiB files:
 
-Quota readings are snapshots. On this cluster `quota` is a site wrapper that
-prints a cached figure; it has been observed **28 minutes stale, and not
-refreshing while a 512 MiB file was written, fsync'ed and deleted.** So every
-reading is printed with the age of the *figure*, not the age of the command:
+| | |
+|---|---|
+| `du -s` immediately after the write | **81 MB** |
+| `du -s` once the tree settled | **376 MB** |
 
-```
-QUOTA
-  source quota -s   figures are a snapshot 5m 27s old
-  ! this number predates anything you did in the last 5m 27s.
-```
-
-Where the backend publishes no timestamp, the age prints as `UNKNOWN` — never
-as "now".
-
-### 2. A freshly written tree has not settled, and the number is provisional
-
-GPFS does not finalise `st_blocks` immediately. Both of these were measured on
-Midway3 scratch, on trees that ended at the same settled size:
-
-| written | first reading | settled | direction |
-|---|---|---|---|
-| 6,000 × 8 KiB | 240.1 MiB | 375.1 MiB | **56% low** |
-| 6,000 × 8 KiB | 1.2 GiB | 375.1 MiB | **69% high** |
-
-Same workload, opposite errors, depending only on *when you looked*. `du` hands
-you whichever number is current and says nothing. slurmdisk flags the tree as
-provisional, and `--settle-wait 60` re-stats to measure the drift instead of
-guessing at it:
+Same tree, same command, **4.6x apart** — and nothing in `du`'s output says which
+of the two you are holding. GPFS does not finalise `st_blocks` for tens of
+seconds, and it moves in *both* directions. slurmdisk re-stats and says so:
 
 ```
-SETTLING
-  6,000 files were written in the last 2m 0s
-  ! re-stat 75s later found 80.0 MiB MORE allocated: this tree is still moving.
+WALK  /scratch/midway3/researcher/run-217   379.2 MiB
+  6,013 files (6,000 regular + 13 dirs)  0.03s at 8 threads  apparent 47.3 MiB
+
+  SETTLING
+      6,000 files were written in the last 2m 0s
+    ! a re-stat 60s later found 111.5 MiB LESS allocated: this tree is still moving.
+        Any size you read right now -- from this tool or from du -- is
+        provisional.
 ```
 
-With no wait, it says the figure is provisional and **does not claim it is
-settled** — an immediate re-stat cannot observe an effect that takes tens of
+With no `--settle-wait` it calls the figure **provisional** and does *not* claim
+it is settled: an immediate re-stat cannot observe an effect that takes tens of
 seconds, and a null result from a blind instrument is not evidence.
+
+### 2. Your quota number has an age, and it is usually not now
+
+Quota readings are snapshots. Here `quota` is a site wrapper printing a cached
+figure; it has been observed **28 minutes stale, and not refreshing while a
+512 MiB file was written, fsync'ed and deleted.** So the age of the *figure* is
+printed beside it:
+
+```
+QUOTA  snapshot 11m 16s old -- predates anything you just did
+  rcc         blocks   72.1 TiB / 202.3 TiB   ██▌░░░░░░░   35.6%  /project
+  otherlab     blocks   11.0 TiB /  11.0 TiB   █████████▉   99.8%  /project
+```
+
+Where the backend publishes no timestamp, the age prints `UNKNOWN` — never "now".
 
 ### 3. Space held by files that were deleted while still open
 
 A file unlinked while a process holds it open has no directory entry. It is
 invisible to `ls`, to `du`, to `ncdu`, and to slurmdisk's own walk. The blocks
-are still allocated. Verified on GPFS:
+are still allocated, and the quota still charges you for them:
 
 ```
-du -s                512 B
-sd . (walk)          512 B
-sd --deleted-only    512.0 MiB in 1 inode(s)
-    512.0 MiB  pids=[731542]  /scratch/midway3/.../ckpt.bin
+$ sd -D
+UNLINKED BUT STILL OPEN
+  512.0 MiB held by open file descriptors in 1 inodes
+  (invisible to du, to ls, and to this tool's own walk)
+
+      512.0 MiB  pid 802715 python
+                 /scratch/midway3/researcher/ckpt-step-4000.bin
 ```
 
 This is the difference between "my quota says 40 GB and I can only find 12" and
@@ -130,51 +119,32 @@ a pid you can go and kill.
 
 ### 4. Where the inodes are, which is not where the bytes are
 
-Inode exhaustion silently blocks job submission, and users never connect the
-two. One conda env is ~177,000 inodes against a 300,000 soft home quota — two
-envs exhaust it. A 64-rank job writes 64 near-empty `rng_state_*.pth` files per
-checkpoint, pure inode cost. So directories are ranked three ways, and the third
-is the one that tells you what to pack:
+Inode exhaustion silently blocks job submission and nobody connects the two. One
+conda env is ~177,000 inodes against a 300,000 soft home quota — two envs
+exhaust it. A 64-rank job writes 64 near-empty `rng_state_*.pth` files per
+checkpoint, pure inode cost. `sd -i` ranks by the count instead of the bytes.
 
-```
-sd .      by allocated bytes -- the classic du question
-sd . -i   by file count -- what an inode quota limits
-```
-
-Packing a directory reclaims the inodes it holds, so the absolute count is the
-ranking; density only tells you how cheap the tar will be. (An earlier version
-ranked by files/GiB directly. A ratio is won by the smallest denominator, so it
-nominated a 260 KiB `.git` directory as the top candidate ahead of one holding
-ten times the inodes.)
+Packing a directory reclaims the inodes it holds, so the **absolute count** is
+the ranking. An earlier version ranked by files/GiB; a ratio is won by the
+smallest denominator, so it nominated a 260 KiB `.git` directory as the top
+candidate ahead of one holding ten times the inodes.
 
 ---
 
 ## The reconciliation, and when it refuses to run
 
 The three-way check is `walk + deleted-but-open ≈ quota`. The third term is a
-snapshot of unknown age, so a naive version of this reports a phantom gap and
-blames an innocent file descriptor. It is therefore allowed to *refuse*:
-
-```
-RECONCILIATION
-  bytes: reconciles (difference is within 13.7 MiB)
-      walked                         691.5 MiB
-      = accounted for                691.5 MiB
-      quota says                     683.8 MiB
-      difference                      -7.7 MiB
-      caveats:
-        - the quota figure is a snapshot taken 327s ago and may predate recent
-          writes or deletions
-```
-
-Any of these turns a difference into `INCONCLUSIVE` rather than a finding:
+snapshot of unknown age, so a naive version reports a phantom gap and blames an
+innocent file descriptor. It is therefore allowed to **refuse**. Any of these
+turns a difference into `INCONCLUSIVE` rather than a finding:
 
 - the quota snapshot is stale, or published no timestamp at all
 - the tree is still settling
 - the walk hit unreadable directories, so its total is a floor
 - the walk crossed filesystems but the quota governs one
+- the walk was `-c`, which never called `stat` and so has no bytes to compare
 
-And when a gap does survive all of that, it is reported with **candidate
+When a gap does survive all of that, it is reported with **candidate
 explanations, none of them asserted** — deleted fds on other nodes, other users'
 processes an unprivileged scan cannot inspect, snapshots, replication factor.
 Walking a subtree of a larger quota'd tree is reported as a share, not a
@@ -185,7 +155,6 @@ discrepancy.
 - **Cross-user attribution needs root.** You can read only your own
   `/proc/*/fd`, so in a shared group quota you can prove a gap exists but cannot
   name the labmate holding it. The count of uninspectable processes is printed.
-  Files *on disk* are attributed by owner, which the walk can do.
 - **The deleted-fd scan is node-local.** A job holding a deleted file on a
   compute node is invisible from the login node.
 - **Quota mount mapping is inferred where the backend does not publish it.**
@@ -197,23 +166,15 @@ discrepancy.
 
 ## Speed
 
-**Bytes do not predict how long a walk takes; files do.** Measured on this
-cluster, same filesystem, same day:
+**Bytes do not predict how long a walk takes; files do.**
 
 | tree | size | files | `du` | `slurmdisk` | |
 |---|---|---|---|---|---|
 | `.cache/huggingface` | 161.7 GiB | 3,286 | 0.44s | 0.03s | 14x |
 | `.cache` | 350.0 GiB | 781,772 | 162.25s | 25.28s | **6.4x** |
 
-Twice the bytes, **370x the wall time.** A 1 TB directory of a few large
-checkpoint shards walks in milliseconds; a 1 GB directory of two million tiny
-files takes minutes.
-
-### Where the time actually goes
-
-An earlier version of this section claimed concurrency was the lever. That was
-measured against `du` and does not describe this walker. Measured against
-itself, on 782k GPFS files:
+Twice the bytes, **370x the wall time.** Measured against itself on those 782k
+GPFS files, the reason is not the Python:
 
 ```
 scandir + stat (what a sizing walk does)   27.09s     28,900 files/s
@@ -221,86 +182,61 @@ scandir alone, no stat                      2.99s    261,800 files/s
 this package's own bookkeeping                          +0.5%
 ```
 
-**`stat` is 90% of the wall time and our Python costs half a percent**, so
-tuning the inner loop is pointless. Two obvious levers were tried and both are
-dead ends:
+`stat` is 90% of the wall time, so tuning the inner loop is pointless — and both
+obvious levers are dead ends (`dir_fd` instead of full paths: no difference;
+processes instead of threads: **35% worse**). Processes being worse puts the
+limit in the GPFS client per node. **~29,000 stats/s is this filesystem's
+ceiling.** The pool caps at 16 and defaults to 8, which is also the polite
+setting: this walk is metadata load on a shared filesystem, the exact sin the
+tool exists to diagnose. `--max-dirs-per-sec` throttles it further.
 
-```
-stat via dir_fd instead of a full path     26.89s vs 26.65s   no difference
-4 or 8 processes instead of threads         41.9s vs  27.0s   35% WORSE
-```
-
-Processes being *worse* places the limit in the GPFS client per node, not per
-process, and thread scaling agrees: 8 → 16 buys 5%, and 24/32/48/64 all get
-slower. **~29,000 stats/s is this filesystem's metadata ceiling** and no
-client-side change moves it. The pool is capped at 16 and defaults to 8, which
-is also the polite setting — this walk is metadata load on a shared filesystem,
-the exact sin the tool exists to diagnose. `--max-dirs-per-sec` throttles it
-further on a busy day.
-
-### The one real speedup: don't call stat
-
-Counting files needs no `stat` at all — `d_type` from `getdents` already
-separates directories from everything else. `-c` uses that:
+The one real speedup is not calling `stat` at all — `d_type` from `getdents`
+already separates directories from everything else, which is all a count needs:
 
 ```
 1.7M-file tree     sizing walk 55s      sd . -c  6.9s      8x
 782k-file tree     sizing walk 27.3s    sd . -c  3.4s      8x
 ```
 
-Exact on counts, no sizes, and hard links counted once per name — all three
-stated in the output rather than implied. For inode-quota pressure, which is
-what this column of the tool is for, that is the whole answer.
-
-> **Prior-art caveat, stated because it is still owed.** The `du` comparison is
-> against a single-threaded 1971 program — *not* against the state of the art.
-> Parallel walkers already exist (`dust`, `gdu`, `diskus`, `duc`). Given the
-> ceiling measured above, any of them will land within a few percent of this
-> one on the same filesystem, because none of them can make GPFS answer `stat`
-> faster. A full PyPI/GitHub sweep has **not** been run. **Speed is table stakes
-> here; the quota-age, settling and deleted-fd reporting are the product.**
-
-## Install
-
-```bash
-pip install slurmdisk
-```
-
-Or just run it — it is stdlib-only:
-
-```bash
-git clone https://github.com/PursuitOfDataScience/slurmdisk
-PYTHONPATH=slurmdisk/src python3 -m slurmdisk .
-```
-
-Installed, the command is `slurmdisk`, with `sd` as a short alias — the same
-pairing as `slurmwatch`/`sw`.
+> **Prior art, stated because it is owed.** The `du` comparison is against a
+> single-threaded 1971 program — *not* the state of the art. Parallel walkers
+> exist (`dust`, `gdu`, `diskus`, `duc`) and, given the ceiling above, any of
+> them will land within a few percent on the same filesystem, because none can
+> make GPFS answer `stat` faster. **Speed is table stakes here; the quota-age,
+> settling and deleted-fd reporting are the product.**
 
 ## Options
 
 ```
 sd [PATH ...] [options]
 
-The only positional argument is a path. Modes are flags, not subcommands:
-`quota`, `walk` and `deleted` are all ordinary directory names, so `sd deleted`
-must mean "measure ./deleted" and nothing else.
-
 -a, --full               quota + /proc scan + reconciliation
 -c, --count              count files only, no stat -- 8x faster
 -i, --inodes             rank by file count, not bytes
--n 0                     show every entry
 -Q, --quota-only         quota table only; walk nothing
 -D, --deleted-only       unlinked-but-open space only
 -t, --threads N          walk concurrency, clamped to 16 (default 8)
--d, --depth N            directory depth to aggregate for reporting (default 2)
--n, --top N              entries per ranking (default 10)
+-d, --depth N            how deep to break the tree down (default 1, like du -d1)
+-n, --top N              entries per ranking (default 10; 0 shows everything)
     --settle-wait S      wait S seconds, then re-stat to measure drift
     --one-file-system    do not cross filesystem boundaries
     --max-dirs-per-sec N token-bucket rate limit on directory opens
     --no-quota           skip the quota backend
     --no-deleted         skip the /proc scan
+    --color WHEN         auto (default) | always | never
+    --ascii              ASCII bars instead of block glyphs
     --json               machine-readable output
 ```
+
+The only positional argument is a path. Modes are flags, not subcommands:
+`quota`, `walk` and `deleted` are all ordinary directory names, so `sd deleted`
+must mean "measure ./deleted" and nothing else.
+
+Colour is off unless stdout is a terminal, honours `NO_COLOR`, and degrades from
+256 colours to 8 and from block glyphs to ASCII when the terminal says so. A long
+walk paints a spinner on **stderr**, so a redirected report stays clean; **Ctrl+C**
+prints the subtrees that finished and says plainly that the rest is unknown,
+rather than ranking a half-counted tree.
 
 Exit codes: `0` clean, `1` something needs a human (incomplete walk, drifting
 tree, unexplained gap), `2` error.
@@ -313,9 +249,18 @@ pip install -e ".[dev]" && pytest
 
 The suite pins the invariants that decide whether this is better or worse than
 `du`: byte-exact agreement, identical results across thread counts, hard-link
-dedup, sparse files not over-counted, the thread cap, and — most of the
-reconciliation tests — the refusals.
+dedup, sparse files not over-counted, the thread cap, that the package still
+parses under Python 3.6 — and, most of the reconciliation tests, the refusals.
 
-## License
+The README GIF is generated from real CLI output by
+[`assets/render_demo.py`](assets/render_demo.py); nothing in it is hand-typed.
+
+---
+
+Before the run, [`slurmate`](https://github.com/PursuitOfDataScience/slurmate)
+builds the request. During it,
+[`slurmwatch`](https://github.com/PursuitOfDataScience/slurmwatch) watches.
+After it, [`slurmpast`](https://github.com/PursuitOfDataScience/slurmpast) says
+what happened. `slurmdisk` is for the storage the whole cycle runs on.
 
 MIT
