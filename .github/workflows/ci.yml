@@ -5,24 +5,51 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint-test:
-    name: Lint & Test (py${{ matrix.python-version }})
+  # Ruff and mypy produce the same verdict on every interpreter, so running them
+  # once is enough; the matrix below is for the code, not the linters.
+  lint:
+    name: Lint & types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # setuptools-scm derives the version from tags
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src/ tests/
+
+  test:
+    name: Test (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         # The package declares >=3.6 and is verified by hand on the 3.6.8
         # /usr/bin/python3 of a RHEL8 login node, which is the deployment target
-        # that motivates the stdlib-only constraint. These are the versions
-        # GitHub runners still provide.
+        # that motivates the stdlib-only constraint. tests/test_py36_compat.py
+        # guards that floor here; these are the versions GitHub still provides.
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v5
         with:
-          # setuptools-scm needs full history + tags to derive the version.
           fetch-depth: 0
 
       - uses: actions/setup-python@v6
@@ -30,32 +57,199 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
-      - name: Install build deps
+      - name: Install package + dev deps
         run: |
           python -m pip install --upgrade pip
-          pip install "setuptools>=64" wheel setuptools-scm
+          pip install -e ".[dev]"
 
-      - name: Install package + dev deps
-        run: pip install -e ".[dev]"
-
-      - name: Lint with ruff
-        run: ruff check .
-
-      - name: Check formatting with ruff
-        run: ruff format --check .
-
-      - name: Type check with mypy
-        run: mypy src/ tests/
-
+      # TMPDIR stays on the runner's local disk. The suite handles a networked
+      # filesystem -- that is what the settling logic is for -- but the fixture
+      # trees would take tens of seconds to settle for no added coverage.
       - name: Test with pytest
-        # TMPDIR is deliberately on a local filesystem here. On a networked
-        # filesystem the fixture trees take tens of seconds to settle, which the
-        # suite handles but which would slow CI down for no added coverage.
-        run: |
-          python -m pytest --cov=slurmdisk --cov-report=xml --cov-report=term --cov-fail-under=60
+        run: python -m pytest --cov=slurmdisk --cov-report=xml --cov-report=term --cov-fail-under=70
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
           files: ./coverage.xml
           fail_ci_if_error: false
+
+  # The headline claim, checked rather than asserted: this walker agrees with du
+  # byte-for-byte. It is also in the test suite; here it runs against a tree the
+  # runner built itself, outside pytest, so a broken fixture cannot hide it.
+  agrees-with-du:
+    name: Byte-for-byte agreement with du
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build a tree with the pathologies that break naive walkers
+        run: |
+          mkdir -p tree/a/b/c
+          for i in $(seq 1 40); do head -c 5000 /dev/urandom > "tree/a/f$i"; done
+          for i in $(seq 1 20); do head -c 9000 /dev/urandom > "tree/a/b/g$i"; done
+          head -c 3000 /dev/urandom > tree/a/b/c/payload
+          for i in $(seq 1 5); do ln tree/a/b/c/payload "tree/link$i"; done  # hard links
+          truncate -s 1G tree/sparse.bin                                     # sparse
+          ln -s /etc/hostname tree/dangling.sym
+          sync
+
+      - name: du and slurmdisk must return the same integer
+        run: |
+          cat > walksize.py <<'PY'
+          import sys
+          from slurmdisk.walk import walk
+          print(walk(sys.argv[1], threads=int(sys.argv[2])).size)
+          PY
+          # Wait for two consecutive du readings to agree before comparing
+          # anything. A runner's ext4 settles instantly, but this is the exact
+          # trap the package documents, and a comparison of two measurements
+          # taken while the filesystem is still moving would fail for a reason
+          # that has nothing to do with the walker.
+          prev=-1
+          for _ in $(seq 1 20); do
+            cur=$(du -s --block-size=1 tree | cut -f1)
+            [ "$cur" = "$prev" ] && break
+            prev=$cur
+            sleep 3
+          done
+          DU=$(du -s --block-size=1 tree | cut -f1)
+          for t in 1 2 4 8 16; do
+            SD=$(PYTHONPATH=src python3 walksize.py tree "$t")
+            echo "threads=$t  du=$DU  slurmdisk=$SD"
+            if [ "$DU" != "$SD" ]; then
+              echo "::error::slurmdisk disagreed with du at $t threads ($SD vs $DU)"
+              exit 1
+            fi
+          done
+
+  # This package exists to be run on a login node during a storage emergency,
+  # where nothing is installed and pip may not be able to write anywhere. If it
+  # needs an install, or a quota backend, or a TTY, that claim is false.
+  zero-install:
+    name: Runs with nothing installed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: No pip, no venv, no dependencies -- just PYTHONPATH
+        run: |
+          cd /tmp && mkdir -p bare/sub && head -c 100000 /dev/urandom > bare/sub/f
+          PYTHONPATH=$GITHUB_WORKSPACE/src python3 -m slurmdisk bare
+          PYTHONPATH=$GITHUB_WORKSPACE/src python3 -m slurmdisk bare --json | python3 -m json.tool > /dev/null
+
+      - name: The package imports nothing outside the standard library
+        run: |
+          python3 - <<'PY'
+          import ast, pathlib, sys
+          stdlib = set(getattr(sys, "stdlib_module_names", ()))
+          assert stdlib, "need Python 3.10+ for stdlib_module_names"
+          bad = []
+          for path in sorted(pathlib.Path("src/slurmdisk").glob("*.py")):
+              for node in ast.walk(ast.parse(path.read_text())):
+                  if isinstance(node, ast.Import):
+                      names = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                      names = [(node.module or "").split(".")[0]]
+                  else:
+                      continue
+                  bad += [(path.name, n) for n in names if n and n not in stdlib]
+          assert not bad, "non-stdlib imports: {}".format(bad)
+          print("stdlib only, confirmed across", len(list(pathlib.Path('src/slurmdisk').glob('*.py'))), "modules")
+          PY
+
+      # There is no `quota`, no `mmlsquota` and no `lfs` on a GitHub runner, and
+      # that is the off-site case: every field must go absent WITH A REASON, and
+      # nothing downstream may break. A traceback here is the bug.
+      - name: A missing quota backend degrades to n/a, not to zero and not to a crash
+        run: |
+          pip install -e .
+          set +e
+          out=$(sd --quota-only 2>&1); code=$?
+          set -e
+          echo "$out"
+          test $code -eq 1 || { echo "::error::expected exit 1 (attention), got $code"; exit 1; }
+          case "$out" in
+            *Traceback*) echo "::error::crashed instead of reporting"; exit 1 ;;
+          esac
+          echo "$out" | grep -q "n/a" || { echo "::error::absent quota did not print n/a"; exit 1; }
+          echo "$out" | grep -qi "not on PATH" || { echo "::error::n/a printed without a reason"; exit 1; }
+
+      - name: Output is clean when redirected -- no escape codes in a support ticket
+        run: |
+          sd . > plain.txt
+          if grep -qP '\x1b\[' plain.txt; then
+            echo "::error::colour escapes leaked into non-TTY output"; exit 1
+          fi
+          NO_COLOR=1 sd . --color auto > nocolor.txt
+          if grep -qP '\x1b\[' nocolor.txt; then
+            echo "::error::NO_COLOR was ignored"; exit 1
+          fi
+
+      # A -c walk never calls stat, so it has no bytes. Reconciling that against
+      # a live quota once fabricated an UNEXPLAINED GAP the size of the whole
+      # quota -- the exact failure the reconciler exists to prevent.
+      - name: A stat-free walk never manufactures a finding
+        run: |
+          sd . -c --json > count.json
+          python3 - <<'PY'
+          import json
+          doc = json.load(open("count.json"))
+          for rec in doc.get("reconciliation", []):
+              assert rec["verdict"] != "gap", rec
+          print("no fabricated gaps from a count-only walk")
+          PY
+
+  # An installed wheel is what a user actually gets. A package that imports from
+  # the source tree but not from site-packages is a packaging bug, and the
+  # release workflow is the wrong place to discover it.
+  wheel:
+    name: Built wheel installs and runs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+
+      - name: Install the wheel into a clean venv and use it
+        run: |
+          python -m venv /tmp/check
+          /tmp/check/bin/pip install --quiet dist/*.whl
+          /tmp/check/bin/slurmdisk --version
+          /tmp/check/bin/sd --version          # the short alias must be there too
+          /tmp/check/bin/sd /tmp --json | python3 -m json.tool > /dev/null
+          /tmp/check/bin/python -c "import slurmdisk, pathlib; \
+            assert (pathlib.Path(slurmdisk.__file__).parent / 'py.typed').is_file(), \
+            'py.typed missing from the wheel'"
+
+      # The stdlib-only promise is a packaging fact, not just a source fact. The
+      # `[dev]` extra legitimately appears here as `; extra == "dev"`, so only
+      # unconditional requirements are a failure -- those are what a plain
+      # `pip install slurmdisk` would drag onto a login node.
+      - name: The wheel carries no unconditional dependencies
+        run: |
+          python -m zipfile -e dist/*.whl /tmp/unpacked
+          meta=$(find /tmp/unpacked -name METADATA | head -1)
+          runtime=$(grep '^Requires-Dist:' "$meta" | grep -v 'extra ==' || true)
+          if [ -n "$runtime" ]; then
+            echo "::error::the wheel declares runtime dependencies:"
+            echo "$runtime"
+            exit 1
+          fi
+          echo "no unconditional Requires-Dist, as intended"

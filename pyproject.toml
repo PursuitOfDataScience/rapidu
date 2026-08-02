@@ -48,8 +48,11 @@ sd = "slurmdisk.cli:main"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff>=0.3",
-    "mypy>=1.8",
+    # Upper-bounded on purpose: a formatter with no ceiling turns `ruff format
+    # --check` into a job that fails on a day nobody touched the repo. 0.15 and
+    # 0.16 were both verified to leave this tree unchanged.
+    "ruff>=0.15,<0.17",
+    "mypy>=1.8,<3",
     "build>=1.0",
     "twine>=4.0",
     "setuptools-scm>=8",
@@ -87,6 +90,9 @@ select = ["E", "F", "W", "I", "B", "C4", "SIM"]
 # The deleted-fd tests must hold descriptors open across statements -- that is
 # precisely the condition under test -- so a context manager is not available.
 "tests/test_deleted.py" = ["SIM115"]
+# Same for the demo renderer: its unlinked-but-open scene only exists while the
+# descriptor is still held, which a `with` block would close.
+"assets/render_demo.py" = ["SIM115"]
 
 [tool.ruff.format]
 quote-style = "double"
