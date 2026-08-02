@@ -139,3 +139,14 @@ if __name__ == "__main__":
         with open(path, "w") as fh:
             fh.write(render(mode) + "\n")
         print("wrote {} ({:,} bytes)".format(path, os.path.getsize(path)))
+        # PNG as well: PyPI renders neither a relative path nor an SVG served
+        # as text/plain from raw.githubusercontent, so the README points at
+        # these. Needs `pip install cairosvg`; the SVG is the source of truth.
+        try:
+            import cairosvg
+        except ImportError:
+            print("  (skipping PNG: pip install cairosvg to regenerate it)")
+            continue
+        png = path[:-4] + ".png"
+        cairosvg.svg2png(url=path, write_to=png, scale=2)
+        print("wrote {} ({:,} bytes)".format(png, os.path.getsize(png)))

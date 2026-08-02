@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo.gif" width="900" alt="rapiDU walking a project tree and explaining that it occupies 266.8 MiB to hold 75.5 MiB of data, ranking the same tree by file count, printing a quota table with the age of its snapshot, finding 512 MiB held by a deleted-but-open file descriptor, and catching a freshly written GPFS tree that loses 224 MiB while it settles.">
+  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/rapidu/main/assets/demo.gif" width="900" alt="rapiDU walking a project tree and explaining that it occupies 266.8 MiB to hold 75.5 MiB of data, ranking the same tree by file count, printing a quota table with the age of its snapshot, finding 512 MiB held by a deleted-but-open file descriptor, and catching a freshly written GPFS tree that loses 224 MiB while it settles.">
 </p>
 
 ## Install
@@ -39,8 +39,8 @@ rdu -a                   # the full audit: quota + /proc scan + reconciliation
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/benchmark-dark.svg">
-    <img src="assets/benchmark-light.svg" width="720" alt="Cold GPFS walk: du takes 168.1s against rapiDU's 25.4s on a 792,225-file package cache (6.6x), and 298.5s against 57.4s on a 1,686,589-file project directory (5.2x).">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/PursuitOfDataScience/rapidu/main/assets/benchmark-dark.png">
+    <img src="https://raw.githubusercontent.com/PursuitOfDataScience/rapidu/main/assets/benchmark-light.png" width="720" alt="Cold GPFS walk: du takes 168.1s against rapiDU's 25.4s on a 792,225-file package cache (6.6x), and 298.5s against 57.4s on a 1,686,589-file project directory (5.2x).">
   </picture>
 </p>
 

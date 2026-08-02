@@ -1,3 +1,6 @@
 include LICENSE
 include README.md
 recursive-include tests *
+# The demo GIF alone is 1.9 MB and is 95% of the sdist. Nobody
+# installing the package needs it; it is a README asset.
+prune assets

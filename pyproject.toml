@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # installs as `pip install rapidu` just as readily, and the importable
 # module stays lowercase `rapidu` -- the PyYAML/yaml arrangement.
 name = "rapiDU"
-description = "Where your bytes and inodes are, what du cannot see, and how old the quota number is"
+description = "A much faster du that tells you why your quota is full."
 readme = "README.md"
 license = { text = "MIT" }
 # Stdlib only, and deliberately conservative: the tool is most useful on a bare
