@@ -13,6 +13,7 @@ import os
 import pytest
 
 from rapidu import cli, report, ui
+from rapidu.fmt import human_bytes
 from rapidu.walk import AGE_BUCKET_LABELS, WATCHED_DIR_NAMES, SettleCheck, walk
 
 
@@ -313,3 +314,103 @@ def test_nothing_is_said_when_nothing_is_hidden(tree):
     res = walk(tree, threads=2, depth=1)
     body = "\n".join(report.render_entries(res, 0, False, ui.resolve_style("never")))
     assert "more" not in body
+
+
+# ---------------------------------------------------------------------------
+# One emphasis rule, applied everywhere
+# ---------------------------------------------------------------------------
+
+_SGR = ui._ANSI_RE
+
+
+def _runs(line):
+    """[(text, sgr-params)] so a test can assert on weight, not on appearance.
+
+    "" (nothing emitted yet) and "0" (just reset) both mean *default weight*, so
+    they are normalised together -- otherwise a row that is uniformly unstyled
+    looks like it mixes two weights. At eight colours `style.muted` is deliberately
+    no styling at all, because there is no second grey to spare, so that is the
+    common case rather than an edge one.
+    """
+    out, cur, pos = [], "0", 0
+    for m in _SGR.finditer(line):
+        seg = line[pos : m.start()]
+        if seg.strip():
+            out.append((seg.strip(), cur))
+        cur = m.group(0)[2:-1] or "0"
+        pos = m.end()
+    if line[pos:].strip():
+        out.append((line[pos:].strip(), cur))
+    return out
+
+
+def _tone_of(line, text):
+    for seg, code in _runs(line):
+        if text in seg:
+            return code
+    raise AssertionError("{!r} not found in {!r}".format(text, _SGR.sub("", line)))
+
+
+def _colour_style():
+    style = ui.resolve_style("always")
+    style.depth = 8  # base-16 codes are stable to assert on
+    return style
+
+
+def test_the_accent_marks_what_the_listing_was_ranked_by(tree):
+    """Emphasis has to move when the ranking moves, or it points at the wrong number.
+
+    The byte total carried the accent unconditionally, so `-i` accented the size
+    while ordering the table by the file count.
+    """
+    style = _colour_style()
+    res = walk(tree, threads=2, depth=1)
+    by_size = report.render_compact(res, SettleCheck(), 3, False, style)[1]
+    by_files = report.render_compact(res, SettleCheck(), 3, True, style)[1]
+
+    size = human_bytes(res.size)
+    assert _tone_of(by_size, size) == report.ACCENT_SGR
+    assert _tone_of(by_files, size) != report.ACCENT_SGR
+
+
+def test_a_value_is_never_painted_at_the_label_weight(tree):
+    """The elapsed time was, which is why it read as a different class of thing.
+
+    `2m 0s` and `21,827` are both measurements; one of them was the same grey as
+    the word "files" beside it.
+    """
+    style = _colour_style()
+    res = walk(tree, threads=2, depth=1)
+    facts = report.render_compact(res, SettleCheck(), 3, False, style)[1]
+    elapsed = "{:.2f}s".format(res.elapsed)
+    assert _tone_of(facts, elapsed) != report.LABEL_SGR
+    # ...while the noun beside a number still is a label.
+    assert _tone_of(facts, "files") == report.LABEL_SGR
+
+
+def test_the_column_header_emphasises_only_the_sorted_column(tree):
+    """Three local rules produced bold, dim and dim-again for no legible reason."""
+    style = _colour_style()
+    head_size = report._entries_header(style, ranked_by_files=False)
+    head_files = report._entries_header(style, ranked_by_files=True)
+    assert _tone_of(head_size, "size") != _tone_of(head_size, "files")
+    assert _tone_of(head_files, "files") != _tone_of(head_files, "size")
+    # `entry` names no measurement, so it is a label under either ranking.
+    assert _tone_of(head_size, "entry") == _tone_of(head_files, "entry") == report.LABEL_SGR
+    # `share` labels the bar, which draws whichever metric was ranked, so it
+    # inherits that column's weight rather than having one of its own.
+    assert _tone_of(head_size, "share") == _tone_of(head_size, "size")
+    assert _tone_of(head_files, "share") == _tone_of(head_files, "files")
+
+
+def test_the_remainder_row_is_one_weight_throughout(tree):
+    """It named real content at the caveat weight, so the row that tells you the
+    table is truncated was the faintest thing on screen. The hatched bar is the
+    only thing that should mark it as a summary."""
+    style = _colour_style()
+    res = walk(tree, threads=2, depth=1)
+    rows = report.render_entries(res, 1, False, style)
+    if len(rows) < 2:
+        pytest.skip("fixture has nothing to summarise")
+    codes = {code for seg, code in _runs(rows[-1]) if seg.strip("░▒ ")}
+    assert len(codes) == 1, "remainder row mixes weights: {}".format(codes)

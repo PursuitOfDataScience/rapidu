@@ -46,6 +46,33 @@ def _gname(gid: int) -> str:
         return str(gid)
 
 
+# The report's three weights, named. Every emphasis decision below picks one of
+# these and nothing else, because the failure mode is not choosing the wrong
+# weight -- it is choosing a fourth one locally and ending up with several rules
+# that each look like emphasis and collectively mean nothing.
+#
+#   ACCENT  the measurement this listing was ranked by. Exactly one per report,
+#           and it moves when `-i` or `--sort` moves the ranking.
+#   VALUE   any other real measurement -- and the *label* of the ranked column,
+#           because emphasis is inherited from what a label names rather than
+#           being a weight of its own.
+#   LABEL   names of everything else, separators, caveats, hints. Never a number.
+#
+# In the table below, colour already means magnitude (the heat ramp), so the rows
+# use `style.muted` for content that is not the ranked column and `style.track`
+# for the bar's background. Those are the same three roles in the ramp's own
+# vocabulary, not a fourth scheme.
+ACCENT = "bold_cyan"
+VALUE = "bold"
+LABEL = "dim"
+
+# The resolved escape parameters, for tests that assert on the rule rather
+# than on how it happens to look.
+ACCENT_SGR = "1;36"
+VALUE_SGR = "1"
+LABEL_SGR = "2"
+
+
 def _counter(n: Optional[int]) -> str:
     """``human_count`` under the same signature as ``human_bytes``."""
     return human_count(n)
@@ -533,7 +560,12 @@ def _entry_line(
         bar,
         style.paint("{:>6}".format(pct(value, total) if total else ""), lead),
         style.paint("{:>9}".format(human_count(inodes)), files_tone),
-        style.paint(name, *(["dim"] if aggregate else [tone])),
+        # `muted`, not `dim`. The remainder row names real content -- "91 more" is
+        # a measurement of the tree, not a caveat about it -- and painting it the
+        # context grey made the one row that tells you the table is truncated the
+        # faintest thing on screen. The hatched bar already says it is a summary;
+        # it does not need to whisper as well.
+        style.paint(name, *([style.muted] if aggregate else [tone])),
     )
 
 
@@ -601,16 +633,29 @@ def _entries_header(
     either word was doing there. Two headers for one measurement was the actual
     mistake; naming it once, over the wider of its two forms, fixes it.
     """
-    size_tone = "dim" if ranked_by_files else "bold"
-    files_tone = "bold" if ranked_by_files else "dim"
+    # One rule for the whole row: every label is a label, so every label carries
+    # the same weight -- except the column the table is sorted by, which carries
+    # the accent. That was three rules before ("size" bold, "files" bold-or-dim,
+    # "share" and "entry" always dim), and three rules that each look like
+    # emphasis add up to none: a reader cannot tell what the bold is *for*.
+    #
+    # `share` takes the sorted column's weight rather than a weight of its own,
+    # because the bar underneath it draws whichever metric was ranked. Emphasising
+    # the number but not the picture of the same measurement is the same mistake
+    # one level down.
+    ranked, plain = "bold", "dim"
+    size_tone = plain if ranked_by_files else ranked
+    files_tone = ranked if ranked_by_files else plain
     head = "" if not size_label else style.paint("{:>10}".format(size_label), size_tone) + "  "
     return "{}{}{}  {}  {}  {}".format(
         indent,
         head,
-        style.paint("{:<{}}".format(bar_label, _BAR_W), "dim"),
+        style.paint(
+            "{:<{}}".format(bar_label, _BAR_W), files_tone if ranked_by_files else size_tone
+        ),
         " " * 6,
         style.paint("{:>9}".format("files"), files_tone),
-        style.paint("entry", "dim"),
+        style.paint("entry", plain),
     )
 
 
@@ -669,7 +714,9 @@ def _facts(style: ui.Style, pairs: List[Any]) -> str:
     return joiner.join(out)
 
 
-def _header(style: ui.Style, headline: str, path: str, subtitle: str) -> List[str]:
+def _header(
+    style: ui.Style, headline: str, path: str, subtitle: str, headline_tone: str = ACCENT
+) -> List[str]:
     """Name the subject, then measure it.
 
     **The path leads.** It is what the report is *about*, and every other line
@@ -697,7 +744,7 @@ def _header(style: ui.Style, headline: str, path: str, subtitle: str) -> List[st
     thing it measures.
     """
     subject = style.paint(path, "bold")
-    facts = style.paint(headline, "bold_cyan")
+    facts = style.paint(headline, headline_tone)
     if subtitle:
         # The same joiner `_facts` uses, so the size sits in that line as one of
         # its members rather than as a prefix stuck on the front of it.
@@ -725,6 +772,14 @@ def render_compact(
     incomplete walk, or drift that was actually measured. A caveat that fires on
     every run is not a warning, it is furniture.
     """
+    # The accent marks what the listing was ranked by, here as in the table below.
+    # It used to sit on the byte total unconditionally, so under `-i` the report
+    # accented the size while sorting on the file count -- pointing at one number
+    # and ordering by another.
+    ranked_by_files = bool(by_inodes or res.count_only)
+    size_tone = VALUE if ranked_by_files else ACCENT
+    files_tone = ACCENT if ranked_by_files else VALUE
+
     if res.count_only:
         out = _header(
             style,
@@ -734,9 +789,10 @@ def render_compact(
                 style,
                 [
                     ("counts only, no sizes", "", ("yellow",)),
-                    ("{:.2f}s".format(res.elapsed), "", ("dim",)),
+                    ("{:.2f}s".format(res.elapsed), "", (VALUE,)),
                 ],
             ),
+            headline_tone=files_tone,
         )
     elif res.partial:
         out = _header(
@@ -758,10 +814,11 @@ def render_compact(
             _facts(
                 style,
                 [
-                    (human_count(res.inodes), "files", ("cyan", "bold")),
-                    ("{:.2f}s".format(res.elapsed), "", ("dim",)),
+                    (human_count(res.inodes), "files", (files_tone,)),
+                    ("{:.2f}s".format(res.elapsed), "", (VALUE,)),
                 ],
             ),
+            headline_tone=size_tone,
         )
     out.extend(_hard_warnings(res, settle, style))
     out.extend(render_allocation(res, style))
@@ -897,12 +954,14 @@ def render_walk(
     columns and got clipped -- and the clipped end was the number, not the path.
     """
     style = style or ui.resolve_style("never")
+    # Same rule as the compact view and the table: the accent marks what the
+    # listing was ranked by, so under `-i` it belongs on the count, not the bytes.
     out = [
         "",
         "{}  {}   {}".format(
             ui.heading("WALK", style),
             style.paint(ui.truncate(res.root, max(24, style.width - 28)), "bold"),
-            style.paint(human_bytes(res.size), "bold_cyan"),
+            style.paint(human_bytes(res.size), VALUE if by_inodes else ACCENT),
         ),
     ]
 

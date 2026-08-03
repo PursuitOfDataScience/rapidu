@@ -1,29 +1,29 @@
 # rdu /scratch/midway3/youzhi/rapidu-settle -a --no-quota --no-deleted --settle-wait 60
 
-[1mWALK[0m  [1m/scratch/midway3/youzhi/rapidu-settle[0m   [1;36m1.3 GiB[0m
-[2m  6,013 files (6,000 regular + 13 dirs)  0.03s at 8 threads (199,111 files/s)[0m
-[2m  apparent 47.3 MiB (29.1x allocated)  64.0 KiB allocation unit[0m
-[33m! 1.3 GiB allocated for 47.3 MiB of data — 29.1x. Your quota is charged the first number.[0m
-[2m      309 files average 8.0 KiB against a 64.0 KiB allocation unit, so they occupy 1.3 GiB[0m
+[1mWALK[0m  [1m/scratch/midway3/youzhi/rapidu-settle[0m   [1;36m224.4 MiB[0m
+[2m  6,013 files (6,000 regular + 13 dirs)  0.03s at 8 threads (211,673 files/s)[0m
+[2m  apparent 47.3 MiB (4.7x allocated)  16.0 MiB allocation unit[0m
+[33m! 224.4 MiB allocated for 47.3 MiB of data — 4.7x. Your quota is charged the first number.[0m
+[2m      14 files average 8.0 KiB against a 16.0 MiB allocation unit, so they occupy 223.9 MiB[0m
 [2m      of padding. Packing them (tar, squashfs, a single archive) returns it.[0m
 
   [1mSETTLING[0m
 [2m      6,000 files were written in the last 2m 0s[0m
-    [33m! a re-stat 60s later found 958.0 MiB LESS allocated: this tree is still moving.[0m
+    [33m! a re-stat 60s later found 64.0 MiB MORE allocated: this tree is still moving.[0m
 [2m        Any size you read right now -- from this tool or from du -- is provisional.[0m
 [2m        Measured on GPFS, a freshly written tree has settled both upward (5.58x) and[0m
 [2m        downward (3.3x) over ~60s.[0m
 [2m        (re-stat covered 4,096 of 6,000 recent files)[0m
 [38;5;238m  ─────────────────────────────────────────────────────────────[0m
-  [1m      size[0m  [2mshare             [0m          [2m    files[0m  [2mentry[0m
-  [38;5;214m 384.0 MiB[0m  [38;5;172m█████[0m[38;5;238m░░░░░░░░░░░░░[0m  [38;5;214m 27.9%[0m  [38;5;247m      501[0m  [38;5;214mshard01/[0m
-  [38;5;220m 336.0 MiB[0m  [38;5;178m████▍[0m[38;5;238m░░░░░░░░░░░░░[0m  [38;5;220m 24.4%[0m  [38;5;247m      501[0m  [38;5;220mshard02/[0m
-  [38;5;227m 256.0 MiB[0m  [38;5;142m███▎[0m[38;5;238m░░░░░░░░░░░░░░[0m  [38;5;227m 18.6%[0m  [38;5;247m      501[0m  [38;5;227mshard04/[0m
-  [38;5;247m 398.3 MiB[0m  [38;5;247m▒▒▒▒▒[0m[38;5;238m░░░░░░░░░░░░░[0m  [38;5;247m 29.0%[0m  [38;5;247m    4,510[0m  [2m(9 more — use -n 0 for all)[0m
+  [1m      size[0m  [1mshare             [0m          [2m    files[0m  [2mentry[0m
+  [38;5;214m  64.0 MiB[0m  [38;5;172m█████▏[0m[38;5;238m░░░░░░░░░░░░[0m  [38;5;214m 28.5%[0m  [38;5;247m      501[0m  [38;5;214mshard02/[0m
+  [38;5;220m  48.0 MiB[0m  [38;5;178m███▊[0m[38;5;238m░░░░░░░░░░░░░░[0m  [38;5;220m 21.4%[0m  [38;5;247m      501[0m  [38;5;220mshard01/[0m
+  [38;5;220m  48.0 MiB[0m  [38;5;178m███▊[0m[38;5;238m░░░░░░░░░░░░░░[0m  [38;5;220m 21.4%[0m  [38;5;247m      501[0m  [38;5;220mshard07/[0m
+  [38;5;247m  64.3 MiB[0m  [38;5;247m▒▒▒▒▒[0m[38;5;238m░░░░░░░░░░░░░[0m  [38;5;247m 28.6%[0m  [38;5;247m    4,510[0m  [38;5;247m(9 more — use -n 0 for all)[0m
 
 [1mBY AGE[0m
 [2m  last modified, regular files[0m
-  < 7d       1.3 GiB  [38;5;172m████████████[0m[38;5;238m[0m  100.0%       6,000 files
+  < 7d     224.0 MiB  [38;5;172m████████████[0m[38;5;238m[0m   99.8%       6,000 files
   7-30d          0 B  [38;5;18m[0m[38;5;238m░░░░░░░░░░░░[0m    0.0%           0 files
   30-90d         0 B  [38;5;18m[0m[38;5;238m░░░░░░░░░░░░[0m    0.0%           0 files
   90d-1y         0 B  [38;5;18m[0m[38;5;238m░░░░░░░░░░░░[0m    0.0%           0 files
