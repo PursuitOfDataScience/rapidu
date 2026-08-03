@@ -51,7 +51,7 @@ Same total as `du`, to the byte. That is checked on every commit.
 ```
 ╭───────────────────────────────────────────────────────────────────────────────────╮
 │ /project/lab/shared                                                               │
-│ 1.4 TiB  ·  5,435 files  ·  87 entries  ·  4.12s                                  │
+│ 1.4 TiB  ·  5,435 files  ·  4.12s                                                 │
 │                                                                                   │
 │   ──────────────────────────────────────────────────────                          │
 │         size  share                           files  entry                        │
@@ -74,8 +74,9 @@ it, which are one measurement in two forms -- the picture and the number. The la
 column is `entry`, not `path`, because it holds plain files as well as directories
 and what is printed is a name relative to the root.
 
-The bar is share of the whole walk, so it always agrees with the number beside
-it. The hatched row is everything not listed.
+The hatched last row is everything not listed, and it names how many that is --
+so a truncated table always says it is truncated. The bar is share of the whole
+walk, so it always agrees with the number beside it.
 The column you sorted by is the one in colour — under `-i`, `files` takes the tone
 and `size` steps back. Sizes are cumulative, so any row agrees with `du -s` on
 that path.

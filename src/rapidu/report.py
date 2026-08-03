@@ -390,6 +390,13 @@ def render_entries(
     # child -- and reporting that as "(0 more)" is noise.
     hidden = _other_count(res, ranked)
     show_rest = hidden > 0 and rest_size > 0 and not res.partial and _entries_partition_tree(res)
+    # The remainder row carries bytes, so it is only well defined when the listed
+    # rows are siblings that partition the tree -- at depth > 1 they nest and it
+    # would double-count. But "there are rows you are not seeing" is true at any
+    # depth, and the table used to just stop without saying so: at `-d 2 -n 10` it
+    # showed ten of fifty-nine and looked complete. A count with no byte figure
+    # attached is honest at every depth.
+    say_hidden = hidden > 0 and not show_rest and not res.partial
 
     # The bar and the share must measure whatever the rows were ranked by, or a
     # -i listing shows an inode ordering with byte-length bars and reads as
@@ -459,6 +466,16 @@ def render_entries(
                 aggregate=True,
                 size_hidden=res.count_only,
                 ranked_by_files=ranked_by_files,
+            )
+        )
+    elif say_hidden:
+        # No bar and no byte figure -- just the count and how to see them. At depth
+        # greater than one the rows nest, so any total attached here would
+        # double-count; the count itself is still true and is the whole point.
+        rows.append(
+            style.paint(
+                "{}{} more {} use -n 0 for all".format(indent, human_count(hidden), ui.dash(style)),
+                "dim",
             )
         )
     return rows
@@ -662,22 +679,24 @@ def _header(style: ui.Style, headline: str, path: str, subtitle: str) -> List[st
     line while its three siblings sat on the next. The path is the title; the
     size is the first fact.
 
-    The path is split: everything up to the last component is where the tree
-    happens to live and is dimmed, and the last component is *what was measured*
-    and is bold. On ``/scratch/midway3/$USER/experiments/run-14`` that is the
-    difference between a wall of equally-weighted text and a line whose subject
-    you can find without reading it.
+    **One weight for the whole path.** It used to be split -- the leading
+    directories dimmed, the last component bold -- so that the subject of a long
+    path like ``/scratch/midway3/$USER/experiments/run-14`` could be found without
+    reading it. That earned its keep when the path sat mid-line beside the size,
+    competing for attention with a number.
+
+    It does not any more, because the path now has a line to itself: the whole line
+    *is* the subject, so there is nothing to pick it out from. What the split does
+    instead is read as arbitrary -- on ``/home/youzhi`` it bolds one of two
+    components and dims the other, which looks like emphasis with a reason nobody
+    can guess. Emphasis that a reader cannot explain is noise, however consistent
+    the rule behind it.
 
     The size keeps the accent it had, so it is still the first thing the eye
     lands on among the numbers -- it just no longer outranks the name of the
     thing it measures.
     """
-    parent, _, leaf = path.rpartition(os.sep)
-    subject = (
-        style.paint(parent + os.sep, "dim") + style.paint(leaf, "bold")
-        if parent and leaf
-        else style.paint(path, "bold")
-    )
+    subject = style.paint(path, "bold")
     facts = style.paint(headline, "bold_cyan")
     if subtitle:
         # The same joiner `_facts` uses, so the size sits in that line as one of
@@ -715,7 +734,6 @@ def render_compact(
                 style,
                 [
                     ("counts only, no sizes", "", ("yellow",)),
-                    (human_count(_entry_total(res)), "entries", (style.muted, "bold")),
                     ("{:.2f}s".format(res.elapsed), "", ("dim",)),
                 ],
             ),
@@ -741,7 +759,6 @@ def render_compact(
                 style,
                 [
                     (human_count(res.inodes), "files", ("cyan", "bold")),
-                    (human_count(_entry_total(res)), "entries", (style.muted, "bold")),
                     ("{:.2f}s".format(res.elapsed), "", ("dim",)),
                 ],
             ),

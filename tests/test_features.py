@@ -256,3 +256,60 @@ def test_json_quota_rows_carry_their_mount_detail():
     assert doc["quota"]["time_note"]
     assert doc["quota"]["rows"][0]["mounts"] == ["/home", "/gpfs/home"]
     assert doc["quota"]["rows"][0]["mount_guessed"] is True
+
+
+# ---------------------------------------------------------------------------
+# The header facts, and saying when the table is truncated
+# ---------------------------------------------------------------------------
+
+
+def test_the_header_states_only_measurements_of_the_tree(tree):
+    """There used to be a fourth fact and it was the most confusing number here.
+
+    It counted the rows the table *could* draw at the current --depth, while -n
+    decided how many were listed -- but sitting between a byte total and a file
+    total it read as a third measurement of the tree, and reconciling it against
+    the file count is impossible because they count different things. No wording
+    rescued it: "95 entries" was opaque and "10 of 95 entries" still leaned on a
+    word that means nothing to a reader. It is gone, and the information it carried
+    now lives next to the table it describes.
+    """
+    res = walk(tree, threads=2, depth=1)
+    header = report.render_compact(res, SettleCheck(), 4, False, ui.resolve_style("never"))[1]
+    assert "entries" not in header
+    assert "files" in header
+    assert "of" not in header.split("files")[1]
+
+
+def test_a_truncated_table_says_so_at_depth_one(tree):
+    """Depth 1 gets the remainder row, which carries bytes as well as the count."""
+    res = walk(tree, threads=2, depth=1)
+    if report._entry_total(res) <= 1:
+        pytest.skip("fixture has nothing to hide")
+    body = "\n".join(report.render_entries(res, 1, False, ui.resolve_style("never")))
+    assert "more" in body and "use -n 0 for all" in body
+
+
+def test_a_truncated_table_says_so_below_depth_one_too(tree):
+    """This is where it used to stop without a word.
+
+    The remainder row carries bytes, so it is only well defined when the listed
+    rows partition the tree -- at depth > 1 they nest and a total would
+    double-count. So the row is suppressed there, and the table simply ended: at
+    `-d 2 -n 10` it showed ten of fifty-nine and looked complete. The count alone
+    is true at any depth.
+    """
+    res = walk(tree, threads=2, depth=3)
+    total = report._entry_total(res)
+    if total <= 2:
+        pytest.skip("fixture is not deep enough")
+    body = "\n".join(report.render_entries(res, 2, False, ui.resolve_style("never")))
+    assert "more" in body, body
+    assert "use -n 0 for all" in body
+
+
+def test_nothing_is_said_when_nothing_is_hidden(tree):
+    """A note that fires on every run is furniture."""
+    res = walk(tree, threads=2, depth=1)
+    body = "\n".join(report.render_entries(res, 0, False, ui.resolve_style("never")))
+    assert "more" not in body
