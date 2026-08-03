@@ -25,6 +25,7 @@ built into the mechanism and are reported rather than papered over:
 import errno
 import os
 import stat
+import threading
 from typing import Dict, List, Optional, Tuple  # noqa: F401  (used in `# type:` comments)
 
 _DELETED_SUFFIX = " (deleted)"
@@ -59,6 +60,15 @@ class DeletedScan:
         self.unreadable_pids = 0  # other users' processes: EACCES
         self.available = True
         self.reason = ""
+        # True when /proc shows only a PID namespace's processes rather than the
+        # node's. The coverage line reads as node-wide, so under Apptainer,
+        # Docker or a Slurm cgroup with proc remounted, "1 of 1 processes" is a
+        # 100%-coverage sentence produced from a namespace holding one process --
+        # on a node running 1,400. Honest about EACCES, blind to this, until now.
+        self.namespaced = False
+        # True when the sweep was abandoned mid-flight, almost certainly because
+        # a stat() blocked on a hung mount. See `scan`.
+        self.timed_out = False
 
     @property
     def total_size(self) -> int:
@@ -67,7 +77,7 @@ class DeletedScan:
     @property
     def complete(self) -> bool:
         """False when other users' processes could not be inspected."""
-        return self.unreadable_pids == 0
+        return self.unreadable_pids == 0 and not self.namespaced and not self.timed_out
 
     def under(self, prefix: str) -> "DeletedScan":
         """Restrict to inodes whose pre-deletion path was under ``prefix``."""
@@ -77,8 +87,40 @@ class DeletedScan:
         out.unreadable_pids = self.unreadable_pids
         out.available = self.available
         out.reason = self.reason
+        out.namespaced = self.namespaced
+        out.timed_out = self.timed_out
         out.files = [f for f in self.files if f.path == pref or f.path.startswith(pref + "/")]
         return out
+
+
+def _in_pid_namespace() -> bool:
+    """Does /proc show a PID namespace rather than the whole node?
+
+    Two independent signals, either of which is sufficient:
+
+    * ``/proc/self/status``'s ``NSpid`` lists one entry per namespace this
+      process is visible in, so more than one means we are nested.
+    * pid 1 in the root namespace is the init system. Inside a container it is
+      whatever the container started.
+
+    Both are read-only files in procfs and cannot block. A false *negative* just
+    restores the previous behaviour, so this is safe to get wrong quietly.
+    """
+    try:
+        with open("{}/self/status".format(_PROC)) as fh:
+            for line in fh:
+                if line.startswith("NSpid:"):
+                    if len(line.split()) > 2:
+                        return True
+                    break
+    except OSError:
+        pass
+    try:
+        with open("{}/1/comm".format(_PROC)) as fh:
+            return fh.read().strip() not in ("systemd", "init", "openrc-init")
+    except OSError:
+        # pid 1 not visible at all is itself evidence of a restricted view.
+        return True
 
 
 def _read_comm(pid: int) -> str:
@@ -94,19 +136,62 @@ def _read_comm(pid: int) -> str:
     return "?"
 
 
-def scan(prefix: Optional[str] = None) -> DeletedScan:
+# A whole-node sweep of readable fds takes ~0.01s here (30 inspectable processes
+# of 1,440). Anything beyond this is not slowness, it is a blocked stat.
+DEFAULT_SCAN_TIMEOUT_S = 10.0
+
+
+def scan(prefix: Optional[str] = None, timeout: float = DEFAULT_SCAN_TIMEOUT_S) -> DeletedScan:
     """Sweep ``/proc/*/fd`` for unlinked-but-open regular files.
 
     ``prefix`` restricts the result to one subtree. Inodes are deduplicated by
     ``(st_dev, st_ino)``: several processes -- or several fds in one process --
     may hold the same inode, and the blocks are allocated once.
+
+    **Bounded, because the sweep is on the emergency path.** ``os.stat`` through
+    ``/proc/<pid>/fd/<n>`` resolves the real inode, so if that inode lives on a
+    hung NFS, Lustre or autofs mount the call blocks in uninterruptible sleep
+    with no timeout and no signal that will reach it. ``rdu -a`` runs this scan
+    unconditionally, and a tool for storage emergencies must not have an
+    unbounded blocking call on the emergency path -- a degraded MDS is the same
+    afternoon someone reaches for it.
+
+    There is no way to interrupt a blocked syscall from the thread making it, so
+    the sweep runs in a daemon thread and is *abandoned* if it overruns. The
+    abandoned thread stays parked in D state until the mount recovers; being a
+    daemon, it does not delay interpreter exit. Whatever it had already found is
+    reported, with ``timed_out`` set so the caller can say coverage is partial.
     """
     res = DeletedScan()
     if not os.path.isdir(_PROC):
         res.available = False
         res.reason = "/proc is not available on this platform"
         return res
+    res.namespaced = _in_pid_namespace()
 
+    # Completed records only. `list.append` is atomic under the GIL, so the main
+    # thread can safely read a prefix of this list after abandoning the worker.
+    found = []  # type: List[DeletedFile]
+    done = threading.Event()
+    worker = threading.Thread(
+        target=_sweep, args=(res, found, prefix, done), name="rapidu-deleted", daemon=True
+    )
+    worker.start()
+    done.wait(timeout)
+    if not done.is_set():
+        res.timed_out = True
+        res.reason = (
+            "the /proc sweep was abandoned after {:.0f}s, which means a stat() "
+            "blocked on an unresponsive mount; results below are partial".format(timeout)
+        )
+    res.files = sorted(found[:], key=lambda f: f.size, reverse=True)
+    return res
+
+
+def _sweep(
+    res: DeletedScan, found: "List[DeletedFile]", prefix: Optional[str], done: "threading.Event"
+) -> None:
+    """The body of :func:`scan`, run in a thread so it can be abandoned."""
     by_inode = {}  # type: Dict[Tuple[int, int], DeletedFile]
     pref = os.path.abspath(prefix).rstrip("/") if prefix else None
 
@@ -162,9 +247,9 @@ def scan(prefix: Optional[str] = None) -> DeletedScan:
             if rec is None:
                 rec = DeletedFile(st.st_dev, st.st_ino, st.st_blocks * 512, path)
                 by_inode[key] = rec
+                found.append(rec)
             if comm is None:
                 comm = _read_comm(pid)
             rec.add_holder(pid, comm)
 
-    res.files = sorted(by_inode.values(), key=lambda f: f.size, reverse=True)
-    return res
+    done.set()

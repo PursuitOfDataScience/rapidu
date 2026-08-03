@@ -59,6 +59,52 @@ MIN_ALLOC_UNIT = 4096
 # Bound on how many recently-modified files we retain for the re-stat pass.
 _RECENT_SAMPLE_CAP = 4096
 
+# Age buckets for the cold-data report, in days, youngest first. The last bucket
+# is open-ended.
+#
+# For a full quota "what is big" is not actionable on its own -- the big thing is
+# usually the thing being worked on. "What is big *and* has not been touched in a
+# year" is the answer, and `st_mtime` is already read for every file to drive the
+# settling check and then discarded. This costs one comparison and one adder per
+# file, no extra syscall.
+AGE_BUCKET_DAYS = (7, 30, 90, 365)
+AGE_BUCKET_LABELS = ("< 7d", "7-30d", "30-90d", "90d-1y", "> 1y")
+
+# Directory *names* worth accumulating a subtree total for, wherever they appear
+# and however deep. `depth` controls the reported breakdown, so `dir_agg` holds
+# only depth-1 entries by default -- and every cache worth naming sits three or
+# four levels down (`~/.cache/huggingface/hub`, `~/.conda/pkgs`). A detector
+# reading `dir_agg` therefore finds nothing on a default run, which is how this
+# feature would have shipped looking implemented and doing nothing.
+#
+# Basenames only, deliberately over-broad: `pip` matches any directory called
+# pip, and `report._reclaimable_match` does the real filtering on the full path.
+# Cheap to be generous here (a set lookup per path component per directory) and
+# expensive to be wrong in the other direction.
+WATCHED_DIR_NAMES = frozenset(
+    (
+        "pkgs",
+        "pip",
+        "uv",
+        "huggingface",
+        "hub",
+        "torch",
+        "cache",
+        "ComputeCache",
+        "Trash",
+        "node_modules",
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+        "objects",
+        "wandb",
+        "mlruns",
+        "lightning_logs",
+        "runtime",
+    )
+)
+
 
 class TokenBucket:
     """Rate limiter over directory opens. Disabled when ``rate <= 0``."""
@@ -197,6 +243,21 @@ class WalkResult:
         # "files" quota charges.
         self.by_uid = {}  # type: Dict[int, Tuple[int, int]]
         self.by_dev = {}  # type: Dict[int, Tuple[int, int]]
+        # A group quota is charged by gid, not uid, and the two diverge exactly
+        # when it matters: a file written into a shared project directory whose
+        # setgid bit is missing lands in the writer's personal group, so it is
+        # charged somewhere nobody is looking. `render_walk` already says "a group
+        # quota charges all of these" over the *uid* table, which answers a
+        # question nobody asked.
+        self.by_gid = {}  # type: Dict[int, Tuple[int, int]]
+        # (bytes, inodes) per `AGE_BUCKET_LABELS` entry, by mtime.
+        self.by_age = [(0, 0)] * len(AGE_BUCKET_LABELS)  # type: List[Tuple[int, int]]
+        # Subtree totals for directories named in `WATCHED_DIR_NAMES`, at any
+        # depth. Kept apart from `dir_agg` on purpose: these are deeper than the
+        # reported depth, and letting them into `dir_agg` would put nested rows in
+        # a ranking that is supposed to partition the tree, and break the
+        # remainder row that depends on that.
+        self.watched = {}  # type: Dict[str, Tuple[int, int]]
         self.dir_agg = {}  # type: Dict[str, Entry]
         self.unreadable_dirs = []  # type: List[Tuple[str, str]]
         self.unstatable = 0
@@ -287,29 +348,6 @@ class WalkResult:
         return top in self.finished_tops
 
 
-def _entry_keys(root: str, rel_parts: Tuple[str, ...], depth: int) -> List[str]:
-    """Every reported ancestor of an object, plus the object itself if shallow.
-
-    For an object at ``a/b/c`` with ``depth=2`` this returns ``[a, a/b]``: its
-    bytes are charged to both, which is what makes directory totals cumulative.
-    For ``a`` it returns ``[a]`` -- the object is its own entry because it sits
-    within the reported depth.
-
-    Relative parts are carried on the work queue rather than recovered with
-    ``os.path.relpath`` per object, which would be a string operation per inode
-    on a million-inode walk.
-    """
-    n = min(len(rel_parts), depth)
-    if n <= 0:
-        return []
-    keys = []
-    acc = root
-    for i in range(n):
-        acc = acc + os.sep + rel_parts[i]
-        keys.append(acc)
-    return keys
-
-
 def walk(
     root: str,
     threads: int = DEFAULT_THREADS,
@@ -328,15 +366,47 @@ def walk(
     complete. ``max_dirs_per_sec`` of 0 disables rate limiting.
 
     ``count_only`` skips ``stat`` entirely and counts directory entries from
-    ``getdents`` alone. That is :data:`COUNT_SPEEDUP`\\ **x faster**, on both
-    trees it has been measured on -- 782k GPFS inodes at 27.3s against 3.4s, and
-    1.69M at 58.7s against 7.1s -- because ``stat`` is ~90% of a normal walk's
-    wall time and ``d_type`` already distinguishes a directory from everything
-    else. The cost is that there are no sizes and hard links cannot be
-    deduplicated, both of which the caller must report rather than paper over.
+    ``getdents`` alone. That is :data:`COUNT_SPEEDUP`\\ **x faster on GPFS**, on
+    both trees it has been measured on -- 782k inodes at 27.3s against 3.4s, and
+    1.69M at 58.7s against 7.1s -- because ``stat`` is ~90% of a *parallel
+    filesystem* walk's wall time and ``d_type`` already distinguishes a directory
+    from everything else. The cost is that there are no sizes and hard links
+    cannot be deduplicated, both of which the caller must report rather than
+    paper over.
 
-    One figure, stated once, from :data:`COUNT_SPEEDUP`. This docstring used to
-    say "9.1x" while the ``--count`` help text said "8x" for the same claim.
+    **The ratio is a property of the filesystem, not of this walker,** and naming
+    GPFS is load-bearing rather than decorative. Re-measured across three trees:
+    8.5x on a large GPFS one, 2.1x on a page-cached local one, 1.6x on a small
+    warm GPFS one. Anything derived from :data:`COUNT_SPEEDUP` must therefore say
+    where it was measured and must not predict a runtime for the filesystem in
+    front of the user -- doing that was out by -74% and -80% on two of the three.
+
+    Two further limits on the fast path, both real and neither yet measurable
+    here:
+
+    * ``entry.is_dir(follow_symlinks=False)`` is answered from ``d_type`` only
+      where the filesystem fills it in. On one that returns ``DT_UNKNOWN`` -- XFS
+      formatted with ``ftype=0``, some NFS exports without readdirplus, a few
+      FUSE layers -- CPython falls back to a real ``stat`` per entry, so ``-c``
+      costs about what a full walk costs while still reporting no sizes and no
+      hard-link dedup: strictly worse than not passing it. Every filesystem
+      reachable from this cluster fills ``d_type`` in, so the fallback has not
+      been observed here, only reasoned about.
+    * ``one_file_system`` costs one ``lstat`` per *directory* on this path, since
+      a child cannot change filesystem unless it is itself a mount point. That is
+      a few percent of inodes and keeps the flag honest; before, it was accepted
+      and silently ignored.
+
+    Memory grows with the tree and is not bounded. Measured at 19-35 bytes of RSS
+    per inode, but the spread is the point: the per-inode figure is a property of
+    hard-link density and frontier width, not of inode count, so it does not
+    extrapolate. The three growing structures are the breadth-first ``queue``
+    (which can hold one whole level of a wide tree), ``seen_links`` (one entry per
+    multiply-linked inode -- 8.6% of a conda env, near zero for a checkpoint
+    tree), and ``dir_agg``, which holds one :class:`Entry` per *reported* object:
+    at the default depth that is one per top-level child, but a single directory
+    holding a million files costs a million ``Entry`` objects, which is exactly
+    the "too many inodes" case this tool is reached for.
     """
     root = os.path.abspath(root)
     nthreads = max(1, min(int(threads), MAX_THREADS))
@@ -371,6 +441,11 @@ def walk(
     # a counter reaches zero that whole subtree is final.
     outstanding = {}  # type: Dict[str, int]
     finished_tops = set()  # type: Set[str]
+    # depth-1 names beneath which the walk abandoned work when it was stopped, or
+    # whose own directory scan was cut short. Subtracted from `finished_tops` at
+    # the end: a counter reaching zero proves only that nothing is *outstanding*,
+    # not that everything was done.
+    abandoned_tops = set()  # type: Set[str]
     cv = threading.Condition()
 
     # Hardlink bookkeeping is global: the same inode may be reached from
@@ -392,6 +467,7 @@ def walk(
         # The root is not itself a reported entry -- it is the total.
         res.by_uid[root_st.st_uid] = (root_st.st_blocks * 512, 1)
         res.by_dev[root_dev] = (root_st.st_blocks * 512, 1)
+        res.by_gid[root_st.st_gid] = (root_st.st_blocks * 512, 1)
 
     def worker(slot_id: int = 0) -> None:
         l_size = l_app = l_files = l_dirs = l_sym = l_unstat = 0
@@ -404,6 +480,9 @@ def walk(
         l_bits = 0
         l_uid = {}  # type: Dict[int, List[int]]
         l_dev = {}  # type: Dict[int, List[int]]
+        l_gid = {}  # type: Dict[int, List[int]]
+        l_age = [[0, 0] for _ in AGE_BUCKET_LABELS]
+        l_watch = {}  # type: Dict[str, List[int]]
         # key -> [bytes, files, dirs, is_dir]
         l_agg = {}  # type: Dict[str, List[int]]
         l_unreadable = []  # type: List[Tuple[str, str]]
@@ -415,9 +494,18 @@ def walk(
         stop_is_set = stop_ev.is_set
         scandir = os.scandir
         sep = os.sep
+        # "" when root is "/", so ancestor keys and child keys agree. See #21.
+        root_stem = root.rstrip(sep) if root != sep else ""
         agg_get = l_agg.get
         uid_get = l_uid.get
         dev_get = l_dev.get
+        gid_get = l_gid.get
+        # Cutoffs as absolute epoch seconds, computed once: comparing against
+        # these is one float compare per file rather than an arithmetic per file.
+        age_cutoffs = [now - days * 86400.0 for days in AGE_BUCKET_DAYS]
+        n_buckets = len(l_age)
+        watch_names = WATCHED_DIR_NAMES
+        watch_get = l_watch.get
         S_IFMT, S_IFDIR, S_IFLNK = 0o170000, 0o040000, 0o120000
         ofs = one_file_system
         cap = _RECENT_SAMPLE_CAP
@@ -433,6 +521,14 @@ def walk(
             seen_here += 1
 
             children = []  # type: List[Tuple[str, Tuple[str, ...]]]
+            # Anything raised between here and the bookkeeping block at the end
+            # must not escape the worker: the dead thread would never release this
+            # directory's pending count, the survivors would spin on `cv.wait`
+            # while `pending_box[0] > 0` forever, and `join()` would never return.
+            # A narrower guard around only the `scandir` call was not enough --
+            # proved by a shadowed-variable bug in the *setup* below, which hung
+            # the walk instead of crashing it.
+            failure = ""
 
             # Every entry in this directory charges the same set of reported
             # ancestors, so resolve their accumulator slots once here rather than
@@ -440,7 +536,14 @@ def walk(
             ndp = len(d_parts)
             own_level = ndp < depth
             base = []  # type: List[List[int]]
-            acc = root
+            # `root_stem` is empty when root is "/", so a reported ancestor's key
+            # is built exactly the way a child's own key is (`dsep + name`). Using
+            # `root` verbatim gave "/" + "/" + "etc" = "//etc" for the ancestor
+            # and "/etc" for the child: two Entry objects per directory, both
+            # relpath'ing to the same displayed name, so `rdu /` listed every
+            # top-level entry twice and os.path.dirname("//etc") == "//" broke the
+            # remainder row. Only root "/" was affected, which is why no test saw it.
+            acc = root_stem
             for i in range(ndp if own_level else depth):
                 acc = acc + sep + d_parts[i]
                 slot = agg_get(acc)
@@ -449,12 +552,32 @@ def walk(
                 base.append(slot)
             nbase = len(base)
             b0 = base[0] if nbase == 1 else None
+            # Watched ancestors, resolved once per directory for the same reason
+            # `base` is: this is per-directory work, not per-inode work. Runs over
+            # the *full* relative path rather than stopping at `depth`.
+            watch = []  # type: List[List[int]]
+            if ndp:
+                wacc = root_stem
+                for i in range(ndp):
+                    wacc = wacc + sep + d_parts[i]
+                    if d_parts[i] in watch_names:
+                        wslot = watch_get(wacc)
+                        if wslot is None:
+                            wslot = l_watch[wacc] = [0, 0]
+                        watch.append(wslot)
             dsep = d if d.endswith(sep) else d + sep
 
-            if bucket is not None:
-                bucket.take()
+            try:
+                if bucket is not None:
+                    bucket.take()
+            except Exception as exc:  # noqa: BLE001  (a hang is worse than a report)
+                failure = "rate limiter: {}".format(exc)
 
             k = 0
+            # Did this directory's own scan stop early? A truncated scan means the
+            # subtree is not complete even when it enqueued no children, so it
+            # cannot be allowed to mark its top-level ancestor finished. See #19.
+            d_truncated = False
             try:
                 with scandir(d) as it:
                     if count_only:
@@ -464,6 +587,7 @@ def walk(
                         for entry in it:
                             k += 1
                             if not (k & 1023) and stop_is_set():
+                                d_truncated = True
                                 break
                             try:
                                 isdir = entry.is_dir(follow_symlinks=False)
@@ -472,6 +596,27 @@ def walk(
                                 continue
                             if isdir:
                                 name = entry.name
+                                # --one-file-system was accepted and silently
+                                # ignored here, because this path never calls
+                                # stat and so never reads st_dev. The two flags a
+                                # user is steered toward combining -- `-i -c` is
+                                # the hint the tool itself prints, and
+                                # --one-file-system is documented as "use this
+                                # when reconciling against a per-filesystem
+                                # quota" -- were exactly the pair that disagreed.
+                                #
+                                # One lstat per *directory*, not per inode: a
+                                # child is on its parent's filesystem unless it is
+                                # itself a mount point, so only directories can
+                                # cross. Directories are a few percent of inodes,
+                                # so the fast path stays fast.
+                                if ofs:
+                                    try:
+                                        if entry.stat(follow_symlinks=False).st_dev != root_dev:
+                                            continue
+                                    except OSError:
+                                        l_unstat += 1
+                                        continue
                                 children.append((dsep + name, d_parts + (name,)))
                                 l_dirs += 1
                                 if b0 is not None:
@@ -511,6 +656,7 @@ def walk(
                         # can hold a million names.
                         k += 1
                         if not (k & 1023) and stop_is_set():
+                            d_truncated = True
                             break
                         try:
                             st = entry.stat(follow_symlinks=False)
@@ -549,6 +695,18 @@ def walk(
                             slot = uid_get(uid)
                             if slot is None:
                                 l_uid[uid] = [blocks, 1]
+                            else:
+                                slot[0] += blocks
+                                slot[1] += 1
+                            # ...and a *group* quota counts it too. `by_uid` was
+                            # charged here and `by_gid` was not, so the two tables
+                            # disagreed by exactly the directory count -- which is
+                            # the one discrepancy a reader comparing them against a
+                            # group quota would notice first.
+                            gid = st.st_gid
+                            slot = gid_get(gid)
+                            if slot is None:
+                                l_gid[gid] = [blocks, 1]
                             else:
                                 slot[0] += blocks
                                 slot[1] += 1
@@ -624,6 +782,32 @@ def walk(
                         else:
                             slot[0] += blocks
                             slot[1] += 1
+                        if watch:
+                            for wslot in watch:
+                                wslot[0] += blocks
+                                wslot[1] += 1
+                        gid = st.st_gid
+                        slot = gid_get(gid)
+                        if slot is None:
+                            l_gid[gid] = [blocks, 1]
+                        else:
+                            slot[0] += blocks
+                            slot[1] += 1
+
+                        mtime = st.st_mtime
+                        # Not `bucket`: that name is the TokenBucket, captured
+                        # from the enclosing scope. Assigning it here made it a
+                        # local to the whole worker, so `if bucket is not None`
+                        # above read an unbound local and the thread died on its
+                        # first directory.
+                        age_bucket = n_buckets - 1
+                        for at, cutoff in enumerate(age_cutoffs):
+                            if mtime >= cutoff:
+                                age_bucket = at
+                                break
+                        slot = l_age[age_bucket]
+                        slot[0] += blocks
+                        slot[1] += 1
 
                         if st.st_mtime >= recent_cutoff or st.st_ctime >= recent_cutoff:
                             l_recent += 1
@@ -633,6 +817,15 @@ def walk(
                                 l_sample.append((dsep + entry.name, blocks))
             except OSError as exc:
                 l_unreadable.append((d, exc.strerror or "unreadable"))
+            except Exception as exc:  # noqa: BLE001  (a hang is worse than a report)
+                # Anything not an OSError -- MemoryError on a huge frontier, a
+                # latent TypeError, a shadowed name -- must not escape. See the
+                # note beside `failure` above for what escaping costs.
+                l_unreadable.append((d, "internal error: {}".format(exc)))
+                d_truncated = True
+            if failure:
+                l_unreadable.append((d, failure))
+                d_truncated = True
 
             if progress is not None:
                 # Published per directory rather than per inode: one list write
@@ -642,12 +835,25 @@ def walk(
                 progress.current = d
 
             with cv:
-                if children and not stop_ev.is_set():
+                dropped = bool(children) and stop_ev.is_set()
+                if children and not dropped:
                     queue.extend(children)
                     pending_box[0] += len(children)
                     for _, cparts in children:
                         outstanding[cparts[0]] = outstanding.get(cparts[0], 0) + 1
                 pending_box[0] -= 1
+                # Work this directory found but will not do. Dropping the children
+                # and then decrementing the subtree's counter anyway let the
+                # counter reach zero, which marked the subtree *complete* -- so an
+                # interrupted run ranked a directory it had barely entered as a
+                # finished measurement. `finished_tops` is the entire basis of the
+                # interrupt guarantee: `is_finished` reads it, `top_dirs(
+                # finished_only=True)` filters on it, and `render_entries` uses
+                # that filter precisely so a half-counted directory never appears
+                # in a ranking. The producer was breaking the promise the consumer
+                # was keeping.
+                if (dropped or d_truncated) and d_parts:
+                    abandoned_tops.add(d_parts[0])
                 if d_parts:
                     top = d_parts[0]
                     outstanding[top] -= 1
@@ -690,6 +896,15 @@ def walk(
             for dev, (b, f) in l_dev.items():
                 pb, pf = res.by_dev.get(dev, (0, 0))
                 res.by_dev[dev] = (pb + b, pf + f)
+            for gid, (b, f) in l_gid.items():
+                pb, pf = res.by_gid.get(gid, (0, 0))
+                res.by_gid[gid] = (pb + b, pf + f)
+            for at, (b, f) in enumerate(l_age):
+                pb, pf = res.by_age[at]
+                res.by_age[at] = (pb + b, pf + f)
+            for wpath, (b, f) in l_watch.items():
+                pb, pf = res.watched.get(wpath, (0, 0))
+                res.watched[wpath] = (pb + b, pf + f)
             for kk, (b, f, dcount, dir_flag) in l_agg.items():
                 ent = res.dir_agg.get(kk)
                 if ent is None:
@@ -715,10 +930,15 @@ def walk(
             cv.notify_all()
         for w in workers:
             w.join(timeout=5.0)
+    # Any stop, not just a KeyboardInterrupt. `stop` is a documented parameter, and
+    # a caller that used it got early termination with `partial` still False -- so
+    # `complete` depended only on unreadable/unstatable counts and a walk that
+    # halted at 18% of the tree could report as a finished measurement.
+    if stop_ev.is_set():
         res.partial = True
     res.elapsed = time.perf_counter() - t0
     res.hardlinked_inodes = len(seen_links)
-    res.finished_tops = finished_tops
+    res.finished_tops = finished_tops - abandoned_tops
     # A depth-1 plain file is complete the moment the root was scanned; only
     # directories can be caught mid-walk. The dirname check is load-bearing: at
     # depth > 1 dir_agg also holds deeper entries, and adding the basename of a
@@ -730,15 +950,6 @@ def walk(
     if progress is not None:
         progress.finished = True
     return res
-
-
-def _bump(d: Dict[int, List[int]], key: int, size: int, files: int) -> None:
-    slot = d.get(key)
-    if slot is None:
-        d[key] = [size, files]
-    else:
-        slot[0] += size
-        slot[1] += files
 
 
 # A re-stat taken immediately after the walk cannot observe drift: the blocks

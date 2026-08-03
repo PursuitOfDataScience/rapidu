@@ -76,9 +76,9 @@ def test_read_best_prefers_the_backend_that_maps_the_path(monkeypatch):
     walk of the scratch path reported "no quota row maps to this path" while the
     answer sat one call below in the same function.
     """
-    monkeypatch.setattr(Q, "read_quota_command", lambda t: _snap("quota -s", "/home"))
-    monkeypatch.setattr(Q, "read_mmlsquota", lambda p, t: _snap("mmlsquota", None, False))
-    monkeypatch.setattr(Q, "read_lfs_quota", lambda p, t: _snap("lfs quota", "/scratch"))
+    monkeypatch.setattr(Q, "read_quota_command", lambda t, d=None: _snap("quota -s", "/home"))
+    monkeypatch.setattr(Q, "read_mmlsquota", lambda p, t, d=None: _snap("mmlsquota", None, False))
+    monkeypatch.setattr(Q, "read_lfs_quota", lambda p, t, d=None: _snap("lfs quota", "/scratch"))
 
     got = Q.read_best("/scratch/me/run")
     assert got.source == "lfs quota"
@@ -89,17 +89,17 @@ def test_read_best_prefers_the_backend_that_maps_the_path(monkeypatch):
 
 def test_read_best_falls_back_to_any_reading_when_none_map(monkeypatch):
     """`-Q` with no path still deserves the table it can get."""
-    monkeypatch.setattr(Q, "read_quota_command", lambda t: _snap("quota -s", "/home"))
-    monkeypatch.setattr(Q, "read_mmlsquota", lambda p, t: _snap("mmlsquota", None, False))
-    monkeypatch.setattr(Q, "read_lfs_quota", lambda p, t: _snap("lfs quota", None, False))
+    monkeypatch.setattr(Q, "read_quota_command", lambda t, d=None: _snap("quota -s", "/home"))
+    monkeypatch.setattr(Q, "read_mmlsquota", lambda p, t, d=None: _snap("mmlsquota", None, False))
+    monkeypatch.setattr(Q, "read_lfs_quota", lambda p, t, d=None: _snap("lfs quota", None, False))
     got = Q.read_best("/tmp/unmapped")
     assert got.available and got.source == "quota -s"
 
 
 def test_read_best_reports_every_failure_when_all_fail(monkeypatch):
-    monkeypatch.setattr(Q, "read_quota_command", lambda t: _snap("quota -s", None, False))
-    monkeypatch.setattr(Q, "read_mmlsquota", lambda p, t: _snap("mmlsquota", None, False))
-    monkeypatch.setattr(Q, "read_lfs_quota", lambda p, t: _snap("lfs quota", None, False))
+    monkeypatch.setattr(Q, "read_quota_command", lambda t, d=None: _snap("quota -s", None, False))
+    monkeypatch.setattr(Q, "read_mmlsquota", lambda p, t, d=None: _snap("mmlsquota", None, False))
+    monkeypatch.setattr(Q, "read_lfs_quota", lambda p, t, d=None: _snap("lfs quota", None, False))
     got = Q.read_best("/tmp")
     assert not got.available
     for name in ("quota -s", "mmlsquota", "lfs quota"):

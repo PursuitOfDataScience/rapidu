@@ -331,3 +331,188 @@ def test_color_depth_is_conservative(monkeypatch):
     monkeypatch.setenv("TERM", "screen")
     monkeypatch.setenv("COLORTERM", "truecolor")
     assert ui.color_depth() == 256
+
+
+# ---------------------------------------------------------------------------
+# The outer frame
+# ---------------------------------------------------------------------------
+
+
+def test_visible_width_ignores_colour():
+    """Width arithmetic on a painted string is wrong by the length of its escapes."""
+    style = ui.resolve_style("always")
+    painted = style.paint("abc", "bold_red")
+    assert len(painted) > 3
+    assert ui.visible_width(painted) == 3
+
+
+def test_visible_width_counts_east_asian_characters_twice():
+    """A path is user data, and a directory named in Chinese is ordinary.
+
+    Measuring it with ``len`` puts the right-hand border one column short per
+    character, so the frame goes crooked on exactly the paths hardest to eyeball.
+    """
+    assert ui.visible_width("模型") == 4
+    assert ui.visible_width("models") == 6
+
+
+def test_visible_width_ignores_combining_marks():
+    assert ui.visible_width("é") == 1
+
+
+def _frame(lines, style):
+    return ui.box(lines, style)
+
+
+def test_the_frame_encloses_every_line():
+    """Every content line must sit between two borders. That is the whole job."""
+    style = ui.resolve_style("never")
+    out = _frame(["one", "two", "three"], style)
+    assert out[0].startswith("╭") and out[0].endswith("╮")
+    assert out[-1].startswith("╰") and out[-1].endswith("╯")
+    for line in out[1:-1]:
+        assert line.startswith("│") and line.endswith("│"), line
+
+
+def test_every_frame_line_is_the_same_width():
+    """A frame whose rows disagree by a column reads as broken, because it is."""
+    style = ui.resolve_style("never")
+    out = _frame(["short", "a much longer line than the first", "mid length"], style)
+    widths = {ui.visible_width(line) for line in out}
+    assert len(widths) == 1, widths
+
+
+def test_the_frame_stays_square_with_colour_on():
+    """The padding is computed from visible width, so colour must not shift it."""
+    style = ui.resolve_style("always")
+    body = [style.paint("red", "red"), style.paint("a longer bold line", "bold"), "plain"]
+    out = ui.box(body, style)
+    widths = {ui.visible_width(line) for line in out}
+    assert len(widths) == 1, widths
+
+
+def test_the_frame_degrades_to_ascii():
+    """``--ascii`` is the documented escape hatch and the frame is not exempt."""
+    style = ui.resolve_style("never", ascii_only=True)
+    out = _frame(["one", "two"], style)
+    text = "\n".join(out)
+    text.encode("ascii")
+    assert text.startswith("+")
+
+
+def test_the_frame_hugs_content_wider_than_the_terminal():
+    """Clipping to the terminal broke the frame on every row.
+
+    The content has an irreducible minimum width -- a fixed set of numeric
+    columns plus a path, and a mount column as long as the site's mount points --
+    so a frame clipped narrower than that has most of its rows overrun the
+    border. Wider-than-terminal merely wraps, which is what the unframed output
+    did at that width anyway, and stays a frame.
+    """
+    style = ui.resolve_style("never")
+    long_line = "x" * 90
+    out = ui.box([long_line, "short"], style, width=30)
+    # Sized to the given width, not to the content...
+    assert {ui.visible_width(line) for line in out} == {30}
+    # ...and the over-long line is wrapped inside rather than allowed past it.
+    for line in out[1:-1]:
+        assert line.startswith("│") and line.endswith("│"), line
+    assert sum(line.count("x") for line in out) == 90
+
+
+def test_a_pathological_line_does_not_pad_every_other_line():
+    """Past the hug limit, one outlier must not bury the report in whitespace."""
+    style = ui.resolve_style("never")
+    out = ui.box(["y" * 400, "short"], style, width=80)
+    assert {ui.visible_width(line) for line in out} == {80}
+    # Every y survives -- wrapped across rows, not truncated.
+    assert sum(line.count("y") for line in out) == 400
+
+
+def test_the_top_border_carries_no_label():
+    """A version string up there reads as packaging, not measurement."""
+    style = ui.resolve_style("never")
+    out = ui.box(["body"], style)
+    assert set(out[0]) <= {"╭", "─", "╮"}, out[0]
+
+
+def test_a_frame_with_no_content_is_no_frame():
+    """Blank input must not produce two lonely borders."""
+    style = ui.resolve_style("never")
+    assert ui.box([], style) == []
+    assert ui.box(["", "   "], style) == []
+
+
+def test_the_frame_gradient_has_more_than_one_tone(monkeypatch):
+    """A "gradient" that emits one colour is a border with extra steps."""
+    monkeypatch.setenv("TERM", "screen-256color")
+    monkeypatch.delenv("COLORTERM", raising=False)
+    style = ui.resolve_style("always")
+    style.depth = 256
+    out = ui.box(["a line of content wide enough to sweep across"], style, width=80)
+    tones = set(ui._ANSI_RE.findall(out[0]))
+    assert len(tones) >= 4, "top border used {} tones".format(len(tones))
+
+
+def test_eight_colour_terminals_get_a_calm_short_ramp():
+    """`TERM=screen` advertises eight colours, and that is what many sessions get.
+
+    At eight colours a ten-step gradient collapses into two or three flat blocks.
+    Bright pink in flat blocks is what "the colours are weird" was about, so the
+    eight-colour ramp is three steps in one hue family and degrades to looking
+    deliberate rather than broken.
+    """
+    style = ui.resolve_style("always")
+    style.depth = 8
+    ramp = ui.frame_ramp(style)
+    assert ramp == ["bold_cyan", "cyan", "blue"]
+    assert all("magenta" not in tone for tone in ramp)
+
+
+def test_truecolor_is_only_used_when_advertised(monkeypatch):
+    """24-bit codes at a terminal that cannot render them are visible garbage."""
+    style = ui.resolve_style("always")
+    style.depth = 256
+    monkeypatch.delenv("COLORTERM", raising=False)
+    assert all(tone.startswith("c256:") for tone in ui.frame_ramp(style))
+    monkeypatch.setenv("COLORTERM", "truecolor")
+    ramp = ui.frame_ramp(style)
+    assert all(tone.startswith("rgb:") for tone in ramp)
+    assert len(ramp) > len(ui._FRAME_RAMP_256), "truecolor should be smoother"
+
+
+def test_the_gradient_is_absent_when_colour_is_off():
+    """`--color never` and a pasted ticket get a plain frame, not a grey sweep."""
+    style = ui.resolve_style("never")
+    assert ui.frame_ramp(style) == []
+    out = ui.box(["content"], style, width=40)
+    assert "\033[" not in "".join(out)
+
+
+def test_wrapping_breaks_a_path_at_a_separator():
+    """A path split mid-token is one you can neither read nor grep for."""
+    path = "/project/rcc/youzhi/models/checkpoints/step-4000/shard-00001-of-00008"
+    pieces = ui._wrap_ansi(path, 30)
+    assert len(pieces) > 1
+    assert "".join(pieces) == path, "wrapping must not lose or add characters"
+    for piece in pieces[:-1]:
+        assert piece.endswith("/"), "broke mid-token: {!r}".format(piece)
+
+
+def test_wrapping_preserves_colour_across_the_break():
+    """An SGR run left open at a break bleeds down the rest of the report."""
+    style = ui.resolve_style("always")
+    text = style.paint("/aaaaaaaaaa/bbbbbbbbbb/cccccccccc/dddddddddd", "bold_red")
+    pieces = ui._wrap_ansi(text, 20)
+    assert len(pieces) > 1
+    for piece in pieces:
+        assert piece.startswith("\033["), piece
+        assert piece.endswith("\033[0m"), piece
+    assert ui._ANSI_RE.sub("", "".join(pieces)) == "/aaaaaaaaaa/bbbbbbbbbb/cccccccccc/dddddddddd"
+
+
+def test_wrapping_hard_breaks_a_token_with_no_separator():
+    """A single long token still has to fit inside a frame that closes."""
+    pieces = ui._wrap_ansi("z" * 90, 25)
+    assert all(ui.visible_width(p) <= 25 for p in pieces)
+    assert "".join(pieces) == "z" * 90

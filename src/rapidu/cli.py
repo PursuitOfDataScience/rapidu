@@ -23,7 +23,7 @@ import json
 import os
 import sys
 import threading
-from typing import List, Optional
+from typing import Dict, List, Optional  # noqa: F401  (`# type:` use)
 
 from . import deleted as deletedmod
 from . import quota as quotamod
@@ -145,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="treat files modified within this window as possibly unsettled (default: %(default)s)",
     )
     p.add_argument(
+        "-x",
         "--one-file-system",
         action="store_true",
         help="do not cross filesystem boundaries; use this when "
@@ -171,7 +172,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--inodes",
         action="store_true",
         help="rank by file count instead of bytes -- what an inode quota limits. "
-        "Add -c to answer it ~{:.0f}x faster, at the cost of counting a hard-linked "
+        "Add -c to answer it without stat -- ~{:.0f}x faster on GPFS, less on a "
+        "page-cached local filesystem -- at the cost of counting a hard-linked "
         "file once per name rather than once per inode.".format(walkmod.COUNT_SPEEDUP),
     )
     p.add_argument(
@@ -187,6 +189,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print only unlinked-but-open space held on this node. A PATH, if "
         "given, restricts the scan to that subtree.",
+    )
+    p.add_argument(
+        "--sort",
+        choices=("size", "files", "density"),
+        default=None,
+        metavar="KEY",
+        help="rank by size (default), file count, or density -- files per GiB. "
+        "Density is the 'what should I pack' signal: a subtree with a million "
+        "small files costs inodes and allocation padding out of proportion to its "
+        "bytes. It was implemented and reachable only through --json.",
+    )
+    p.add_argument(
+        "--no-box",
+        action="store_true",
+        help="do not draw the frame around the report. The frame is one block to "
+        "select and paste into a ticket; turn it off when piping into grep, awk "
+        "or a diff, where the borders are noise.",
     )
     p.add_argument("--no-quota", action="store_true", help="skip the quota backend")
     p.add_argument(
@@ -212,7 +231,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=quotamod.DEFAULT_TIMEOUT_S,
         metavar="SECONDS",
-        help="(default: %(default)s)",
+        help="total budget for reading quotas, across every backend tried "
+        "(default: %(default)s). Backends run in sequence, so this bounds the "
+        "whole quota step -- not each subprocess within it.",
     )
     p.add_argument(
         "--max-snapshot-age",
@@ -261,6 +282,18 @@ def _resolve_paths(raw: List[str]) -> List[str]:
         if not os.path.isdir(ap):
             sys.stderr.write("rapidu: {}: not a directory\n".format(p))
             continue
+        # A symlink to a directory has to be resolved *here*, because the two
+        # halves of this tool disagreed about what the argument was: this
+        # function admitted it (`isdir` follows symlinks) and `walk` then
+        # rejected it (`os.lstat` does not), so `rdu ~/scratch` failed outright
+        # with "is not a directory" -- the README's own second example, on the
+        # standard layout where $SCRATCH is symlinked into $HOME. `du` offers two
+        # readings, `linktest` (the link) and `linktest/` (the target), but
+        # `os.path.abspath` has already stripped the trailing slash by now, so
+        # that distinction is not recoverable and never was. Measuring the target
+        # is the only reading that answers the question anyone types this to ask.
+        if os.path.islink(ap):
+            ap = os.path.realpath(ap)
         out.append(ap)
     return out
 
@@ -276,18 +309,73 @@ def _warn_threads(requested: int) -> None:
         sys.stderr.write("rapidu: --threads {} raised to 1\n".format(requested))
 
 
+# A quota this full is the finding, whether or not a walk was asked for.
+QUOTA_ATTENTION_FRACTION = 0.90
+
+
+def _quota_needs_attention(
+    snap: "quotamod.QuotaSnapshot", paths: Optional[List[str]] = None
+) -> bool:
+    """Is any relevant quota row at/over the line, or running a grace timer?
+
+    ``rdu -Q`` used to exit 0 with a fileset at 99.9% of blocks and 92.8% of
+    files, and would have exited 0 with a grace timer already counting down --
+    ``EXIT_ATTENTION`` fired only when the backend was *unavailable*. So the one
+    invocation designed to be cheap enough to run from cron reported "fine" in
+    the two states that mean "writes are about to stop".
+    """
+    rows = []  # type: List[quotamod.QuotaRow]
+    for p in paths or []:
+        rows.extend(snap.rows_for_path(p))
+    if not rows:
+        rows = list(snap.rows)
+    for r in rows:
+        if r.grace:
+            return True
+        frac = r.usage_fraction
+        if frac is not None and frac >= QUOTA_ATTENTION_FRACTION:
+            return True
+    return False
+
+
+def _framed(lines: List[str], style: ui.Style, boxed: bool) -> str:
+    """One report, optionally inside a single frame.
+
+    The frame derives its own width from the terminal, not from ``style.width`` --
+    which ``_box_style`` has already reduced by the chrome for the renderers' sake.
+    """
+    if boxed:
+        lines = ui.box(lines, style)
+    return "\n".join(lines)
+
+
+def _box_style(color: str, ascii_only: bool, boxed: bool) -> "ui.Style":
+    """A style whose width already accounts for the frame it will sit in.
+
+    The renderers lay their columns out against ``style.width``; handing them the
+    full terminal and then adding two borders would push the widest row past the
+    edge and wrap it, which is worse than no frame at all. Reserve the chrome
+    first, so every column decision downstream is made against the space that
+    actually exists.
+    """
+    style = ui.resolve_style(color, ascii_only)
+    if boxed:
+        style.width = max(40, style.width - ui.BOX_CHROME)
+    return style
+
+
 def cmd_quota(args: argparse.Namespace) -> int:
     paths = [os.path.abspath(os.path.expanduser(p)) for p in args.paths]
     snap = quotamod.read_best(paths[0] if paths else os.getcwd(), args.quota_timeout)
     if args.as_json:
         print(json.dumps(report.to_json(None, None, snap, None, None), indent=2))
     else:
-        print(
-            "\n".join(
-                report.render_quota(snap, paths or None, ui.resolve_style(args.color, args.ascii))
-            )
-        )
-    return EXIT_OK if snap.available else EXIT_ATTENTION
+        boxed = not args.no_box
+        style = _box_style(args.color, args.ascii, boxed)
+        print(_framed(report.render_quota(snap, paths or None, style), style, boxed))
+    if not snap.available:
+        return EXIT_ATTENTION
+    return EXIT_ATTENTION if _quota_needs_attention(snap, paths) else EXIT_OK
 
 
 def cmd_deleted(args: argparse.Namespace) -> int:
@@ -298,11 +386,9 @@ def cmd_deleted(args: argparse.Namespace) -> int:
         if args.as_json:
             print(json.dumps(report.to_json(None, None, None, scan, None, args.top), indent=2))
         else:
-            print(
-                "\n".join(
-                    report.render_deleted(scan, args.top, ui.resolve_style(args.color, args.ascii))
-                )
-            )
+            boxed = not args.no_box
+            style = _box_style(args.color, args.ascii, boxed)
+            print(_framed(report.render_deleted(scan, args.top, style), style, boxed))
         if scan.files:
             rcode = EXIT_ATTENTION
     return rcode
@@ -383,14 +469,35 @@ def cmd_walk(args: argparse.Namespace) -> int:
     if args.count:
         # Nothing downstream of a stat-free walk has bytes to work with.
         args.no_settle_check = True
-    style = ui.resolve_style(args.color, args.ascii)
+    # --json is a document, not a display: it is never framed.
+    boxed = not args.no_box and not args.as_json
+    style = _box_style(args.color, args.ascii, boxed)
 
-    snap = None
     # Both of these are work the default view does not use: the quota backend
     # shells out to a site wrapper that can take seconds, and the /proc sweep
     # walks every pid on the node.
-    if full and not args.no_quota:
-        snap = quotamod.read_best(paths[0], args.quota_timeout)
+    #
+    # The quota read is per path, and memoised per path, because `read_best`
+    # explicitly chooses *the backend that can map the path it was given*. Reading
+    # once for paths[0] and reusing it meant `rdu -a ~ /scratch/lustre` picked a
+    # backend for $HOME and then reconciled the Lustre path against it -- which is
+    # precisely the multi-filesystem failure the first-success-wins fix set out to
+    # remove, reintroduced one layer up. Memoising keeps the common case (every
+    # path on one filesystem, or a site-wide wrapper) at exactly one subprocess.
+    snaps = {}  # type: Dict[str, Optional[quotamod.QuotaSnapshot]]
+
+    def quota_for(path: str) -> "Optional[quotamod.QuotaSnapshot]":
+        if args.no_quota or not full:
+            return None
+        if path not in snaps:
+            fresh = quotamod.read_best(path, args.quota_timeout)
+            # A snapshot that maps this path is specific to it; one that maps
+            # nothing is a site-wide answer and can be shared with every path.
+            snaps[path] = fresh
+            if not fresh.rows_for_path(path):
+                for other in paths:
+                    snaps.setdefault(other, fresh)
+        return snaps[path]
 
     scan = None
     if full and not args.no_deleted:
@@ -399,6 +506,7 @@ def cmd_walk(args: argparse.Namespace) -> int:
     docs = []
     rcode = EXIT_OK
     for path in paths:
+        snap = quota_for(path)
         try:
             res = _walk_with_progress(path, args, style)
         except OSError as exc:
@@ -428,8 +536,12 @@ def cmd_walk(args: argparse.Namespace) -> int:
             docs.append(report.to_json(res, settle, snap, path_scan, recs, args.top))
         elif not full:
             print(
-                "\n".join(
-                    report.render_compact(res, settle, args.top, args.inodes or args.count, style)
+                _framed(
+                    report.render_compact(
+                        res, settle, args.top, args.inodes or args.count, style, sort=args.sort
+                    ),
+                    style,
+                    boxed,
                 )
             )
         else:
@@ -438,18 +550,34 @@ def cmd_walk(args: argparse.Namespace) -> int:
                 lines.extend(report.render_quota(snap, [path], style))
             lines.extend(
                 report.render_walk(
-                    res, settle, args.top, scan=path_scan, style=style, by_inodes=args.inodes
+                    res,
+                    settle,
+                    args.top,
+                    scan=path_scan,
+                    style=style,
+                    by_inodes=args.inodes,
+                    sort=args.sort,
                 )
             )
             if path_scan.available and path_scan.files:
                 lines.extend(report.render_deleted(path_scan, args.top, style))
             if recs:
                 lines.extend(report.render_reconcile(recs, style))
-            print("\n".join(lines))
+            # One frame around the whole report -- quota, walk, /proc scan and
+            # reconciliation together -- rather than one per section. The sections
+            # are one answer to one question and they are read as a unit.
+            print(_framed(lines, style, boxed))
 
         if not res.complete or settle.moved:
             rcode = EXIT_ATTENTION
-        if any(r.verdict == rc.GAP for r in recs):
+        # INCONCLUSIVE was excluded, and on any GPFS-native or Lustre site it is
+        # the *only* verdict the vendor backends could produce, so the exit code
+        # was constant there and a cron job could not use it. It means "there is a
+        # difference I cannot rule out", which is precisely what a caller checking
+        # an exit code wants to be told.
+        if any(r.verdict in (rc.GAP, rc.INCONCLUSIVE) for r in recs):
+            rcode = EXIT_ATTENTION
+        if snap is not None and _quota_needs_attention(snap, [path]):
             rcode = EXIT_ATTENTION
 
     if args.as_json and docs:
@@ -471,6 +599,35 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.quota_only and args.deleted_only:
         parser.error("--quota-only and --deleted-only ask for different reports")
+
+    # Four values were accepted and silently did something other than what they
+    # look like. Each one disables a feature rather than adjusting it, and each
+    # did so without a word: `-d 0` printed "0 entries" and exited 0, as though
+    # the tree were empty; `--settle-window -5` pushed the cutoff into the future
+    # and turned off the unsettled-tree check that is one of the tool's four
+    # reasons to exist; `--max-dirs-per-sec -3` turned off the rate limiter on a
+    # shared filesystem. Rejecting them costs one line each and cannot be wrong:
+    # none of the four has a defensible meaning.
+    # `-i` predates `--sort` and means `--sort files`. Keeping both is right --
+    # `-i` is the flag someone reaches for when the quota says "files" -- so
+    # resolve them here rather than making every renderer take two arguments.
+    if args.sort is None:
+        args.sort = "files" if args.inodes else "size"
+    elif args.sort == "files":
+        args.inodes = True
+
+    if args.depth < 1:
+        parser.error(
+            "--depth must be at least 1 (it is how deep entries are reported, not a filter)"
+        )
+    if args.top < 0:
+        parser.error("-n must be 0 or more; 0 means every entry")
+    if args.settle_window < 0:
+        parser.error("--settle-window cannot be negative: it is a window into the past")
+    if args.max_dirs_per_sec < 0:
+        parser.error("--max-dirs-per-sec cannot be negative; 0 disables the rate limit")
+    if args.quota_timeout <= 0:
+        parser.error("--quota-timeout must be positive; use --no-quota to skip the backend")
 
     try:
         if args.quota_only:

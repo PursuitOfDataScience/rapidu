@@ -21,5 +21,7 @@ src/rapidu/_version.py
 .claude/settings.local.json
 .claude/hooks/
 
-# Local audit notes: contains real cluster paths, never publish.
+# Local audit and planning notes: both carry real cluster paths, real fileset
+# names and internal ticket statistics. Never publish -- this repo is public.
 issues.md
+features.md

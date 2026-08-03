@@ -183,6 +183,67 @@ def _run(cmd: List[str], timeout: float) -> Tuple[int, str, str]:
         return 1, "", str(exc)
 
 
+# Every spelling of a quota scope we have seen a backend publish, mapped to the
+# four this codebase reasons about. `mmlsquota -Y` publishes `USR`/`GRP`/
+# `FILESET`; `lfs quota` is asked one scope at a time and we name it ourselves;
+# the RCC wrapper prints `(user)`/`(group)`. Lowercasing `USR` yields `usr`,
+# which matched nothing, so a personal GPFS quota was compared against every
+# file in a shared tree and the candidate list blamed a group that did not
+# exist. The mapping is the fix; the point of doing it in one table is that a new
+# backend cannot reintroduce the bug by inventing a fifth spelling silently --
+# an unrecognised scope stays verbatim and `_pick_row` treats it as non-user,
+# which is the conservative direction.
+_SCOPE_ALIASES = {
+    "usr": "user",
+    "user": "user",
+    "u": "user",
+    "grp": "group",
+    "group": "group",
+    "g": "group",
+    "fileset": "fileset",
+    "filset": "fileset",
+    "prj": "project",
+    "proj": "project",
+    "project": "project",
+    "p": "project",
+}
+
+
+def _norm_scope(raw: str) -> str:
+    """A backend's spelling of a quota scope, in this codebase's vocabulary."""
+    return _SCOPE_ALIASES.get((raw or "").strip().lower(), (raw or "").strip().lower())
+
+
+def _clean_grace(raw: str) -> str:
+    """A grace field, with every backend's spelling of "not in grace" removed.
+
+    ``lfs`` prints ``-``, GPFS prints ``none`` and the RCC wrapper prints
+    ``none`` too. Passing any of those through would make
+    :func:`report.render_quota` paint "! IN GRACE, - left", which is worse than
+    saying nothing: it is the only warning in the tool that means *writes are
+    about to stop*, so a false positive spends the one alarm that matters.
+    """
+    g = (raw or "").strip()
+    if g.lower() in ("", "-", "none", "0", "n/a"):
+        return ""
+    return g
+
+
+def _budget(timeout: float, deadline: Optional[float]) -> float:
+    """How long one subprocess may run: its own timeout, capped by the deadline.
+
+    ``read_best`` may run six subprocesses (``quota``, ``mmlsquota``, ``lfs
+    project``, and ``lfs quota`` once per scope). Giving each the full timeout
+    made the worst case their *sum* -- 225s of silence at the 45s default, 270s
+    when a project id is found -- with no spinner, before the walk has started.
+    A hanging ``lfs quota`` is not exotic; it is what a Lustre client does when an
+    MDS is degraded, which is the same afternoon someone reaches for this tool.
+    """
+    if deadline is None:
+        return timeout
+    return max(0.0, min(timeout, deadline - time.time()))
+
+
 def _guess_mount(fileset: str) -> Optional[str]:
     """Best-effort mount for a fileset named without an explicit mount line.
 
@@ -287,6 +348,31 @@ def _mounts_for(name: str, table: Optional[Dict[str, List[str]]] = None) -> List
     return [guess] if os.path.isdir(guess) else []
 
 
+def _enclosing_mount(target: str, fstypes: Tuple[str, ...], path: str = "/proc/mounts") -> str:
+    """The longest mount point of one of ``fstypes`` that contains ``target``.
+
+    Used only as a fallback: when a backend's own output does not name the
+    filesystem's mount point, the kernel still does. Returns ``""`` when nothing
+    matches, so the caller degrades to "unmapped" rather than to a guess.
+    """
+    target = os.path.abspath(target)
+    best = ""
+    try:
+        with open(path) as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) < 3 or fields[2] not in fstypes:
+                    continue
+                point = fields[1].replace("\\040", " ").replace("\\011", "\t")
+                stem = point.rstrip("/") or "/"
+                covers = target == stem or target.startswith(stem.rstrip("/") + "/")
+                if covers and len(stem) > len(best):
+                    best = stem
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return best
+
+
 def _host_tokens() -> List[str]:
     host = socket.gethostname().lower()
     return [t for t in re.split(r"[^a-z0-9]+", host) if len(t) >= 4]
@@ -335,7 +421,9 @@ def _disambiguate_mounts(rows: List[QuotaRow]) -> None:
                 )
 
 
-def read_quota_command(timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapshot:
+def read_quota_command(
+    timeout: float = DEFAULT_TIMEOUT_S, deadline: Optional[float] = None
+) -> QuotaSnapshot:
     """Parse ``quota -s``, including site wrappers that print a table.
 
     Handles the tabular form used by RCC's ``systool.quota9`` wrapper:
@@ -348,7 +436,7 @@ def read_quota_command(timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapshot:
     supply the mount point for the rows beneath them.
     """
     snap = QuotaSnapshot("quota -s")
-    rc, out, err = _run(["quota", "-s"], timeout)
+    rc, out, err = _run(["quota", "-s"], _budget(timeout, deadline))
     snap.raw = out
     if rc == 127:
         snap.reason = "`quota` is not on PATH"
@@ -425,7 +513,12 @@ def _parse_quota_row(line: str, mount: Optional[str]) -> Optional[QuotaRow]:
         return None
     soft = conv(nums[1])
     hard = conv(nums[2])
-    grace = nums[3] if len(nums) > 3 else ""
+    # Normalised at the parser, not at each consumer. The site wrapper prints the
+    # literal word "none" when no timer is running, and a truthiness test on that
+    # string reads as "in grace" -- which is how a 2.9%-full home came to set
+    # EXIT_ATTENTION. One backend spelling "not in grace" as a non-empty string is
+    # enough to poison every consumer, so none of them should have to know.
+    grace = _clean_grace(nums[3] if len(nums) > 3 else "")
     guessed = mount is None
     resolved = mount or _guess_mount(fileset)
     return QuotaRow(fileset, kind, scope, used, soft, hard, grace, resolved, guessed)
@@ -460,43 +553,80 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
                 return None
             return v * 1024 if kib else v
 
+        table = read_mount_table()
+        pending = None  # type: Optional[str]
         for nxt in lines[i + 1 :]:
             parts = nxt.split()
-            if len(parts) < 7 or not parts[0].startswith("/"):
+            if not parts:
                 break
-            if len(parts) == 7:
-                bidx, fidx = 1, 4
-            elif len(parts) >= 9:
-                bidx, fidx = 1, 5
-            else:
+            # `quota` wraps a long device name onto its own line and indents the
+            # figures onto the next. Requiring name-and-numbers on one line lost
+            # every row at sites whose device names are long, which is most NFS.
+            if len(parts) == 1 and parse_size(parts[0].rstrip("*")) is None:
+                pending = parts[0]
                 continue
-            fs = parts[0]
-            blocks = block_bytes(parts[bidx])
-            bsoft = block_bytes(parts[bidx + 1])
-            bhard = block_bytes(parts[bidx + 2])
+            if pending is not None:
+                fs, nums = pending, parts
+                pending = None
+            else:
+                fs, nums = parts[0], parts[1:]
+            # A data row is 6 figures, or 8 when both grace timers are printed.
+            # The end of the table is anything else. The previous test -- "the
+            # first column starts with /" -- rejected the whole table at any site
+            # whose device is `server:/export` or `//host/share`, i.e. every NFS
+            # and CIFS mount, before a single number was read.
+            if len(nums) == 6:
+                bidx, fidx, bgrace, fgrace = 0, 3, "", ""
+            elif len(nums) >= 8:
+                bidx, fidx, bgrace, fgrace = 0, 4, nums[3], nums[7]
+            else:
+                break
+            blocks = block_bytes(nums[bidx])
+            bsoft = block_bytes(nums[bidx + 1])
+            bhard = block_bytes(nums[bidx + 2])
+            if blocks is None:
+                break
             files = None  # type: Optional[int]
             fsoft = None  # type: Optional[int]
             fhard = None  # type: Optional[int]
             try:
-                files = int(parts[fidx].rstrip("*"))
-                fsoft = int(parts[fidx + 1])
-                fhard = int(parts[fidx + 2])
+                files = int(nums[fidx].rstrip("*"))
+                fsoft = int(nums[fidx + 1])
+                fhard = int(nums[fidx + 2])
             except ValueError:
                 files = fsoft = fhard = None
-            mount = fs if os.path.isdir(fs) else None
-            if blocks is not None:
-                rows.append(
-                    QuotaRow(fs, "blocks", "user", blocks, bsoft or None, bhard or None, "", mount)
+            # The first column of stock `quota` is a *device*, never a directory,
+            # so testing it with `isdir` mapped nothing and every correctly
+            # parsed row was dropped for want of a mount. /proc/mounts is keyed
+            # by exactly that string and already knows the answer.
+            mounts = list(table.get(fs) or [])
+            guessed = False
+            if not mounts and os.path.isdir(fs):
+                mounts = [os.path.abspath(fs)]
+            if not mounts:
+                inferred = _guess_mount(fs)
+                if inferred:
+                    mounts = [inferred]
+                    guessed = True
+            mount = mounts[0] if mounts else None
+            for kind, used, soft, hard, grace in (
+                ("blocks", blocks, bsoft, bhard, _clean_grace(bgrace)),
+                ("files", files, fsoft, fhard, _clean_grace(fgrace)),
+            ):
+                if used is None:
+                    continue
+                row = QuotaRow(
+                    fs, kind, "user", used, soft or None, hard or None, grace, mount, guessed
                 )
-            if files is not None:
-                rows.append(
-                    QuotaRow(fs, "files", "user", files, fsoft or None, fhard or None, "", mount)
-                )
+                row.mounts = list(mounts)
+                rows.append(row)
         break
     return rows
 
 
-def read_mmlsquota(path: str, timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapshot:
+def read_mmlsquota(
+    path: str, timeout: float = DEFAULT_TIMEOUT_S, deadline: Optional[float] = None
+) -> QuotaSnapshot:
     """GPFS ``mmlsquota -Y``, reporting every filesystem it knows about.
 
     Not present on every GPFS site (it is frequently root-only or simply not
@@ -510,7 +640,7 @@ def read_mmlsquota(path: str, timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapsh
     """
     snap = QuotaSnapshot("mmlsquota")
     table = read_mount_table()
-    rc, out, err = _run(["mmlsquota", "-Y"], timeout)
+    rc, out, err = _run(["mmlsquota", "-Y"], _budget(timeout, deadline))
     snap.raw = out
     if rc != 0 or not out.strip():
         snap.reason = err.strip() or "mmlsquota unavailable (rc={})".format(rc)
@@ -536,29 +666,46 @@ def read_mmlsquota(path: str, timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapsh
         except (TypeError, ValueError):
             continue
         name = rec.get("filesystemName", "?")
-        scope = (rec.get("quotaType", "") or "").lower()
-        mounts = _mounts_for(name, table)
+        scope = _norm_scope(rec.get("quotaType", ""))
+        # A fileset-scoped row is named by its fileset, not by the filesystem;
+        # `filesetName` is what distinguishes two labs sharing one mount.
+        if scope == "fileset":
+            name = rec.get("filesetName", "") or name
+        mounts = _mounts_for(rec.get("filesystemName", "?"), table)
         mount = mounts[0] if mounts else None
-        for kind, used, soft, hard in (
-            ("blocks", block_used, block_soft, block_hard),
-            ("files", file_used, file_soft, file_hard),
+        block_grace = _clean_grace(rec.get("blockGrace", ""))
+        file_grace = _clean_grace(rec.get("filesGrace", ""))
+        for kind, used, soft, hard, grace in (
+            ("blocks", block_used, block_soft, block_hard, block_grace),
+            ("files", file_used, file_soft, file_hard, file_grace),
         ):
-            row = QuotaRow(name, kind, scope, used, soft or None, hard or None, "", mount)
+            row = QuotaRow(name, kind, scope, used, soft or None, hard or None, grace, mount)
             row.mounts = list(mounts)
             snap.rows.append(row)
     snap.available = bool(snap.rows)
+    # `mmlsquota` is a live query, not a cached report, so the figure is as
+    # current as the filesystem's own accounting. Leaving `taken_at` unset made
+    # `age_seconds` None, which permanently tripped reconcile's "published no
+    # timestamp" blocker: on a GPFS-native site every verdict was downgraded to
+    # INCONCLUSIVE and `GAP` -- with it `EXIT_ATTENTION` -- was unreachable.
+    if snap.available:
+        snap.taken_at = snap.read_at
+        snap.time_note = (
+            "read live from mmlsquota; GPFS quota accounting itself can lag "
+            "writes by up to a minute, so treat a small difference as timing"
+        )
     if not snap.available:
         snap.reason = "mmlsquota returned no parseable rows"
     return snap
 
 
-def _lfs_project_id(path: str, timeout: float) -> Optional[str]:
+def _lfs_project_id(path: str, timeout: float, deadline: Optional[float] = None) -> Optional[str]:
     """The Lustre project id ``path`` is charged to, if it carries one.
 
     ``lfs project -d <dir>`` prints ``<projid> <flags> <path>``. Project id 0 is
     "no project", which is not a quota worth asking about.
     """
-    rc, out, _ = _run(["lfs", "project", "-d", path], timeout)
+    rc, out, _ = _run(["lfs", "project", "-d", path], _budget(timeout, deadline))
     if rc != 0:
         return None
     parts = out.split()
@@ -568,48 +715,80 @@ def _lfs_project_id(path: str, timeout: float) -> Optional[str]:
 
 
 def _parse_lfs_rows(out: str, scope: str, path: str) -> List[QuotaRow]:
-    """The one data line under Lustre's ``Filesystem ... kbytes`` header."""
+    """The one data line under Lustre's ``Filesystem ... kbytes`` header.
+
+    Two things here were wrong and both produced a confident wrong answer.
+
+    **The mount point.** The queried path was stored as the row's mount, so
+    ``reconcile``'s test for "does this walk cover the whole quota'd tree"
+    (``root == row.mount``) was true by construction. The ``SUBTREE`` verdict --
+    the one that exists precisely to say *you walked a subdirectory of a much
+    larger quota'd filesystem, the difference is expected* -- became unreachable
+    on Lustre, and every ``rdu -a <subdir>`` reported the rest of the filesystem
+    as a difference needing explanation. ``lfs`` publishes the filesystem's own
+    mount point in the first column; that is what a mount point is.
+
+    **Wrapped rows.** ``lfs`` wraps when the filesystem path is long, putting the
+    name on its own line and the eight numbers on the next. Requiring nine
+    fields on one line meant those sites parsed to zero rows -- no quota at all,
+    reported as "could not parse", on precisely the paths whose names are long
+    enough to wrap.
+    """
     rows = []  # type: List[QuotaRow]
     lines = [ln for ln in out.splitlines() if ln.strip()]
     for i, line in enumerate(lines):
         if "Filesystem" not in line or "kbytes" not in line:
             continue
-        if i + 1 >= len(lines):
+        rest = lines[i + 1 :]
+        if not rest:
             break
-        parts = lines[i + 1].split()
-        if len(parts) >= 9:
-            try:
-                rows.append(
-                    QuotaRow(
-                        parts[0],
-                        "blocks",
-                        scope,
-                        int(parts[1].rstrip("*")) * 1024,
-                        int(parts[2]) * 1024 or None,
-                        int(parts[3]) * 1024 or None,
-                        "",
-                        path,
-                    )
+        parts = rest[0].split()
+        # The unwrapped form is name + 8 numbers. The wrapped form is the name
+        # alone, then the 8 numbers; `lfs` indents the continuation line.
+        if len(parts) == 1 and len(rest) > 1:
+            fsname = parts[0]
+            parts = [fsname] + rest[1].split()
+        if len(parts) < 9:
+            break
+        fsname = parts[0]
+        # `lfs` names the filesystem by its mount point. Fall back to the kernel
+        # when it does not, and to nothing at all when neither can say -- an
+        # unmapped row is honest, a row mounted at the walk root is not.
+        mount = fsname if fsname.startswith("/") else _enclosing_mount(path, ("lustre",))
+        try:
+            rows.append(
+                QuotaRow(
+                    os.path.basename(mount.rstrip("/")) or fsname,
+                    "blocks",
+                    scope,
+                    int(parts[1].rstrip("*")) * 1024,
+                    int(parts[2]) * 1024 or None,
+                    int(parts[3]) * 1024 or None,
+                    _clean_grace(parts[4]),
+                    mount or None,
                 )
-                rows.append(
-                    QuotaRow(
-                        parts[0],
-                        "files",
-                        scope,
-                        int(parts[5].rstrip("*")),
-                        int(parts[6]) or None,
-                        int(parts[7]) or None,
-                        "",
-                        path,
-                    )
+            )
+            rows.append(
+                QuotaRow(
+                    os.path.basename(mount.rstrip("/")) or fsname,
+                    "files",
+                    scope,
+                    int(parts[5].rstrip("*")),
+                    int(parts[6]) or None,
+                    int(parts[7]) or None,
+                    _clean_grace(parts[8]),
+                    mount or None,
                 )
-            except ValueError:
-                pass
+            )
+        except ValueError:
+            pass
         break
     return rows
 
 
-def read_lfs_quota(path: str, timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapshot:
+def read_lfs_quota(
+    path: str, timeout: float = DEFAULT_TIMEOUT_S, deadline: Optional[float] = None
+) -> QuotaSnapshot:
     """Lustre quotas for ``path``: user, group, and -- crucially -- project.
 
     Reading only ``-u`` was wrong in the case that matters. **Lustre project
@@ -632,13 +811,13 @@ def read_lfs_quota(path: str, timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapsh
         scopes.append(("group", ["-g", grp.getgrgid(os.getgid()).gr_name]))
     except (ImportError, KeyError, OSError):
         pass
-    projid = _lfs_project_id(path, timeout)
+    projid = _lfs_project_id(path, timeout, deadline)
     if projid:
         scopes.append(("project", ["-p", projid]))
 
     failures = []  # type: List[str]
     for scope, flags in scopes:
-        rc, out, err = _run(["lfs", "quota"] + flags + [path], timeout)
+        rc, out, err = _run(["lfs", "quota"] + flags + [path], _budget(timeout, deadline))
         if not snap.raw:
             snap.raw = out
         if rc != 0 or not out.strip():
@@ -647,6 +826,14 @@ def read_lfs_quota(path: str, timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapsh
         snap.rows.extend(_parse_lfs_rows(out, scope, path))
 
     snap.available = bool(snap.rows)
+    # A live query, like mmlsquota: see the note there for why leaving this unset
+    # made `GAP` unreachable on every Lustre site.
+    if snap.available:
+        snap.taken_at = snap.read_at
+        snap.time_note = (
+            "read live from lfs quota; Lustre accounting is updated "
+            "asynchronously by the OSTs, so treat a small difference as timing"
+        )
     if not snap.available:
         snap.reason = "; ".join(failures) or "could not parse `lfs quota` output"
     return snap
@@ -667,14 +854,22 @@ def read_best(path: str, timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapshot:
     So a backend wins by mapping the path the caller actually asked about. A
     backend that merely produced rows is kept only as the fallback, which is
     still the right answer for ``-Q`` with no path.
+
+    ``timeout`` is the budget for **all** of this, not for each subprocess within
+    it. Backends run in sequence and one of them may run several commands, so a
+    per-call timeout made the worst case their sum: 225s of silence at the 45s
+    default, before the walk has started and with no spinner running.
     """
     attempts = []  # type: List[QuotaSnapshot]
     fallback = None  # type: Optional[QuotaSnapshot]
+    deadline = time.time() + timeout
     for reader in (
-        lambda: read_quota_command(timeout),
-        lambda: read_mmlsquota(path, timeout),
-        lambda: read_lfs_quota(path, timeout),
+        lambda: read_quota_command(timeout, deadline),
+        lambda: read_mmlsquota(path, timeout, deadline),
+        lambda: read_lfs_quota(path, timeout, deadline),
     ):
+        if _budget(timeout, deadline) <= 0 and attempts:
+            break
         snap = reader()
         attempts.append(snap)
         if not snap.available:
@@ -689,4 +884,6 @@ def read_best(path: str, timeout: float = DEFAULT_TIMEOUT_S) -> QuotaSnapshot:
     merged.reason = "; ".join(
         "{}: {}".format(a.source, a.reason or "unavailable") for a in attempts
     )
+    if _budget(timeout, deadline) <= 0:
+        merged.reason += "; the {:.0f}s quota budget was exhausted".format(timeout)
     return merged

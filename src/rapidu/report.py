@@ -7,18 +7,29 @@ Two rules govern everything printed here:
   of both, so a reader can see whether the comparison was safe.
 """
 
+import grp
 import os
 import pwd
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple  # noqa: F401  (`# type:` use)
 
 from . import reconcile as rc
 from . import ui
+from . import walk as walkmod
 from .deleted import DeletedScan
 from .fmt import files_per_gib, human_bytes, human_count, human_duration, pct
 from .quota import QuotaSnapshot
 from .walk import SettleCheck, WalkResult
 
-_RULE = "-" * 78
+
+def _section_rule(style: "ui.Style") -> str:
+    """A section divider in the same glyph and grey as the table's own rule.
+
+    Was a hard-coded 78 ASCII dashes, which ignored both the terminal width and
+    the ``--ascii`` glyph decision -- so a unicode report carried one unicode rule
+    and one ASCII one.
+    """
+    glyph = "\u2500" if style.unicode else "-"
+    return style.paint(glyph * max(20, min(78, style.width - 1)), style.track)
 
 
 def _uname(uid: int) -> str:
@@ -26,6 +37,13 @@ def _uname(uid: int) -> str:
         return pwd.getpwuid(uid).pw_name
     except KeyError:
         return str(uid)
+
+
+def _gname(gid: int) -> str:
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
 
 
 def _counter(n: Optional[int]) -> str:
@@ -58,14 +76,39 @@ def render_quota(
         out.append(style.paint("  ? " + snap.time_note, "yellow"))
 
     rows = snap.rows
+    unmapped = []  # type: List[str]
     if paths:
         keep = []
         for p in paths:
-            for r in snap.rows_for_path(p):
+            found = snap.rows_for_path(p)
+            if not found:
+                unmapped.append(p)
+            for r in found:
                 if r not in keep:
                     keep.append(r)
         if keep:
             rows = keep
+    # Falling through to *all* rows when a path mapped nothing printed thirty
+    # rows for eight filesystems, none of which governed the path asked about,
+    # with nothing to say so -- and it looked authoritative. The reconciler says
+    # the honest thing in exactly this situation; `-Q` said nothing.
+    for p in unmapped:
+        out.append(
+            style.paint(
+                "  ? no quota row maps to {}{}".format(
+                    p,
+                    " -- every row is shown below instead" if not rows or rows is snap.rows else "",
+                ),
+                "yellow",
+            )
+        )
+
+    # Two filesets on one mount render identically without this: the mount column
+    # cannot disambiguate a collision that is *on* one mount, and the scope column
+    # is what separates a user row from a group row for the same fileset -- which
+    # is every Lustre reading, where user, group and project all come back at once.
+    width = max([16] + [len(r.fileset) for r in rows]) if rows else 16
+    width = min(width, 40)
 
     for r in rows:
         used = human_count(r.used) if r.kind == "files" else human_bytes(r.used)
@@ -83,19 +126,26 @@ def render_quota(
         elif frac is not None and frac >= 0.75:
             tone = "yellow"
         bar = ui.bar(frac if frac is not None else 0.0, 10, style, accent=tone, min_tick=False)
+        # A bar clamps at full, so 100% and 450% drew identically. Over the limit
+        # is the one state the bar cannot express, so it gets a mark of its own.
+        over = style.paint(" OVER", "red") if frac is not None and frac > 1.0 else ""
         grace = ""
         if r.grace and r.grace.lower() not in ("none", "-", ""):
             # An expired soft limit stops writes; it cannot sit in a quiet column.
             grace = style.paint("  ! IN GRACE, {} left".format(r.grace), "red")
         out.append(
-            "  {}  {}  {}  {}  {}  {}{}".format(
-                style.paint("{:<16}".format(r.fileset[:16]), "bold"),
+            "  {}  {}  {}  {}  {}{}  {}{}".format(
+                style.paint(
+                    "{:<{w}}".format(ui.truncate(r.fileset, width), w=width),
+                    "bold",
+                ),
+                style.paint("{:<7}".format((r.scope or "?")[:7]), "dim"),
                 style.paint("{:<6}".format(r.kind), "dim"),
                 "{:>11} / {:<11}".format(used, soft),
                 bar,
                 style.paint("{:>6}".format(pct(frac, 1.0) if frac is not None else "n/a"), tone),
                 style.paint(r.mount or "?", "dim"),
-                grace,
+                over + grace,
             )
         )
 
@@ -105,10 +155,207 @@ def render_quota(
     return out
 
 
+# Directories whose contents are a cache, an artifact tree, or a working set
+# nobody meant to keep, mapped to the command that reclaims them.
+#
+# This is the highest-value pattern table in the package and the reason is in the
+# ticket record: hidden dotfiles are the single largest staff-named cause (82
+# tickets), with container caches (18) and conda/pip caches (12) as separate
+# entries on the same list. A walker sees all of them by construction -- it is
+# already standing in the directory -- so recognising them costs a dict lookup and
+# closes the three biggest classes at once.
+#
+# `None` means "review this yourself": `wandb/` and `mlruns/` are often the
+# experiment record somebody needs, and the tool has no business implying
+# otherwise.
+_RECLAIMABLE = (
+    ("conda/pkgs", "conda clean -a"),
+    ("mamba/pkgs", "conda clean -a"),
+    ("cache/pip", "pip cache purge"),
+    ("cache/huggingface/hub", "huggingface-cli delete-cache"),
+    ("cache/huggingface", "huggingface-cli delete-cache"),
+    ("cache/torch", "rm -rf ~/.cache/torch"),
+    ("cache/uv", "uv cache clean"),
+    ("apptainer/cache", "apptainer cache clean"),
+    ("singularity/cache", "singularity cache clean"),
+    ("nv/ComputeCache", "safe to delete"),
+    ("local/share/Trash", "safe to delete"),
+    ("node_modules", "safe to delete and reinstall"),
+    ("__pycache__", "safe to delete"),
+    (".mypy_cache", "safe to delete"),
+    (".ruff_cache", "safe to delete"),
+    (".pytest_cache", "safe to delete"),
+    (".git/objects", "git gc --aggressive --prune=now"),
+    ("wandb", None),
+    ("mlruns", None),
+    ("lightning_logs", None),
+    ("jupyter/runtime", None),
+)
+
+
+def _reclaimable_match(path: str) -> Optional[Tuple[str, Optional[str]]]:
+    """The reclaim rule for a path, if one applies. Longest pattern wins."""
+    normalised = path.replace(os.sep, "/").lstrip("/")
+    best = None  # type: Optional[Tuple[str, Optional[str]]]
+    for pattern, command in _RECLAIMABLE:
+        stem = pattern.lstrip(".")
+        hit = normalised.endswith("/" + pattern) or normalised.endswith("/." + stem)
+        if hit and (best is None or len(pattern) > len(best[0])):
+            best = (pattern, command)
+    return best
+
+
+def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
+    """Directories in this tree that are caches, grouped by what reclaims them.
+
+    Suggests; never deletes, and never offers to. The tool's authority comes from
+    being a measurement instrument, and one that also removes things is one nobody
+    runs on a full filesystem at 2 a.m. Printing the command is strictly more
+    useful than running it, because the reader can read it first.
+
+    **Grouped by pattern, not listed per directory.** A home directory with
+    twenty-five git repositories produced twenty-five ``.git/objects`` rows each
+    repeating the same ``git gc``, which buried the one 2 GiB model cache that was
+    the actual answer. One line per *kind* of reclaimable thing, with its total and
+    its largest few examples, is the same information in the order it is useful.
+    """
+    groups = {}  # type: Dict[str, List[Tuple[int, int, str]]]
+    commands = {}  # type: Dict[str, Optional[str]]
+    matched = []  # type: List[Tuple[str, int, int, str]]
+
+    # `res.watched` carries these at any depth; `dir_agg` only reaches the reported
+    # depth and would miss every one of them on a default run.
+    candidates = [(path, size, n) for path, (size, n) in res.watched.items()]
+    candidates += [
+        (e.path, e.size, e.inodes) for e in res.dir_agg.values() if e.is_dir and e.path != res.root
+    ]
+    seen = set()  # type: Set[str]
+    for path, size, inodes in candidates:
+        if path in seen:
+            continue
+        match = _reclaimable_match(path)
+        if match is None:
+            continue
+        seen.add(path)
+        matched.append((path, size, inodes, match[0]))
+        commands[match[0]] = match[1]
+
+    # A nested match sits inside its parent's total already, so reporting both
+    # counts the same bytes twice.
+    paths = {m[0] for m in matched}
+    for path, size, inodes, pattern in matched:
+        if any(other != path and path.startswith(other + os.sep) for other in paths):
+            continue
+        groups.setdefault(pattern, []).append((size, inodes, path))
+    if not groups:
+        return []
+
+    ranked = sorted(groups.items(), key=lambda kv: sum(v[0] for v in kv[1]), reverse=True)
+    out = ["", ui.heading("RECLAIMABLE", style)]
+    out.extend(
+        _wrapped(
+            "caches and build artifacts, listed not asserted -- read each command "
+            "before you run it",
+            style,
+            "  ",
+        )
+    )
+    total = 0
+    for pattern, hits in ranked[:6]:
+        hits.sort(reverse=True)
+        size = sum(h[0] for h in hits)
+        inodes = sum(h[1] for h in hits)
+        total += size
+        # One hit names the actual directory; several name the pattern and count.
+        # Printing the *pattern* for a single hit dropped the one thing the reader
+        # needs -- which directory it is -- in favour of restating the rule.
+        if len(hits) == 1:
+            label = os.path.relpath(hits[0][2], res.root)
+        else:
+            label = "{}x {}".format(len(hits), pattern)
+        out.append(
+            "  {:>10}  {:>10} files  {}".format(
+                style.paint(human_bytes(size), "bold"), human_count(inodes), label
+            )
+        )
+        command = commands.get(pattern)
+        out.append(
+            style.paint("              {}".format(command or "review before deleting"), "cyan")
+        )
+        if len(hits) > 1:
+            examples = ", ".join(
+                "{} ({})".format(os.path.relpath(h[2], res.root), human_bytes(h[0]))
+                for h in hits[:2]
+            )
+            out.extend(_wrapped("largest: " + examples, style, "              "))
+    if len(ranked) > 6:
+        out.append(style.paint("  ... and {} more kinds".format(len(ranked) - 6), "dim"))
+    share = " ({} of the tree)".format(pct(total / float(res.size), 1.0)) if res.size else ""
+    out.append(style.paint("  {} reclaimable in total{}".format(human_bytes(total), share), "dim"))
+    return out
+
+
+def render_age(res: WalkResult, style: ui.Style) -> List[str]:
+    """Bytes and inodes by how long ago they were last modified.
+
+    For a quota that is full, "what is big" is not the actionable question -- the
+    biggest thing is usually the thing being worked on. "What is big *and* has not
+    been touched in a year" is, and it is the question this histogram answers.
+
+    Regular files only. Directories are a handful of bytes each and their mtime
+    tracks their *contents* changing, so bucketing them would count the same event
+    twice and add nothing to either column.
+    """
+    if res.count_only or not any(size or inodes for size, inodes in res.by_age):
+        return []
+    peak = max(size for size, _inodes in res.by_age) or 1
+    out = ["", ui.heading("BY AGE", style), style.paint("  last modified, regular files", "dim")]
+    for label, (size, inodes) in zip(walkmod.AGE_BUCKET_LABELS, res.by_age):
+        share = size / float(res.size) if res.size else 0.0
+        out.append(
+            "  {:<8}{:>10}  {}  {:>6}  {:>10} files".format(
+                label,
+                human_bytes(size),
+                ui.bar(size / float(peak), 12, style, accent=style.heat(size / float(peak))),
+                pct(share, 1.0),
+                human_count(inodes),
+            )
+        )
+    # Whichever of the two is material, because either can be the binding limit
+    # and they do not move together. On a tree that has not settled the byte column
+    # is legitimately all zeros -- GPFS has not allocated the blocks yet, which is
+    # the phenomenon `render_settle` reports -- and the inode count is still the
+    # whole story. Gating this sentence on bytes alone meant the cold-data finding
+    # vanished on exactly the freshly-written trees people run this against.
+    cold_bytes, cold_inodes = res.by_age[-1]
+    byte_share = cold_bytes / float(res.size) if res.size else 0.0
+    inode_share = cold_inodes / float(res.inodes) if res.inodes else 0.0
+    if byte_share >= 0.05 or inode_share >= 0.05:
+        if byte_share >= inode_share:
+            measure = "{} ({})".format(human_bytes(cold_bytes), pct(byte_share, 1.0))
+        else:
+            measure = "{} files ({})".format(human_count(cold_inodes), pct(inode_share, 1.0))
+        out.extend(
+            _wrapped(
+                "{} has not been modified in over a year. On a full quota that is "
+                "the first place to look, and it is invisible to a size-only "
+                "listing.".format(measure),
+                style,
+                "  ",
+            )
+        )
+    return out
+
+
 def render_entries(
-    res: WalkResult, top: int, by_inodes: bool, style: ui.Style, indent: str = "  "
+    res: WalkResult,
+    top: int,
+    by_inodes: bool,
+    style: ui.Style,
+    indent: str = "  ",
+    sort: str = "",
 ) -> List[str]:
-    """The ranked table: size, proportional bar, share of tree, inodes, path.
+    """The ranked table: size, proportional bar, share of the total, inodes, path.
 
     Sizes are cumulative subtree totals, so any row agrees with ``du -s`` on that
     path. Plain files appear alongside directories -- three 63 MiB ``.db`` files
@@ -126,7 +373,8 @@ def render_entries(
     # it is the wrong answer, presented with the authority of the right one.
     # -n 0 means "all of them", not "none".
     limit = top if top > 0 else 10**9
-    ranked = res.top_dirs(limit, "files" if by_inodes else "size", finished_only=res.partial)
+    key = sort or ("files" if by_inodes else "size")
+    ranked = res.top_dirs(limit, key, finished_only=res.partial)
     if not ranked:
         return []
 
@@ -279,10 +527,14 @@ _FIXED_COLS = 2 + 10 + 2 + 2 + 6 + 2 + 9 + 2
 def _entries_rule(style: ui.Style, names: List[str], indent: str = "  ") -> str:
     """A hairline between the header and the table, sized to the table.
 
-    One dim rule is enough structure to separate the two blocks; a box would be
-    heavier than a du replacement warrants and breaks when pasted into a ticket.
+    One dim rule separates the header from the table. It is drawn in the same
+    near-background grey as the bar tracks and the outer frame, so the three read
+    as one piece of structure rather than three competing ones.
+
     Sized to the widest row rather than to the terminal, because a rule running
-    forty characters past the last column looks like a mistake.
+    forty characters past the last column looks like a mistake. That also means it
+    is *narrower* than the frame around it, which is deliberate: the frame bounds
+    the report, the rule divides one section of it.
     """
     glyph = "\u2500" if style.unicode else "-"
     widest = max([len(n) for n in names] or [8])
@@ -296,7 +548,7 @@ def _entries_header(
     style: ui.Style,
     indent: str = "  ",
     size_label: str = "size",
-    bar_label: str = "of tree",
+    bar_label: str = "share",
     ranked_by_files: bool = False,
 ) -> str:
     """Column labels, with the one the table is sorted by marked.
@@ -316,6 +568,13 @@ def _entries_header(
     The last column is ``path``, not ``name`` and not ``directory``. ``name`` said
     nothing -- every column is the name of something -- and ``directory`` would be
     a lie, because plain files are ranked here too.
+
+    ``share`` labels the bar, and the percentage beside it goes unlabelled, because
+    they are one column in two forms -- the picture and the number. The bar used to
+    be headed ``of tree``, which put ``size  of tree`` next to each other and read
+    as the phrase "size of tree": a description of the whole row, which is not what
+    either word was doing there. Two headers for one measurement was the actual
+    mistake; naming it once, over the wider of its two forms, fixes it.
     """
     size_tone = "dim" if ranked_by_files else "bold"
     files_tone = "bold" if ranked_by_files else "dim"
@@ -324,7 +583,7 @@ def _entries_header(
         indent,
         head,
         style.paint("{:<{}}".format(bar_label, _BAR_W), "dim"),
-        style.paint("{:>6}".format("share"), "dim"),
+        " " * 6,
         style.paint("{:>9}".format("files"), files_tone),
         style.paint("path", "dim"),
     )
@@ -404,15 +663,25 @@ def _header(style: ui.Style, headline: str, path: str, subtitle: str) -> List[st
         if parent and leaf
         else style.paint(path, "bold")
     )
+    # Both lines start at the same column. The size used to be right-justified in
+    # a ten-wide field with the subtitle indented to sit under the *path*, which
+    # aligned the second line with the wrong thing: it left a number at column 3
+    # and the line below it starting at column 15, reading as an indent with no
+    # reason behind it. Flush left, the two lines are visibly one block.
     return [
-        "{}   {}".format(style.paint(headline.rjust(10), "bold_cyan"), subject),
-        "{}   {}".format(" " * 10, subtitle),
+        "{}   {}".format(style.paint(headline, "bold_cyan"), subject),
+        subtitle,
         "",
     ]
 
 
 def render_compact(
-    res: WalkResult, settle: SettleCheck, top: int, by_inodes: bool, style: ui.Style
+    res: WalkResult,
+    settle: SettleCheck,
+    top: int,
+    by_inodes: bool,
+    style: ui.Style,
+    sort: str = "",
 ) -> List[str]:
     """The default view: how big is this tree, and what is big inside it.
 
@@ -446,8 +715,8 @@ def render_compact(
             human_bytes(res.size),
             res.root,
             style.paint(
-                "PARTIAL \u2014 {} files scanned before the interrupt".format(
-                    human_count(res.inodes)
+                "PARTIAL {} {} files scanned before the interrupt".format(
+                    ui.dash(style), human_count(res.inodes)
                 ),
                 "yellow",
             ),
@@ -469,7 +738,7 @@ def render_compact(
     out.extend(_hard_warnings(res, settle, style))
     out.extend(render_allocation(res, style))
     hint = _count_hint(res, by_inodes, style)
-    body = render_entries(res, top, by_inodes, style)
+    body = render_entries(res, top, by_inodes, style, sort=sort)
     if body:
         out.append(_entries_rule(style, _entry_names(res, top, by_inodes)))
         out.append(
@@ -478,7 +747,7 @@ def render_compact(
                 size_label="" if res.count_only else "size",
                 # An interrupted walk has no total to be a share of, so the bar
                 # falls back to ranking against the largest row and says so.
-                bar_label="of largest" if res.partial else "of tree",
+                bar_label="vs largest" if res.partial else "share",
                 ranked_by_files=bool(by_inodes or res.count_only),
             )
         )
@@ -504,12 +773,20 @@ def _count_hint(res: WalkResult, by_inodes: bool, style: ui.Style) -> List[str]:
     """
     if not by_inodes or res.count_only or res.partial or res.elapsed < _HINT_AFTER_S:
         return []
+    # No predicted runtime. The old form divided this walk's elapsed time by
+    # COUNT_SPEEDUP and printed the quotient as "(Ns here)", which turned a
+    # constant measured on cold GPFS into a forecast for whatever filesystem is
+    # actually in front of the user. Re-measured across three: 8.5x on a large
+    # GPFS tree, 2.1x on a page-cached local one, 1.6x on a small warm GPFS tree
+    # -- so the prediction was out by -74% and -80% on two of the three. The
+    # ratio is a property of the filesystem's stat latency, not of this tool, and
+    # Constraint 18 applies to a number synthesised from a measurement as much as
+    # to one invented outright. Name where it was measured; promise nothing here.
     return [
         style.paint(
-            "  hint: -i -c answers this ~{:.0f}x faster ({:.0f}s here) by skipping stat; "
-            "a hard-linked file then counts once per name, not once per inode.".format(
-                walk_speedup(), res.elapsed / walk_speedup()
-            ),
+            "  hint: -i -c answers this without stat -- measured ~{:.0f}x faster on GPFS, "
+            "less on a page-cached local filesystem; a hard-linked file then counts "
+            "once per name, not once per inode.".format(walk_speedup()),
             "dim",
         )
     ]
@@ -583,6 +860,7 @@ def render_walk(
     scan: Optional[DeletedScan] = None,
     style: Optional[ui.Style] = None,
     by_inodes: bool = False,
+    sort: str = "",
 ) -> List[str]:
     """The walk block of the full report: headline, then facts worth a line each.
 
@@ -628,11 +906,17 @@ def render_walk(
         # "none visible", not "none": this scan sees neither other users'
         # processes nor any compute node. See `render_deleted`.
         facts.append(
-            "no unlinked-but-open space visible ({} of {} pids inspectable, this node only)".format(
-                scan.scanned_pids, scan.scanned_pids + scan.unreadable_pids
+            "no unlinked-but-open space visible ({} of {} pids inspectable, {})".format(
+                scan.scanned_pids,
+                scan.scanned_pids + scan.unreadable_pids,
+                "this PID namespace only" if scan.namespaced else "this node only",
             )
         )
-    out.append(style.paint("  " + "  ".join(facts), "dim"))
+    # Packed onto as many lines as it takes, not forced onto one. Joined raw this
+    # reached 230 columns with every fact present -- it overflowed an 80-column
+    # terminal long before there was a frame to break, and inside one it is the
+    # line that breaks it. Packed by fact, so no fact is ever split in half.
+    out.extend(_packed(facts, style, "  "))
 
     out.extend(_hard_warnings(res, settle, style, settling=False))
     out.extend(render_allocation(res, style, indent="    "))
@@ -648,7 +932,7 @@ def render_walk(
 
     if show_uids and len(res.by_uid) > 1:
         out.append("")
-        out.append(style.paint("  owners (a group quota charges all of these):", "dim"))
+        out.append(style.paint("  owners:", "dim"))
         for uid, (size, inodes) in sorted(
             res.by_uid.items(), key=lambda kv: kv[1][0], reverse=True
         )[:6]:
@@ -657,8 +941,23 @@ def render_walk(
                     _uname(uid), human_bytes(size), human_count(inodes)
                 )
             )
+    # The uid table used to be captioned "a group quota charges all of these",
+    # which is the wrong table: a group quota is charged by **gid**. The two
+    # diverge exactly when it matters -- a file written into a shared project
+    # directory whose setgid bit is missing is charged to the writer's personal
+    # group, where nobody is looking for it.
+    if show_uids and len(res.by_gid) > 1:
+        out.append(style.paint("  groups (a group quota charges these):", "dim"))
+        for gid, (size, inodes) in sorted(
+            res.by_gid.items(), key=lambda kv: kv[1][0], reverse=True
+        )[:6]:
+            out.append(
+                "      {:<16}{:>12}  {:>12} files".format(
+                    _gname(gid), human_bytes(size), human_count(inodes)
+                )
+            )
 
-    body = render_entries(res, top, by_inodes, style)
+    body = render_entries(res, top, by_inodes, style, sort=sort)
     if body:
         out.append(_entries_rule(style, _entry_names(res, top, by_inodes)))
         out.append(
@@ -667,11 +966,15 @@ def render_walk(
                 size_label="" if res.count_only else "size",
                 # An interrupted walk has no total to be a share of, so the bar
                 # falls back to ranking against the largest row and says so.
-                bar_label="of largest" if res.partial else "of tree",
+                bar_label="vs largest" if res.partial else "share",
                 ranked_by_files=bool(by_inodes or res.count_only),
             )
         )
         out.extend(body)
+    # Only in the full report. `rdu .` is asked how big a tree is, not for an
+    # audit -- the same reason the quota and /proc sections sit behind -a.
+    out.extend(render_age(res, style))
+    out.extend(render_reclaimable(res, style))
     return out
 
 
@@ -796,6 +1099,31 @@ def allocation_is_material(res: WalkResult) -> bool:
     return ratio >= _ALLOC_RATIO or ratio <= 1.0 / _ALLOC_RATIO
 
 
+def _packed(items: List[str], style: "ui.Style", indent: str, sep: str = "  ") -> List[str]:
+    """Pack whole items onto as few lines as fit, never splitting one.
+
+    Word-wrapping this line was the obvious thing and it was wrong: each fact is
+    a unit -- ``apparent 23.4 MiB (2.0x allocated)`` states a number *and* what it
+    means, and a break between them leaves a bare figure on one line and a
+    parenthetical on the next, which is the exact confusion the fact was reworded
+    to remove. Packing at item boundaries keeps every fact whole and still fits
+    the width.
+    """
+    width = max(40, style.width - len(indent) - 1)
+    lines = []  # type: List[str]
+    current = ""
+    for item in items:
+        candidate = item if not current else current + sep + item
+        if current and ui.visible_width(candidate) > width:
+            lines.append(current)
+            current = item
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return [style.paint(indent + line, "dim") for line in lines]
+
+
 def _wrapped(text: str, style: ui.Style, indent: str, tone: str = "dim") -> List[str]:
     """Soft-wrap a prose line to the terminal, painting each line separately.
 
@@ -839,8 +1167,8 @@ def render_allocation(res: WalkResult, style: ui.Style, indent: str = "  ") -> L
     out = []  # type: List[str]
 
     if ratio >= 1.0:
-        head = "{} allocated for {} of data — {:.1f}x".format(
-            human_bytes(res.size), human_bytes(res.apparent), ratio
+        head = "{} allocated for {} of data {} {:.1f}x".format(
+            human_bytes(res.size), human_bytes(res.apparent), ui.dash(style), ratio
         )
         out.append(ui.warn(head + ". Your quota is charged the first number.", style))
         if res.padded_files and unit:
@@ -862,9 +1190,9 @@ def render_allocation(res: WalkResult, style: ui.Style, indent: str = "  ") -> L
     else:
         out.extend(
             _wrapped(
-                "{} of data stored in {} — {:.2f}x. These files are sparse,"
+                "{} of data stored in {} {} {:.2f}x. These files are sparse,"
                 " compressed, or small enough to live in their inodes.".format(
-                    human_bytes(res.apparent), human_bytes(res.size), ratio
+                    human_bytes(res.apparent), human_bytes(res.size), ui.dash(style), ratio
                 ),
                 style,
                 indent,
@@ -897,7 +1225,7 @@ def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] =
     does this one -- and here the headline figure is genuinely an alarm, because
     it is quota being charged for something no walker can show you."""
     style = style or ui.resolve_style("never")
-    out = ["", ui.heading("UNLINKED BUT STILL OPEN", style), style.paint(_RULE, "dim")]
+    out = ["", ui.heading("UNLINKED BUT STILL OPEN", style), _section_rule(style)]
     if not scan.available:
         out.append("  n/a - {}".format(scan.reason))
         return out
@@ -910,8 +1238,12 @@ def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] =
         # there" is not what was measured.
         out.append(
             style.paint(
-                "  none found in the {} of {} processes this scan can inspect".format(
-                    scan.scanned_pids, scan.scanned_pids + scan.unreadable_pids
+                "  none found in the {} of {} processes this scan can inspect{}".format(
+                    scan.scanned_pids,
+                    scan.scanned_pids + scan.unreadable_pids,
+                    " -- and that total is this PID namespace only, not the node"
+                    if scan.namespaced
+                    else "",
                 ),
                 "dim",
             )
@@ -947,7 +1279,13 @@ def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] =
             out.append("                  {}".format(f.path))
         if len(scan.files) > top:
             out.append(style.paint("      ... and {} more".format(len(scan.files) - top), "dim"))
-    scope = ["", "  scope: this node only, {} processes inspected".format(scan.scanned_pids)]
+    scope = [
+        "",
+        "  scope: {}, {} processes inspected".format(
+            "this PID namespace only" if scan.namespaced else "this node only",
+            scan.scanned_pids,
+        ),
+    ]
     if scan.unreadable_pids:
         scope.append(
             "         {} processes belong to other users and cannot be inspected".format(
@@ -955,6 +1293,18 @@ def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] =
             )
         )
         scope.append("         without root, so this figure is a floor.")
+    # The denominator is whatever /proc showed, and /proc shows only the current
+    # PID namespace. Under Apptainer, Docker or a Slurm cgroup with proc
+    # remounted, "1 of 1 processes" is a 100%-coverage sentence produced from a
+    # namespace holding one process, on a node running fourteen hundred. Honest
+    # about EACCES, blind to this -- so the count needs the qualifier, not just
+    # the `complete` flag.
+    if scan.namespaced:
+        scope.append("         /proc shows only this PID namespace (container or cgroup), so")
+        scope.append("         that count is not the node's process count and the coverage")
+        scope.append("         above cannot be read as node-wide.")
+    if scan.timed_out:
+        scope.append("         The sweep was abandoned early: " + scan.reason)
     scope.append("         A job holding a deleted file on a compute node is not visible here.")
     out.extend(style.paint(ln, "dim") if ln else ln for ln in scope)
     return out
@@ -995,15 +1345,25 @@ def render_reconcile(recs: List[rc.Reconciliation], style: Optional[ui.Style] = 
                 )
             )
             for b in r.blockers:
-                out.append(style.paint("      caveat: " + b, "dim"))
+                out.extend(_wrapped("caveat: " + b, style, "      "))
             continue
 
         if r.verdict == rc.SUBTREE:
             out.append("  {}  {}".format(label, style.paint(rc.verdict_line(r), "dim")))
+            # `reconcile` builds a note here that names the fileset, the mount and
+            # the scope the figure came from -- "the rcc quota covers /project
+            # (group-scoped); this walk covers only /project/dachxiu/x, so the
+            # difference is expected" -- and this branch used to `continue` past
+            # it. SUBTREE is the most common verdict on a real cluster, so the one
+            # line that says *which* quota you are being measured against was the
+            # one line never printed, on nearly every run. It is also what makes a
+            # tie broken between two filesets on one mount visible at all.
+            for n in r.notes:
+                out.extend(_wrapped(n, style, "      "))
             # Only ever populated when the subtree exceeds the whole quota
             # figure, which is a real puzzle rather than an expected difference.
             for c in r.candidates:
-                out.append(style.paint("      possible cause (not asserted): " + c, "dim"))
+                out.extend(_wrapped("possible cause (not asserted): " + c, style, "      "))
             continue
 
         tone = "yellow" if r.verdict == rc.INCONCLUSIVE else "red"
@@ -1029,9 +1389,9 @@ def render_reconcile(recs: List[rc.Reconciliation], style: Optional[ui.Style] = 
         for b in r.blockers:
             out.append(style.paint("      cannot call this a finding: " + b, "dim"))
         for c in r.candidates:
-            out.append(style.paint("      possible cause (not asserted): " + c, "dim"))
+            out.extend(_wrapped("possible cause (not asserted): " + c, style, "      "))
         for n in r.notes:
-            out.append(style.paint("      " + n, "dim"))
+            out.extend(_wrapped(n, style, "      "))
     return out
 
 
@@ -1048,7 +1408,10 @@ def to_json(
     recs: Optional[List[rc.Reconciliation]],
     top: int = 10,
 ) -> Dict[str, Any]:
-    doc = {"tool": "rapidu"}  # type: Dict[str, Any]
+    # A version on the document, so a consumer can branch on shape instead of
+    # probing for keys. Bumped when a key changes meaning or disappears, not when
+    # one is added.
+    doc = {"tool": "rapidu", "schema": 1}  # type: Dict[str, Any]
 
     if snap is not None:
         doc["quota"] = {
@@ -1057,6 +1420,11 @@ def to_json(
             "reason": snap.reason or None,
             "snapshot_age_seconds": snap.age_seconds,
             "snapshot_taken_at": snap.taken_at,
+            # The two caveats a human reader is shown and a machine consumer was
+            # not: the timezone-suspicion warning and the reasons some rows could
+            # not be tied to a path.
+            "time_note": snap.time_note or None,
+            "mapping_notes": snap.mapping_notes(),
             "rows": [
                 {
                     "fileset": r.fileset,
@@ -1067,6 +1435,8 @@ def to_json(
                     "hard": r.hard,
                     "grace": r.grace or None,
                     "mount": r.mount,
+                    "mounts": list(r.mounts),
+                    "mount_guessed": r.guessed,
                 }
                 for r in snap.rows
             ],
@@ -1099,14 +1469,29 @@ def to_json(
             "unstatable_entries": res.unstatable,
             "interrupted": res.partial,
             "by_uid": {_uname(u): {"bytes": b, "inodes": i} for u, (b, i) in res.by_uid.items()},
+            "by_gid": {_gname(g): {"bytes": b, "inodes": i} for g, (b, i) in res.by_gid.items()},
+            "by_age": [
+                {"bucket": label, "bytes": b, "inodes": i}
+                for label, (b, i) in zip(walkmod.AGE_BUCKET_LABELS, res.by_age)
+            ],
+            # Paths, not just the count. A consumer that knows three directories
+            # were unreadable cannot act on it; one that knows *which* can.
+            "unreadable_dir_paths": [p for p, _why in res.unreadable_dirs[:64]],
+            "recent_bytes": res.recent_size,
             "filesystems": len(res.by_dev),
+            # `finished_only=res.partial`, exactly as `render_entries` does. One
+            # result object must not have two honesty policies: these three keys
+            # exist to be ranked on, and on an interrupted walk they published
+            # subtrees the text renderer refuses to show -- /usr/lib64 at 17% of
+            # its real size, /usr/mpi at 0 bytes -- with "interrupted": true
+            # sitting three keys above, where a ranking consumer never looks.
             "top_by_size": [
                 {"path": a.path, "bytes": a.size, "inodes": a.inodes}
-                for a in res.top_dirs(top, "size")
+                for a in res.top_dirs(top, "size", finished_only=res.partial)
             ],
             "top_by_inodes": [
                 {"path": a.path, "bytes": a.size, "inodes": a.inodes}
-                for a in res.top_dirs(top, "files")
+                for a in res.top_dirs(top, "files", finished_only=res.partial)
             ],
             "top_by_density": [
                 {
@@ -1115,7 +1500,7 @@ def to_json(
                     "inodes": a.inodes,
                     "files_per_gib": files_per_gib(a.size, a.inodes),
                 }
-                for a in res.top_dirs(top, "density")
+                for a in res.top_dirs(top, "density", finished_only=res.partial)
             ],
         }
 
@@ -1146,6 +1531,11 @@ def to_json(
             "unreadable_pids": scan.unreadable_pids,
             "complete": scan.complete,
             "node_local_only": True,
+            # A consumer computing coverage from scanned_pids needs to know the
+            # denominator is namespace-scoped, and that the sweep may have been
+            # cut short -- neither is inferable from the counts alone.
+            "pid_namespaced": scan.namespaced,
+            "timed_out": scan.timed_out,
             "files": [
                 {
                     "path": f.path,

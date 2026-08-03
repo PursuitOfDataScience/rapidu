@@ -18,7 +18,7 @@ gap with candidate explanations listed -- never as an accusation.
 """
 
 import os
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import walk as walkmod
 from .deleted import DeletedScan
@@ -83,15 +83,83 @@ def _tolerance(quota_value: int, kind: str) -> int:
     return max(frac, MIN_TOLERANCE_BYTES)
 
 
-def _pick_row(rows: List[QuotaRow], kind: str) -> Optional[QuotaRow]:
-    """Prefer a user-scoped row; a group row measures more than one person."""
+def _fileset_hint(path: str, mount: str) -> str:
+    """The fileset ``path`` most likely belongs to: its first component below ``mount``.
+
+    GPFS *independent filesets* are the standard way to give each lab its own
+    quota inside one filesystem, and they all share one mount point. On this
+    cluster ``/project`` carries three, and the convention -- near-universal
+    because it is the only one that scales to a directory listing -- is that the
+    fileset is the first path component beneath the mount: ``/project/dachxiu``
+    is the ``dachxiu`` fileset.
+
+    This is a *hint*, not an assertion. It is used only to break a tie between
+    rows that all match the path equally well, and it loses to nothing: when it
+    matches no row, the previous ordering stands.
+    """
+    target = os.path.abspath(path)
+    stem = (mount or "").rstrip("/")
+    if not stem or not target.startswith(stem + "/"):
+        return ""
+    return target[len(stem) + 1 :].split(os.sep)[0]
+
+
+# Scope preference when several rows govern one path. A user row measures exactly
+# the person asking; a project row measures the allocation a shared directory is
+# charged against; a group or fileset row measures everybody. Narrowest first.
+_SCOPE_RANK = {"user": 0, "project": 1, "fileset": 2, "group": 3}
+
+
+def _pick_row(
+    rows: List[QuotaRow], kind: str, path: str = ""
+) -> Tuple[Optional[QuotaRow], List[str]]:
+    """The row that governs ``path``, and any note about how it was chosen.
+
+    ``rows_for_path`` returns *every* row tied for the longest matching mount.
+    Taking ``matching[0]`` meant parse order decided, so a user whose own fileset
+    was at 99.9% could be reconciled against a sibling lab's 31%-full one and
+    told their tree was a rounding error. Ties are now broken by the fileset the
+    path actually sits in, then by how narrowly the row is scoped, and a tie
+    broken on anything less than the fileset name says so out loud.
+    """
     matching = [r for r in rows if r.kind == kind]
     if not matching:
-        return None
+        return None, []
+    if len(matching) == 1:
+        return matching[0], []
+
+    hint = ""
     for r in matching:
-        if r.scope == "user":
-            return r
-    return matching[0]
+        hint = _fileset_hint(path, r.mount or "") or hint
+        if hint:
+            break
+    named = [r for r in matching if hint and r.fileset.lower() == hint.lower()]
+    pool = named or matching
+    best = min(pool, key=lambda r: (_SCOPE_RANK.get(r.scope, 4), pool.index(r)))
+
+    notes = []  # type: List[str]
+    others = [r for r in matching if r is not best]
+    if named:
+        if len(named) > 1:
+            notes.append(
+                "{} {} rows govern {} equally; reconciled against the {}-scoped "
+                "one because {} is the fileset this path sits in".format(
+                    len(named), kind, path, best.scope or "un", best.fileset
+                )
+            )
+    else:
+        notes.append(
+            "{} {} quota rows govern this path equally ({}); reconciled against "
+            "'{}' because it is the most narrowly scoped, not because it is known "
+            "to be the right one -- confirm with `mmlsattr --get-fileset` or "
+            "`lfs project -d`".format(
+                len(matching),
+                kind,
+                ", ".join(sorted({r.fileset for r in others} | {best.fileset})),
+                best.fileset,
+            )
+        )
+    return best, notes
 
 
 def reconcile(
@@ -114,7 +182,8 @@ def reconcile(
         return rec
 
     rows = snap.rows_for_path(res.root)
-    row = _pick_row(rows, kind)
+    row, pick_notes = _pick_row(rows, kind, res.root)
+    rec.notes.extend(pick_notes)
     if row is None:
         rec.notes.append(
             "no {} quota row maps to {} -- the backend published no mount point "

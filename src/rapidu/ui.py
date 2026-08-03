@@ -13,6 +13,7 @@ than no colour at all.
 import os
 import re
 import sys
+import unicodedata
 from typing import List, Optional, Sequence, Tuple
 
 _RESET = "\033[0m"
@@ -203,6 +204,13 @@ _BAR_FULL_ASCII, _BAR_EMPTY_ASCII = "#", "-"
 # sub-cell tail on a hatched bar is invisible and only costs alignment.
 _BAR_HATCH, _BAR_HATCH_ASCII = "▒", ":"
 
+# Every non-ASCII character this module can emit, in one string, so the
+# capability probe in `_supports_unicode` tests exactly what will be printed. A
+# probe that checked a subset would clear a stream that then crashed on the
+# glyph it had not been asked about -- which is how U+00B7 escaped the em-dash
+# fix. `_SPIN` is appended where it is defined, below.
+_GLYPHS = _BAR_FULL + _BAR_EMPTY + "".join(_BAR_PARTIALS) + _BAR_HATCH + "—·─"
+
 
 class Style:
     """Resolved presentation settings for one run."""
@@ -220,6 +228,8 @@ class Style:
         for name in styles:
             if name.startswith("c256:"):
                 parts.append("\033[38;5;{}m".format(name[5:]))
+            elif name.startswith("rgb:"):
+                parts.append("\033[38;2;{}m".format(name[4:].replace(",", ";")))
             else:
                 parts.append(_CODES.get(name, ""))
         prefix = "".join(parts)
@@ -276,10 +286,30 @@ class Style:
 
 
 def _supports_unicode(stream) -> bool:
-    enc = getattr(stream, "encoding", None) or ""
-    if "utf" in enc.lower():
+    """Can this stream actually encode the glyph set?
+
+    **The stream's own encoding is decisive, and it is the only thing that is.**
+    Falling back to ``LC_ALL``/``LANG`` when the encoding was not UTF meant the
+    environment could promise what the stream could not deliver, and every such
+    disagreement ends in a ``UnicodeEncodeError`` traceback mid-report:
+
+    * ``LC_ALL=C.UTF-8`` on Python 3.6 -- the interpreter this package advertises
+      as its floor -- leaves ``sys.stdout.encoding`` at ``ANSI_X3.4-1968`` while
+      the environment says utf, so the separator ``U+00B7`` crashed.
+    * ``PYTHONIOENCODING=ascii`` does the same on any version.
+
+    Asking the stream directly, with an encode probe as the arbiter, cannot
+    disagree with itself. A stream that reports no encoding at all (a plain
+    ``StringIO`` under test) accepts anything, so it is treated as capable.
+    """
+    enc = getattr(stream, "encoding", None)
+    if not enc:
         return True
-    return "utf" in (os.environ.get("LC_ALL") or os.environ.get("LANG") or "").lower()
+    try:
+        _GLYPHS.encode(enc)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
 
 
 def resolve_style(mode: str = "auto", ascii_only: bool = False, stream=None) -> Style:
@@ -406,6 +436,283 @@ def dash(style: Style) -> str:
     return "\u2014" if style.unicode else "--"
 
 
+# Escape sequences occupy no columns. Any width arithmetic done on a painted
+# string is wrong by the length of its escapes -- which is how a bar drawn from
+# `len()` ends up ragged -- so every measurement below goes through
+# `visible_width`, never `len`.
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+# What the frame costs a line: "| " on the left and " |" on the right.
+BOX_CHROME = 4
+
+# A frame narrower than this is not worth drawing around anything.
+_MIN_INNER = 20
+
+
+def visible_width(text: str) -> int:
+    """Columns ``text`` occupies on a terminal.
+
+    Three things make this different from ``len``: SGR escapes are invisible,
+    combining marks attach to the previous cell rather than taking their own, and
+    East Asian wide characters take two. The last matters here because a path is
+    user data -- a directory named in Chinese or Japanese is perfectly ordinary,
+    and measuring it with ``len`` puts the right-hand border one column short per
+    character.
+    """
+    plain = _ANSI_RE.sub("", text)
+    width = 0
+    for ch in plain:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+# The frame's gradient, as anchor colours it is interpolated between: pale ice ->
+# cyan -> blue -> indigo. Only used where the terminal can render 24-bit colour,
+# where the sweep comes out genuinely smooth rather than banded.
+_FRAME_ANCHORS = ((207, 246, 255), (34, 211, 238), (59, 130, 246), (99, 102, 241))
+
+# The same sweep quantised to the xterm-256 cube: pale cyan -> cyan -> azure ->
+# blue -> deep blue. Twelve steps is as smooth as that cube gets in one hue
+# family, so this bands a little; there is nothing to be done about it at 256.
+_FRAME_RAMP_256 = (195, 159, 123, 87, 51, 45, 39, 33, 27, 21, 20, 19)
+
+# Eight colours. This is the one that matters most in practice and it is the one
+# with no room: `TERM=screen`, `TERM=xterm` and most tmux defaults advertise eight,
+# so this is what a great many sessions actually get.
+#
+# Three steps in a single hue family, not a sweep through several. A six-step
+# magenta-to-cyan version was tried and it is what "the colours are weird" was
+# about: with eight colours a ten-step gradient collapses into two or three flat
+# blocks, and two flat blocks of bright pink around a disk-usage report do not read
+# as a gradient -- they read as a mistake. Cyan to blue degrades honestly, because
+# even when it flattens to one tone it still looks like a deliberate border.
+_FRAME_RAMP_8 = ("bold_cyan", "cyan", "blue")
+
+# How many steps to quantise the truecolor sweep into. Fine enough that the bands
+# are invisible, coarse enough that runs of equal colour still group into one
+# escape sequence instead of one per column.
+_FRAME_TRUECOLOR_STEPS = 24
+
+
+def truecolor() -> bool:
+    """Does the terminal advertise 24-bit colour?
+
+    Only ``COLORTERM``, which is the one signal that means it. ``TERM`` says
+    ``screen`` or ``xterm-256color`` on plenty of terminals that do support it and
+    on plenty that do not, and emitting 24-bit codes at one that cannot renders
+    them as visible garbage.
+    """
+    return os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit")
+
+
+def _lerp_anchors(position: float) -> str:
+    """A tone from the anchor list at ``position`` in 0..1, linearly blended."""
+    span = len(_FRAME_ANCHORS) - 1
+    scaled = max(0.0, min(1.0, position)) * span
+    low = min(span, int(scaled))
+    high = min(span, low + 1)
+    fraction = scaled - low
+    channels = [
+        int(
+            round(
+                _FRAME_ANCHORS[low][i]
+                + (_FRAME_ANCHORS[high][i] - _FRAME_ANCHORS[low][i]) * fraction
+            )
+        )
+        for i in range(3)
+    ]
+    return "rgb:{},{},{}".format(*channels)
+
+
+def frame_ramp(style: Style) -> List[str]:
+    """Tones for the frame gradient, lightest first, or empty when colour is off."""
+    if not style.color:
+        return []
+    if style.depth >= 256 and truecolor():
+        steps = _FRAME_TRUECOLOR_STEPS
+        return [_lerp_anchors(i / float(steps - 1)) for i in range(steps)]
+    if style.depth >= 256:
+        return ["c256:{}".format(code) for code in _FRAME_RAMP_256]
+    return list(_FRAME_RAMP_8)
+
+
+def box(lines: List[str], style: Style, width: Optional[int] = None) -> List[str]:
+    """Wrap already-rendered lines in a single frame.
+
+    Rounded corners and a **diagonal colour sweep** around the perimeter: hue
+    advances with ``x + y``, so the top-left corner is the lightest point and the
+    bottom-right the deepest, the way a highlight falls across a glossy surface.
+    Painting it per character would cost an escape sequence per column, so runs of
+    equal tone are emitted as one -- about ten escapes per border rather than
+    eighty.
+
+    The border carries no label. A version string in the top edge was tried and
+    read as packaging rather than measurement -- it is the first thing the eye
+    lands on and the last thing anyone needs from a disk-usage report.
+
+    ``width`` is the **total** frame width including both borders, defaulting to
+    the terminal. It is a parameter rather than a read of ``style.width`` because
+    the caller has already reduced that for the renderers (see
+    ``cli._box_style``): consulting it here subtracted the chrome a second time and
+    left the frame four columns narrower than the space it had. Both halves now
+    derive from :func:`terminal_width`, so they cannot disagree.
+
+    **The frame always closes.** Every content line sits between two borders, on
+    every row, at every terminal width. That is the one property a frame has to
+    have: a border that stops halfway down the report is not a frame, it is a
+    rendering bug that looks like one.
+
+    Closure is what decides the other two questions. Because a line too wide for
+    the frame is *wrapped* rather than allowed to run past it, the frame can be
+    sized to the terminal without anything overrunning -- so it never gets
+    soft-wrapped by the terminal itself, which is the other way a border comes
+    apart. And because wrapping preserves the whole line, nothing is truncated: the
+    path column is the answer being asked for, and dropping its tail to make a
+    border meet would be trading the measurement for the chrome.
+    """
+    if style.unicode:
+        top_l, top_r, bot_l, bot_r, horiz, vert = (
+            "\u256d",
+            "\u256e",
+            "\u2570",
+            "\u256f",
+            "\u2500",
+            "\u2502",
+        )
+    else:
+        top_l = top_r = bot_l = bot_r = "+"
+        horiz, vert = "-", "|"
+
+    body = list(lines)
+    # The frame supplies the separation that leading and trailing blank lines
+    # were there to provide.
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    if not body:
+        return []
+
+    total = terminal_width() if width is None else width
+    inner = max(_MIN_INNER, total - BOX_CHROME)
+    widest = max(visible_width(line) for line in body)
+    if widest < inner:
+        # Nothing needs the full width, so hug the content instead of floating a
+        # half-empty frame out to the terminal edge.
+        inner = max(widest, _MIN_INNER)
+
+    # Wrap first, then measure: the row count is what the vertical half of the
+    # gradient is computed from, and wrapping changes it.
+    rows = []  # type: List[str]
+    for line in body:
+        rows.extend(_wrap_ansi(line, inner))
+
+    total_w = inner + BOX_CHROME
+    total_h = len(rows) + 2
+    ramp = frame_ramp(style)
+
+    def tone_at(x: int, y: int) -> str:
+        """Hue for one frame cell, sweeping diagonally from top-left."""
+        if not ramp:
+            return style.track
+        across = x / float(total_w - 1) if total_w > 1 else 0.0
+        down = y / float(total_h - 1) if total_h > 1 else 0.0
+        position = 0.5 * across + 0.5 * down
+        return ramp[min(len(ramp) - 1, max(0, int(position * len(ramp))))]
+
+    def sweep(text: str, y: int) -> str:
+        """Paint a horizontal border run, grouping equal tones into one escape."""
+        parts = []  # type: List[str]
+        buffered = []  # type: List[str]
+        current = None  # type: Optional[str]
+        for x, char in enumerate(text):
+            tone = tone_at(x, y)
+            if current is not None and tone != current:
+                parts.append(style.paint("".join(buffered), current))
+                buffered = []
+            current = tone
+            buffered.append(char)
+        if buffered and current is not None:
+            parts.append(style.paint("".join(buffered), current))
+        return "".join(parts)
+
+    out = [sweep(top_l + horiz * (inner + 2) + top_r, 0)]
+    for row, line in enumerate(rows):
+        y = row + 1
+        left = style.paint(vert, tone_at(0, y))
+        right = style.paint(vert, tone_at(total_w - 1, y))
+        out.append(left + " " + line + " " * (inner - visible_width(line)) + " " + right)
+    out.append(sweep(bot_l + horiz * (inner + 2) + bot_r, total_h - 1))
+    return out
+
+
+def _wrap_ansi(text: str, width: int) -> List[str]:
+    """Split ``text`` into runs of at most ``width`` visible columns.
+
+    Colour makes this more than ``textwrap``. An SGR run has to be closed at the
+    end of each piece and reopened at the start of the next, or the colour of a
+    wrapped row bleeds across the border and down the rest of the report; the
+    break has to be measured in visible columns, which is not where ``len`` would
+    put it; and breaking mid-escape would emit a partial sequence and print raw
+    bytes.
+
+    **Breaks after a path separator, or at a space, before it breaks mid-token.**
+    A first version broke wherever the column ran out, which split
+    ``.../test_a_directory_named0/quota`` into ``...quot`` and ``a`` -- a path you
+    can neither read nor grep for, which is most of what a path is for. Slashes are
+    where a path is *meant* to come apart, so they are tried first; a space is the
+    fallback for prose; and a token with neither still has to fit, so it is cut.
+    """
+    if visible_width(text) <= width or width <= 0:
+        return [text]
+
+    pieces = []  # type: List[str]
+    buffered = []  # type: List[str]
+    active = ""  # the SGR prefix in force, reopened on each continuation
+    cut = -1  # index in `buffered` to break at, exclusive
+    drop = 0  # buffered items to discard at the break (the space itself)
+    index = 0
+
+    def emit(upto: int) -> None:
+        pieces.append("".join(buffered[:upto]) + (_RESET if active else ""))
+
+    while index < len(text):
+        match = _ANSI_RE.match(text, index)
+        if match:
+            sequence = match.group(0)
+            buffered.append(sequence)
+            active = "" if sequence == _RESET else active + sequence
+            index = match.end()
+            continue
+        char = text[index]
+        if unicodedata.combining(char):
+            char_w = 0
+        else:
+            char_w = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if visible_width("".join(buffered)) + char_w > width and buffered:
+            if cut > 0:
+                emit(cut)
+                carry = buffered[cut + drop :]
+            else:
+                emit(len(buffered))
+                carry = []
+            buffered = ([active] if active else []) + carry
+            cut, drop = -1, 0
+        if char == " ":
+            # Break before the space and discard it: a line must not start with one.
+            cut, drop = len(buffered), 1
+        buffered.append(char)
+        if char == os.sep:
+            # Break after the separator and keep it, so the path reads as a path.
+            cut, drop = len(buffered), 0
+        index += 1
+    if buffered:
+        emit(len(buffered))
+    return [piece for piece in pieces if _ANSI_RE.sub("", piece).strip()] or [""]
+
+
 def truncate(text: str, width: int) -> str:
     """Shorten to ``width``, keeping the tail, which is the distinguishing part.
 
@@ -418,19 +725,8 @@ def truncate(text: str, width: int) -> str:
     return "..." + text[-(width - 3) :]
 
 
-def rule(style: Style, width: Optional[int] = None) -> str:
-    return style.paint("-" * (width or style.width), "dim")
-
-
 def heading(text: str, style: Style) -> str:
     return style.paint(text, "bold")
-
-
-def key_value(label: str, value: str, style: Style, label_width: int = 20) -> str:
-    return "  {}  {}".format(
-        style.paint(label.ljust(label_width), "dim"),
-        value,
-    )
 
 
 def warn(text: str, style: Style) -> str:
@@ -439,24 +735,6 @@ def warn(text: str, style: Style) -> str:
 
 def alarm(text: str, style: Style) -> str:
     return style.paint("! " + text, "red")
-
-
-def ok(text: str, style: Style) -> str:
-    return style.paint(text, "green")
-
-
-def columns(rows: List[List[str]], aligns: str) -> List[str]:
-    """Lay out plain (already-uncoloured) cells into aligned columns."""
-    if not rows:
-        return []
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-    out = []
-    for r in rows:
-        cells = []
-        for i, cell in enumerate(r):
-            cells.append(cell.rjust(widths[i]) if aligns[i] == "r" else cell.ljust(widths[i]))
-        out.append(" ".join(cells).rstrip())
-    return out
 
 
 # --------------------------------------------------------------------------
@@ -614,6 +892,9 @@ def _paint_prose(text: str, style: Style, names: frozenset = frozenset()) -> str
 # is for the same terminals that get ASCII bars.
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SPIN_ASCII = "|/-\\"
+# Complete the probe set now that the spinner frames exist. Braille is outside
+# latin-1, so a stream that can encode the bars may still not encode these.
+_GLYPHS += _SPIN
 
 # A walk shorter than this finishes before a human registers the spinner, and
 # painting one would only produce a flicker.

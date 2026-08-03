@@ -49,13 +49,28 @@ Same total as `du`, to the byte. That is checked on every commit.
 ## Reading the table
 
 ```
-      size  of tree              share      files  path
- 661.5 GiB  █████▋░░░░░░░░░░░░   31.9%        350  checkpoints/
- 343.8 GiB  ██▊░░░░░░░░░░░░░░░   16.6%        968  datasets/
- 470.9 GiB  ▒▒▒▒▒▒▒▒░░░░░░░░░░   22.9%      4,117  (84 more — use -n 0 for all)
+╭───────────────────────────────────────────────────────────────────────────────────╮
+│ 1.4 TiB   /project/lab/shared                                                     │
+│ 5,435 files  ·  87 entries  ·  4.12s                                              │
+│                                                                                   │
+│   ──────────────────────────────────────────────────────                          │
+│         size  share                           files  path                         │
+│    661.5 GiB  █████▏░░░░░░░░░░░░   31.9%        350  checkpoints/                 │
+│    343.8 GiB  ██▊░░░░░░░░░░░░░░░   16.6%        968  datasets/                    │
+│    470.9 GiB  ▒▒▒▒▒▒▒▒░░░░░░░░░░   22.9%      4,117  (84 more — use -n 0 for all) │
+╰───────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-The bar is share of the whole tree, so it always agrees with the number beside
-it. The hatched row is everything not listed. The column you sorted by is the one
-in colour — under `-i`, `files` takes the tone and `size` steps back. Sizes are
-cumulative, so any row agrees with `du -s` on that path.
+The frame carries no title and it always closes: a line too wide for it wraps
+inside, at a path separator, rather than running past the border. Its colour is a
+gradient sweeping from the top-left corner, and it degrades — 24-bit if your
+terminal advertises `COLORTERM=truecolor`, a 12-step ramp at 256 colours, and a
+calm three-step cyan at 8. `--ascii` turns it into `+--+`; `--no-box` removes it,
+which is what you want when piping into `grep` or a diff.
+
+`share` labels the bar and the percentage beside it: they are one measurement in
+two forms, the picture and the number. The bar is share of the whole walk, so it
+always agrees with the number beside it. The hatched row is everything not listed.
+The column you sorted by is the one in colour — under `-i`, `files` takes the tone
+and `size` steps back. Sizes are cumulative, so any row agrees with `du -s` on
+that path.

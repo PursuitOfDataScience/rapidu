@@ -20,6 +20,14 @@ def small_tree(tmp_path):
     return root
 
 
+# Tests that assert on the *content* of a report pass --no-box. A framed report
+# wraps a line too wide for the frame -- at a path separator, so it stays readable
+# -- which means a long absolute path is no longer one contiguous substring. That
+# is the intended behaviour of a frame that always closes, and it is not what
+# these tests are about. Tests that assert on the frame itself live in
+# test_ui.py and test_audit_round_three.py.
+
+
 def test_a_directory_named_like_an_old_subcommand_is_measured(tmp_path, capsys):
     """The reason subcommands were removed: these are ordinary directory names.
 
@@ -36,7 +44,7 @@ def test_a_directory_named_like_an_old_subcommand_is_measured(tmp_path, capsys):
         cwd = os.getcwd()
         os.chdir(str(tmp_path))
         try:
-            cli.main([name])
+            cli.main([name, "--no-box"])
         finally:
             os.chdir(cwd)
         out = capsys.readouterr().out
@@ -46,14 +54,14 @@ def test_a_directory_named_like_an_old_subcommand_is_measured(tmp_path, capsys):
 
 
 def test_quota_only_flag(capsys):
-    cli.main(["--quota-only"])
+    cli.main(["--quota-only", "--no-box"])
     out = capsys.readouterr().out
     assert "QUOTA" in out
     assert "WALK" not in out
 
 
 def test_deleted_only_flag(capsys):
-    cli.main(["--deleted-only"])
+    cli.main(["--deleted-only", "--no-box"])
     out = capsys.readouterr().out
     assert "UNLINKED BUT STILL OPEN" in out
     assert "WALK" not in out
@@ -85,7 +93,10 @@ def test_default_answers_how_big_and_nothing_else(small_tree, capsys):
     The quota backend shells out to a site wrapper and the /proc sweep visits
     every pid on the node; neither is used to answer "how big is this tree".
     """
-    cli.main([small_tree])
+    # --no-box so the assertion below counts the *report*, not the two border
+    # lines the frame adds. The claim under test is that the default view is
+    # compact, which is a property of the content.
+    cli.main([small_tree, "--no-box"])
     out = capsys.readouterr().out
     assert small_tree in out
     # Byte totals are not asserted: on GPFS a just-written fixture reports
@@ -100,13 +111,13 @@ def test_default_answers_how_big_and_nothing_else(small_tree, capsys):
 
 
 def test_full_flag_restores_the_whole_report(small_tree, capsys):
-    cli.main([small_tree, "-a", "--no-quota", "--no-deleted"])
+    cli.main([small_tree, "-a", "--no-quota", "--no-deleted", "--no-box"])
     out = capsys.readouterr().out
     assert "WALK" in out
 
 
 def test_inodes_flag_switches_the_ranking(small_tree, capsys):
-    cli.main([small_tree, "-i"])
+    cli.main([small_tree, "-i", "--no-box"])
     assert small_tree in capsys.readouterr().out
 
 
@@ -123,21 +134,21 @@ def test_no_density_ranking_section(small_tree, capsys):
     It nominated a 260 KiB .git directory as the "best candidate to pack" ahead
     of one holding ten times the inodes. Density is a column now, not a ranking.
     """
-    cli.main([small_tree, "-a", "--no-quota", "--no-deleted", "-n", "5"])
+    cli.main([small_tree, "-a", "--no-quota", "--no-deleted", "-n", "5", "--no-box"])
     out = capsys.readouterr().out
     assert "DENSEST" not in out
 
 
 def test_clean_deleted_scan_is_one_line(small_tree, capsys):
     """In the full report, a null result must not cost seven lines of caveats."""
-    cli.main([small_tree, "-a", "--no-quota"])
+    cli.main([small_tree, "-a", "--no-quota", "--no-box"])
     out = capsys.readouterr().out
     assert "UNLINKED BUT STILL OPEN" not in out
     assert len([ln for ln in out.splitlines() if "unlinked-but-open" in ln]) == 1
 
 
 def test_no_quota_skips_the_quota_section(small_tree, capsys):
-    cli.main([small_tree, "-a", "--no-quota", "--no-deleted"])
+    cli.main([small_tree, "-a", "--no-quota", "--no-deleted", "--no-box"])
     assert "QUOTA" not in capsys.readouterr().out
 
 
@@ -173,7 +184,7 @@ def test_file_argument_rejected(tmp_path, capsys):
 
 
 def test_thread_clamp_warns(small_tree, capsys):
-    cli.main([small_tree, "--threads", "999"])
+    cli.main([small_tree, "--threads", "999", "--no-box"])
     assert "clamped" in capsys.readouterr().err
 
 
@@ -236,7 +247,7 @@ def test_interrupted_output_states_no_total_and_no_shares(small_tree, capsys, mo
         return res
 
     monkeypatch.setattr(walkmod, "walk", interrupted)
-    cli.main([small_tree, "--no-progress"])
+    cli.main([small_tree, "--no-progress", "--no-box"])
     out = capsys.readouterr().out
     assert "INTERRUPTED" in out
     assert "PARTIAL" in out
@@ -251,7 +262,7 @@ def test_n_zero_shows_everything_and_no_phantom_remainder(small_tree, capsys):
     The leftover with everything shown is exactly the root directory's own
     inode, which belongs to no child; reporting it as "(0 more)" is noise.
     """
-    cli.main([small_tree, "-n", "0"])
+    cli.main([small_tree, "-n", "0", "--no-box"])
     out = capsys.readouterr().out
     assert "more" not in out
 
@@ -266,6 +277,6 @@ def test_truncated_listing_says_how_to_expand(tmp_path, capsys):
         os.makedirs(d)
         with open(os.path.join(d, "f"), "wb") as fh:
             fh.write(b"x" * (4096 * (i + 1)))
-    cli.main([root, "-n", "3"])
+    cli.main([root, "-n", "3", "--no-box"])
     out = capsys.readouterr().out
     assert "more" in out and "-n 0" in out

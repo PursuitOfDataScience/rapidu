@@ -8,10 +8,12 @@ import contextlib
 import os
 import shutil
 import subprocess
+import threading
 import time
 
 import pytest
 
+from rapidu import walk as walkmod
 from rapidu.walk import MAX_THREADS, TokenBucket, walk
 
 
@@ -317,12 +319,14 @@ def test_finished_tops_covers_a_complete_walk(tree):
 
 
 def test_interrupted_walk_reports_only_finished_subtrees(tree):
-    """A half-counted directory must not appear in a ranking.
+    """A half-counted directory must not appear in a ranking -- consumer side.
 
-    Simulated rather than signalled: delivering SIGINT at a deterministic point
-    inside a threaded walk is not reproducible, but the reporting rule is, and
-    the rule is what matters -- a subtree caught mid-walk carries an arbitrary
-    fraction of its contents and belongs nowhere near an ordered table.
+    This exercises ``top_dirs``' filter with the field assigned by hand. That is
+    a legitimate unit test of the *consumer*, but on its own it was the reason a
+    producer bug survived a green suite for two audit rounds: the walk marked
+    abandoned subtrees finished, and nothing here could see it. The producer is
+    tested for real in
+    ``test_interrupt_does_not_mark_an_abandoned_subtree_finished``.
     """
     r = walk(tree, threads=4, depth=1)
     everything = {os.path.basename(e.path) for e in r.dir_agg.values() if e.path != r.root}
@@ -338,6 +342,137 @@ def test_interrupted_walk_reports_only_finished_subtrees(tree):
     # Without the filter the unfinished entry is still there, so the filter is
     # doing the work and the test would fail if it were dropped.
     assert victim in {os.path.basename(e.path) for e in r.top_dirs(50)}
+
+
+def _deep_tree(base, tops=("big", "small"), depth=12, files=6):
+    """A deep, narrow tree: the shape where an interrupt lands mid-subtree.
+
+    Depth matters. On a wide tree ``outstanding[top]`` is large for most of the
+    walk, so a dropped directory rarely takes the counter to zero; on a deep one
+    it sits at 1 nearly the whole time and every drop is the last outstanding
+    item. Measured while reproducing this: 31 of 40 real SIGINTs on a deep tree,
+    0 of 40 on a bushy one.
+    """
+    made = []
+    for top in tops:
+        d = os.path.join(base, top)
+        os.makedirs(d)
+        made.append(d)
+        for level in range(depth):
+            d = os.path.join(d, "lvl%02d" % level)
+            os.makedirs(d)
+            for j in range(files):
+                with open(os.path.join(d, "f%d" % j), "wb") as fh:
+                    fh.write(b"x" * 4096)
+    return made
+
+
+def test_interrupt_does_not_mark_an_abandoned_subtree_finished(tmp_path):
+    """The interrupt guarantee, tested on the producer that has to keep it.
+
+    ``finished_tops`` is the whole basis of the promise ``du`` does not make.
+    When the stop event is set, a worker inside a directory discards the children
+    it found -- and used to decrement that subtree's outstanding counter anyway,
+    so the counter reached zero and the subtree was recorded as **complete**. An
+    interrupted run then ranked a directory it had barely entered as a finished
+    measurement, understated by up to 100%, under a header saying it had been
+    walked to completion.
+
+    The premise that excused not testing this ("delivering SIGINT at a
+    deterministic point inside a threaded walk is not reproducible") is false.
+    Setting the documented ``stop`` event from inside a patched ``os.scandir``
+    lands the interrupt at a chosen directory, deterministically, in-process --
+    which is exactly what ``walk``'s own KeyboardInterrupt handler does.
+    """
+    base = str(tmp_path)
+    _deep_tree(base)
+    full = walk(base, threads=1, depth=1)
+
+    real_scandir = os.scandir
+    ev = threading.Event()
+
+    def trip(path):
+        if os.path.basename(str(path)) == "lvl03":
+            ev.set()
+        return real_scandir(path)
+
+    try:
+        walkmod.os.scandir = trip
+        part = walk(base, threads=1, depth=1, stop=ev)
+    finally:
+        walkmod.os.scandir = real_scandir
+
+    assert part.partial, "an external stop must mark the result partial"
+    truth = {os.path.basename(e.path): e for e in full.dir_agg.values() if e.path != full.root}
+    got = {os.path.basename(e.path): e for e in part.dir_agg.values() if e.path != part.root}
+    assert "big" in got and got["big"].inodes < truth["big"].inodes, (
+        "the fixture must actually be truncated, or this test proves nothing"
+    )
+
+    # The abandoned subtree must not be finished...
+    assert not part.is_finished(got["big"])
+    assert "big" not in part.finished_tops
+    # ...and must not reach a ranking.
+    ranked = part.top_dirs(50, "files", finished_only=True)
+    assert "big" not in {os.path.basename(e.path) for e in ranked}
+    # Whatever *is* ranked must be exact, not merely present.
+    for e in ranked:
+        name = os.path.basename(e.path)
+        assert e.inodes == truth[name].inodes, "{} ranked with a partial count".format(name)
+
+
+def test_a_truncated_directory_scan_also_blocks_the_finished_mark(tmp_path):
+    """A cut-short scan makes its subtree incomplete even with no children.
+
+    The children-dropped path is not the only way to lose entries: the per-entry
+    loop breaks on the stop event too, so a leaf directory holding no
+    subdirectories can still be missing files. Guarding only the enqueue path
+    would leave that hole open.
+    """
+    base = str(tmp_path)
+    d = os.path.join(base, "leafy")
+    os.makedirs(d)
+    for j in range(4200):  # > the 1024-entry stop-check stride, several times
+        with open(os.path.join(d, "f%04d" % j), "wb") as fh:
+            fh.write(b"x")
+    os.makedirs(os.path.join(base, "other"))
+
+    real_scandir = os.scandir
+    ev = threading.Event()
+
+    def trip(path):
+        it = real_scandir(path)
+        if os.path.basename(str(path)) == "leafy":
+            ev.set()  # set before the entry loop runs, so it breaks partway
+        return it
+
+    try:
+        walkmod.os.scandir = trip
+        part = walk(base, threads=1, depth=1, stop=ev)
+    finally:
+        walkmod.os.scandir = real_scandir
+
+    got = {os.path.basename(e.path): e for e in part.dir_agg.values() if e.path != part.root}
+    if got.get("leafy") and got["leafy"].inodes < 4200:
+        assert "leafy" not in part.finished_tops
+        assert not part.is_finished(got["leafy"])
+
+
+def test_an_external_stop_marks_the_result_partial(tmp_path):
+    """``stop`` is a documented parameter and must not lie about completeness.
+
+    ``partial`` was set only in the KeyboardInterrupt handler, so a caller using
+    ``stop=`` got early termination with ``partial`` still False -- and
+    ``complete`` consults only unreadable/unstatable counts, so a walk that
+    halted at a fraction of the tree could report as a finished measurement.
+    """
+    base = str(tmp_path)
+    _deep_tree(base, tops=("a",), depth=8)
+    ev = threading.Event()
+    ev.set()  # already stopped: the walk must terminate immediately and say so
+    res = walk(base, threads=2, depth=1, stop=ev)
+    assert res.partial
+    assert not res.complete
 
 
 def test_count_only_matches_the_full_walk_counts(tree):
