@@ -183,10 +183,20 @@ def test_a_full_bar_has_no_track_left_to_draw():
     assert PLAIN.bar_chars[1] not in rows[0]
 
 
-def test_the_last_column_is_headed_path_because_files_are_listed_too():
+def test_the_last_column_is_headed_entry_because_it_holds_both():
+    """`directory` would be a lie and `path` was wrong in the other direction.
+
+    Plain files are ranked in that column alongside directories, so `directory`
+    excludes half of it. But what is printed is a *name* relative to the walk
+    root, not a path, so `path` promised something it did not give -- and
+    `msg3_plain.db` sitting under a column headed `path` invites exactly that
+    misreading. A directory entry is precisely the category that contains both,
+    and it is already the word the facts line uses for their count.
+    """
     head = report._entries_header(PLAIN)
-    assert head.endswith("path")
-    assert "name" not in head and "directory" not in head
+    assert head.endswith("entry")
+    assert "directory" not in head
+    assert not head.endswith("path")
 
 
 def test_an_interrupted_walk_says_the_bar_is_relative_instead():

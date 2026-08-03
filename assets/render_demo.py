@@ -147,6 +147,12 @@ class Pen:
             elif p == 38 and i + 2 < len(params) and params[i + 1] == 5:
                 self.color = xterm256(params[i + 2])
                 i += 2
+            elif p == 38 and i + 4 < len(params) and params[i + 1] == 2:
+                # 24-bit. The report's frame emits this where COLORTERM says the
+                # terminal can take it; without this branch the parameters fell
+                # through and painted the border in whatever colour was current.
+                self.color = (params[i + 2], params[i + 3], params[i + 4])
+                i += 4
             i += 1
 
 
@@ -359,11 +365,24 @@ def play(movie, screen, command, output, settle_ms=900, read_ms=2600):
 def run(argv, env_extra=None):
     env = dict(os.environ)
     env["PYTHONPATH"] = SRC + os.pathsep + env.get("PYTHONPATH", "")
-    env["COLUMNS"] = str(COLS)
+    # The *inner* width of the frame, not the full canvas. The CLI is run with
+    # --no-box (see `frame_scene`), so it lays its columns out against the whole
+    # terminal -- and if that is wider than the space inside the frame, `box` has
+    # to re-wrap the prose when it goes in. A re-wrapped continuation starts at the
+    # margin instead of under the paragraph it continues, which reads as text
+    # falling out of the box even though the border is intact. Laying out against
+    # the inner width means nothing needs re-wrapping and every indent survives.
+    env["COLUMNS"] = str(COLS - _chrome_cols())
     env["TERM"] = "xterm-256color"
+    # Pinned, not inherited. The frame's gradient is 24-bit when COLORTERM
+    # advertises it and 256-colour otherwise, so leaving this to the ambient
+    # environment made the GIF depend on whose terminal rendered it.
+    env["COLORTERM"] = "truecolor"
     env.update(env_extra or {})
     proc = subprocess.run(
-        [sys.executable, "-m", "rapidu"] + argv + ["--color", "always", "--no-progress"],
+        [sys.executable, "-m", "rapidu"]
+        + argv
+        + ["--color", "always", "--no-progress", "--no-box"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env=env,
@@ -420,6 +439,43 @@ _DEMO_LAYOUT = (
     (".cache/pip", 800, 4 << 10),
     ("notebooks", 12, 256 << 10),
 )
+
+
+def _chrome_cols():
+    """Columns the frame's border and padding take from each line."""
+    sys.path.insert(0, SRC)
+    from rapidu.ui import BOX_CHROME
+
+    return BOX_CHROME
+
+
+def frame_scene(text):
+    """Put the report's frame on, after redaction has finished moving text around.
+
+    **The order matters and getting it wrong is invisible until you look.**
+    ``anonymize`` rewrites paths, and its replacements are not the same length as
+    what they replace -- a username becomes ``researcher`` (four columns wider) and
+    ``$TMPDIR`` becomes ``/scratch/$USER`` (sixteen narrower). Framing before that
+    means every border was measured against text that no longer exists: lines end
+    up longer than the frame and spill past it, or shorter and pull the right
+    border inward. Both were visible in the GIF, as rows of output hanging outside
+    a box that was supposed to close.
+
+    So the CLI is run with ``--no-box``, the paths are rewritten, and the frame is
+    measured last -- against the text that will actually be drawn.
+    """
+    from rapidu.ui import BOX_CHROME, Style, box
+
+    style = Style(True, True, COLS - BOX_CHROME, 256)
+    framed = box(text.rstrip("\n").split("\n"), style, width=COLS)
+    # A frame is either square or it is a bug. Cheap to assert, and it is exactly
+    # the failure that shipped twice.
+    from rapidu.ui import visible_width
+
+    widths = {visible_width(line) for line in framed}
+    if len(widths) != 1:
+        raise SystemExit("frame is ragged: widths {}".format(sorted(widths)))
+    return "\n".join(framed) + "\n"
 
 
 def anonymize(text, tree, scratch):
@@ -511,7 +567,9 @@ def demo_quota_scene():
             "labgroup", "files", "group", 43_583_258, 230_900_000, 231_900_000, "", "/project"
         ),
     ]
-    return "\n".join(render_quota(snap, style=Style(True, True, COLS, 256))) + "\n"
+    # Unframed, like every other scene: `frame_scene` puts the border on after
+    # redaction. See the note there.
+    return "\n".join(render_quota(snap, style=Style(True, True, COLS - _chrome_cols(), 256))) + "\n"
 
 
 def main():
@@ -543,7 +601,7 @@ def main():
             ("rdu -Q", demo_quota_scene()),
             ("rdu -D", deleted_fd_scene(scratch)),
         ]
-        scenes = [(label, anonymize(out, tree, scratch)) for label, out in scenes]
+        scenes = [(label, frame_scene(anonymize(out, tree, scratch))) for label, out in scenes]
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -559,10 +617,11 @@ def main():
         # The capture was taken on a real filesystem, so its paths go through
         # the same redaction as the live scenes -- label included, since the
         # label is the command line and the command line names the tree.
+        sys.path.insert(0, SRC)
         scenes.append(
             (
                 anonymize(label, tree, scratch),
-                anonymize(transcript, tree, scratch),
+                frame_scene(anonymize(transcript, tree, scratch)),
             )
         )
 
@@ -570,7 +629,12 @@ def main():
     # the prompt line and a single blank after the output. It used to carry four
     # rows of slack, which the tallest scene needed and the other four did not --
     # so most of the running time was spent showing an empty band at the bottom.
-    rows = max(len(to_cells(out)) for _, out in scenes) + 2
+    # Exactly what `play` draws: the prompt line, every output row, and one blank
+    # after it. This used to be measured on `to_cells(out)` while `play` drew
+    # `to_cells(out.rstrip("\n"))`, so the budget and the content were counted from
+    # two different strings -- and the tallest scene lost its last rows off the
+    # bottom of the canvas, which on a framed report means losing the border.
+    rows = max(1 + len(to_cells(out.rstrip("\n"))) + 1 for _, out in scenes)
     painter = Painter(rows)
     screen = Screen(rows)
     movie = Movie(painter)

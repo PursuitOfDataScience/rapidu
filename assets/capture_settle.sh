@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Capture the settling scene for the README GIF.
 #
+# Captured WITHOUT the frame (--no-box). render_demo.py redacts real paths from
+# this transcript before it draws it, and a redaction changes the line's length
+# ($USER -> researcher is four columns wider), so a frame captured here would no
+# longer fit the text it was measured against. The renderer frames the redacted
+# text instead, which cannot disagree with itself.
+#
 # This is the one scene render_demo.py cannot reproduce on demand: it needs a
 # GPFS filesystem and a minute of real drift. Writing the tree and re-stat'ing
 # it takes ~2 minutes, so it is captured once and replayed.
@@ -41,9 +47,13 @@ rc=0
 # It was hardcoded to a stand-in path once, and the GIF then showed a command
 # that did not match the tree in its own output.
 printf '# rdu %s -a --no-quota --no-deleted --settle-wait 60\n' "$TREE" >"$OUT"
-COLUMNS=96 TERM=xterm-256color PYTHONPATH="$REPO/src" \
+# 92, not 96: the renderer frames this transcript afterwards, and the border plus
+# its padding costs four columns. Laying out against 96 here would make every
+# wrapped paragraph one that `box` has to break again, and a re-broken line starts
+# at the margin instead of under the text it continues.
+COLUMNS=92 TERM=xterm-256color PYTHONPATH="$REPO/src" \
     python3 -m rapidu "$TREE" -a --no-quota --no-deleted --settle-wait 60 \
-    -n 3 --color always --no-progress >>"$OUT" || rc=$?
+    -n 3 --color always --no-progress --no-box >>"$OUT" || rc=$?
 if [ "$rc" -gt 1 ]; then
     echo "rapidu failed with exit $rc" >&2
     exit "$rc"

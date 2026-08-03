@@ -565,9 +565,17 @@ def _entries_header(
     lets the two numbers be compared without a translation step. Directories are
     included in the count, exactly as the quota includes them.
 
-    The last column is ``path``, not ``name`` and not ``directory``. ``name`` said
-    nothing -- every column is the name of something -- and ``directory`` would be
-    a lie, because plain files are ranked here too.
+    The last column is ``entry``. ``directory`` would be a lie, because plain files
+    are ranked here too -- three 63 MiB ``.db`` files in a home directory are a
+    quarter of it. ``path`` was the previous answer and it was also wrong, in the
+    other direction: what is printed is a *name* relative to the walk root, not a
+    path, and calling it one while listing `msg3_plain.db` beside `ArgonneAI/`
+    invites the reader to expect something they are not being given. ``name`` says
+    nothing, since every column is the name of something.
+
+    ``entry`` is what these actually are -- directory entries, which is precisely
+    the category that contains both -- and it is already the word the facts line
+    uses for their count ("94 entries"), so the two agree.
 
     ``share`` labels the bar, and the percentage beside it goes unlabelled, because
     they are one column in two forms -- the picture and the number. The bar used to
@@ -585,7 +593,7 @@ def _entries_header(
         style.paint("{:<{}}".format(bar_label, _BAR_W), "dim"),
         " " * 6,
         style.paint("{:>9}".format("files"), files_tone),
-        style.paint("path", "dim"),
+        style.paint("entry", "dim"),
     )
 
 
@@ -645,17 +653,24 @@ def _facts(style: ui.Style, pairs: List[Any]) -> str:
 
 
 def _header(style: ui.Style, headline: str, path: str, subtitle: str) -> List[str]:
-    """Lead with the answer, then the path, then the metadata.
+    """Name the subject, then measure it.
 
-    ``du -sh`` prints the size first and everyone reads it that way, so the size
-    goes first and carries the visual weight.
+    **The path leads.** It is what the report is *about*, and every other line
+    below it is a number describing it. Putting the size first followed ``du -sh``,
+    which prints one number and nothing else -- but this report prints four
+    measurements, so leading with one of them left the size stranded on its own
+    line while its three siblings sat on the next. The path is the title; the
+    size is the first fact.
 
-    The path is split. Everything up to the last component is where the tree
-    happens to live and is dimmed; the last component is *what was measured* and
-    is bold. On ``/scratch/midway3/$USER/experiments/run-14`` that is the
+    The path is split: everything up to the last component is where the tree
+    happens to live and is dimmed, and the last component is *what was measured*
+    and is bold. On ``/scratch/midway3/$USER/experiments/run-14`` that is the
     difference between a wall of equally-weighted text and a line whose subject
-    you can find without reading it. Counts and timing are weighted by
-    :func:`_facts`.
+    you can find without reading it.
+
+    The size keeps the accent it had, so it is still the first thing the eye
+    lands on among the numbers -- it just no longer outranks the name of the
+    thing it measures.
     """
     parent, _, leaf = path.rpartition(os.sep)
     subject = (
@@ -663,16 +678,12 @@ def _header(style: ui.Style, headline: str, path: str, subtitle: str) -> List[st
         if parent and leaf
         else style.paint(path, "bold")
     )
-    # Both lines start at the same column. The size used to be right-justified in
-    # a ten-wide field with the subtitle indented to sit under the *path*, which
-    # aligned the second line with the wrong thing: it left a number at column 3
-    # and the line below it starting at column 15, reading as an indent with no
-    # reason behind it. Flush left, the two lines are visibly one block.
-    return [
-        "{}   {}".format(style.paint(headline, "bold_cyan"), subject),
-        subtitle,
-        "",
-    ]
+    facts = style.paint(headline, "bold_cyan")
+    if subtitle:
+        # The same joiner `_facts` uses, so the size sits in that line as one of
+        # its members rather than as a prefix stuck on the front of it.
+        facts += style.paint("  {}  ".format(ui.sep(style)), style.track) + subtitle
+    return [subject, facts, ""]
 
 
 def render_compact(
@@ -1029,12 +1040,16 @@ def render_settle(
                 style,
             )
         )
-        out.append(
-            style.paint(
-                "        Any size you read right now -- from this tool or from du -- is\n"
-                "        provisional. Measured on GPFS, a freshly written tree has settled\n"
-                "        both upward (5.58x) and downward (3.3x) over ~60s.",
-                "dim",
+        # Wrapped, not hand-broken. This was three lines joined with "\n" inside a
+        # single list element, which measured as one 200-column line and tore the
+        # frame around it in half.
+        out.extend(
+            _wrapped(
+                "Any size you read right now -- from this tool or from du -- is "
+                "provisional. Measured on GPFS, a freshly written tree has settled "
+                "both upward (5.58x) and downward (3.3x) over ~60s.",
+                style,
+                "        ",
             )
         )
         if settle.sampled:

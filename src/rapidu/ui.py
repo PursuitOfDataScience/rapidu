@@ -468,27 +468,36 @@ def visible_width(text: str) -> int:
     return width
 
 
-# The frame's gradient, as anchor colours it is interpolated between: pale ice ->
-# cyan -> blue -> indigo. Only used where the terminal can render 24-bit colour,
-# where the sweep comes out genuinely smooth rather than banded.
-_FRAME_ANCHORS = ((207, 246, 255), (34, 211, 238), (59, 130, 246), (99, 102, 241))
-
-# The same sweep quantised to the xterm-256 cube: pale cyan -> cyan -> azure ->
-# blue -> deep blue. Twelve steps is as smooth as that cube gets in one hue
-# family, so this bands a little; there is nothing to be done about it at 256.
-_FRAME_RAMP_256 = (195, 159, 123, 87, 51, 45, 39, 33, 27, 21, 20, 19)
-
-# Eight colours. This is the one that matters most in practice and it is the one
-# with no room: `TERM=screen`, `TERM=xterm` and most tmux defaults advertise eight,
-# so this is what a great many sessions actually get.
+# The frame's gradient, as anchor colours it is interpolated between. Every one
+# of them is a *light* colour, and that is the whole point.
 #
-# Three steps in a single hue family, not a sweep through several. A six-step
-# magenta-to-cyan version was tried and it is what "the colours are weird" was
-# about: with eight colours a ten-step gradient collapses into two or three flat
-# blocks, and two flat blocks of bright pink around a disk-usage report do not read
-# as a gradient -- they read as a mistake. Cyan to blue degrades honestly, because
-# even when it flattens to one tone it still looks like a deliberate border.
-_FRAME_RAMP_8 = ("bold_cyan", "cyan", "blue")
+# The first version swept light-to-deep so the highlight landed at the top-left
+# like a gloss on a card. On a dark terminal that puts the darkest end of the ramp
+# at the bottom-right, where it simply disappears -- the bottom border read as
+# barely there while the top read as fine, which is exactly how it was reported.
+# A gradient whose range crosses out of the visible band is not a gradient with a
+# subtle end, it is a gradient that is broken for half its length.
+#
+# So the sweep now moves in *hue* and stays put in brightness: light cyan through
+# aqua and periwinkle to light violet. Every step is legible against black, none
+# is legible as data (nothing in the table is ever this pale), and the border has
+# the same weight at the bottom as at the top.
+_FRAME_ANCHORS = ((140, 233, 255), (94, 234, 212), (129, 199, 255), (167, 160, 255))
+
+# The same sweep on the xterm-256 cube, and held to the same rule: nothing below
+# the bright band. The deep-blue tail this ramp used to end on (27, 21, 20, 19) is
+# what made the bottom border vanish.
+_FRAME_RAMP_256 = (123, 87, 80, 74, 75, 111, 147, 141, 177, 183)
+
+# Eight colours, which is what `TERM=screen`, `TERM=xterm` and most tmux defaults
+# advertise -- so this is the ramp most sessions actually get, and it is the one
+# with no room to be clever.
+#
+# **Bright variants only.** Plain `blue` at eight colours is a murky navy that
+# disappears against a dark background, and because the sweep runs diagonally it
+# was landing on the bottom border. Two bold tones read as a deliberate two-tone
+# frame; three tones where one of them is invisible reads as a rendering fault.
+_FRAME_RAMP_8 = ("bold_cyan", "bold_blue")
 
 # How many steps to quantise the truecolor sweep into. Fine enough that the bands
 # are invisible, coarse enough that runs of equal colour still group into one
@@ -585,7 +594,15 @@ def box(lines: List[str], style: Style, width: Optional[int] = None) -> List[str
         top_l = top_r = bot_l = bot_r = "+"
         horiz, vert = "-", "|"
 
-    body = list(lines)
+    # Split on embedded newlines first. A caller handing one string that contains
+    # "\n" means two *display* lines, and measuring it as one produced a single
+    # pair of borders wrapped around both: the first half lost its right border and
+    # the second lost its left. That is a frame that does not close, which is the
+    # one thing this function has to get right, so it is fixed here rather than
+    # only at the caller -- any future caller can make the same mistake.
+    body = []  # type: List[str]
+    for line in lines:
+        body.extend(line.split("\n") if "\n" in line else [line])
     # The frame supplies the separation that leading and trailing blank lines
     # were there to provide.
     while body and not body[0].strip():

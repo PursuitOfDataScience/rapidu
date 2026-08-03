@@ -454,19 +454,35 @@ def test_the_frame_gradient_has_more_than_one_tone(monkeypatch):
     assert len(tones) >= 4, "top border used {} tones".format(len(tones))
 
 
-def test_eight_colour_terminals_get_a_calm_short_ramp():
+def test_eight_colour_terminals_get_bright_tones_only():
     """`TERM=screen` advertises eight colours, and that is what many sessions get.
 
-    At eight colours a ten-step gradient collapses into two or three flat blocks.
-    Bright pink in flat blocks is what "the colours are weird" was about, so the
-    eight-colour ramp is three steps in one hue family and degrades to looking
-    deliberate rather than broken.
+    Plain `blue` at eight colours is a murky navy that disappears against a dark
+    background -- and because the sweep runs diagonally it landed on the *bottom*
+    border, which is exactly how it was reported: "very dim, especially the bottom
+    line". Every tone here has to be a bright one.
     """
     style = ui.resolve_style("always")
     style.depth = 8
     ramp = ui.frame_ramp(style)
-    assert ramp == ["bold_cyan", "cyan", "blue"]
+    assert ramp, "no ramp at all"
+    for tone in ramp:
+        assert tone.startswith("bold_"), "{!r} is not a bright tone".format(tone)
     assert all("magenta" not in tone for tone in ramp)
+
+
+def test_no_ramp_tone_is_dark_enough_to_vanish():
+    """The 256-colour ramp must not dip below the bright band either.
+
+    Its first version ended on 27/21/20/19 -- deep blues -- so the bottom-right
+    corner of the frame faded out on a dark terminal. The xterm-256 cube encodes
+    its blue axis in the low indices, so a floor on the index is a floor on
+    brightness.
+    """
+    assert min(ui._FRAME_RAMP_256) >= 70, sorted(ui._FRAME_RAMP_256)[:3]
+    # And every truecolor anchor stays legible: no channel triple that dark.
+    for anchor in ui._FRAME_ANCHORS:
+        assert sum(anchor) >= 400, anchor
 
 
 def test_truecolor_is_only_used_when_advertised(monkeypatch):
@@ -516,3 +532,20 @@ def test_wrapping_hard_breaks_a_token_with_no_separator():
     pieces = ui._wrap_ansi("z" * 90, 25)
     assert all(ui.visible_width(p) <= 25 for p in pieces)
     assert "".join(pieces) == "z" * 90
+
+
+def test_an_embedded_newline_does_not_tear_the_frame():
+    """One string holding "\\n" is two display lines, and must be framed as two.
+
+    Measured as one, it produced a single pair of borders wrapped around both: the
+    first half lost its right border and the second lost its left. Found in the
+    real report -- `render_settle` carried a hand-broken three-line paragraph in one
+    list element -- and visible as a hole in the middle of the frame.
+    """
+    style = ui.resolve_style("never")
+    out = ui.box(["first", "two\nlines", "last"], style, width=40)
+    assert len(out) == 6, out  # top + 4 content rows + bottom
+    widths = {ui.visible_width(line) for line in out}
+    assert len(widths) == 1, widths
+    for line in out[1:-1]:
+        assert line.startswith("│") and line.endswith("│"), line
