@@ -266,6 +266,75 @@ def test_an_abandoned_worker_cannot_mark_its_subtrees_finished(hung):
     assert not any("_slow" in e.path for e in ranked)
 
 
+def test_a_stranded_root_scan_leaves_nothing_rankable(_hung_tree, monkeypatch):
+    """The root's own scan is what charges each child with its own inode.
+
+    ``d_parts`` is empty for the root, so keying the in-flight set by
+    ``d_parts[0]`` recorded nothing for it and a stranded root scanner looked
+    harmless. It is not: every depth-1 entry then comes back short by exactly
+    itself. CI caught a `fast_3` ranked at 40 inodes instead of 41 -- on py3.10
+    only, on the one run where the worker that had scanned the root went on to
+    wedge.
+
+    Reproduced deterministically by wedging *the root scanner's next directory*
+    rather than a directory chosen by name: whichever worker scanned the root is
+    the one abandoned, while the others finish their subtrees and merge normally.
+    That is the shape the accounting got wrong, and a name-based wedge only lands
+    on it by luck -- twelve four-thread runs on the machine this was written on
+    never hit it.
+    """
+    root = _hung_tree
+    real = os.scandir
+    scanned_root = set()
+    wedged = threading.Event()
+
+    peer_started = threading.Event()
+
+    def wedge_the_root_scanner(path):
+        me = threading.current_thread().name
+        if str(path).rstrip("/") == root.rstrip("/"):
+            scanned_root.add(me)
+            return real(path)
+        if me in scanned_root:
+            if not wedged.is_set():
+                # Let a peer take a subtree first. The root scanner is already
+                # running when it enqueues the children, so left to itself it can
+                # claim one and wedge before any peer has even woken -- every
+                # worker then breaks on the stop before scanning anything, and the
+                # run has no completed subtree to withhold, so it exercises
+                # nothing. Waiting here removes that race from the fixture without
+                # removing it from the code under test.
+                peer_started.wait(5.0)
+                wedged.set()
+                time.sleep(_HANG_S)
+            return real(path)
+        peer_started.set()
+        return real(path)
+
+    monkeypatch.setattr(walkmod.os, "scandir", wedge_the_root_scanner)
+    stop = threading.Event()
+    threading.Thread(target=lambda: (wedged.wait(_HANG_S * 2), stop.set()), daemon=True).start()
+    res = walk(root, threads=4, depth=1, stop=stop)
+
+    assert res.partial and res.abandoned_workers >= 1
+    # Nothing may be ranked: every entry is short by its own inode, and a uniform
+    # small error is still an error. The symptom CI saw was a row at 40.
+    assert res.finished_tops == set()
+    assert res.top_dirs(50, "files", finished_only=True) == []
+    # The arithmetic symptom, stated exactly: a depth-1 directory's own inode is
+    # charged by the *root's* scan, so a stranded root leaves `dirs == 0` on an
+    # entry that has all its files. CI saw this as a row at 40 instead of 41.
+    children = [e for e in res.dir_agg.values() if e.path != res.root and e.is_dir]
+    assert any(e.dirs == 0 and e.files for e in children), (
+        "the fixture must actually strand the root scan, or this proves nothing: "
+        + repr([(os.path.basename(e.path), e.files, e.dirs) for e in children])
+    )
+    # And the report says why, instead of an empty table with no reason.
+    text = _flat(report._hard_warnings(res, SettleCheck(), PLAIN))
+    assert "0 top-level entries were walked to completion" in text
+    assert "still blocked" in text
+
+
 def test_the_interrupt_caveat_states_no_denominator_it_cannot_defend(hung):
     """ "2 of 2 top-level entries" -- with four finished and two withheld.
 

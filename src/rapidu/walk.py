@@ -42,6 +42,10 @@ DEFAULT_SETTLE_WINDOW_S = 120.0
 # somewhere, and ^C has to stay responsive when it does.
 STOP_GRACE_S = 5.0
 
+# Stands for "the root directory's own scan" in the per-worker in-flight sets. Not
+# a possible depth-1 name: `os.scandir` never yields an empty one.
+_ROOT_SCAN = ""
+
 # What skipping `stat` is worth. Held on both trees it has been measured on --
 # 782k GPFS inodes (27.3s -> 3.4s) and 1.69M (58.7s -> 7.1s) -- which is why the
 # README states one figure for both. Defined here once because the walk
@@ -623,8 +627,15 @@ def walk(
                 # subtree in here has tallies that exist nowhere else. No worker
                 # reaches this line after `stop_ev` is set, so the main thread can
                 # read these sets as final once it has stopped the walk.
-                if d_parts:
-                    inflight[slot_id].add(d_parts[0])
+                #
+                # `_ROOT_SCAN` for the root itself, because the root's scan is what
+                # charges every depth-1 child with its *own* inode and its own
+                # blocks -- `d_parts` is empty there, so keying by `d_parts[0]`
+                # recorded nothing and a stranded root scanner looked harmless. It
+                # is not: CI caught a `fast_3` ranked at 40 inodes instead of 41,
+                # short by exactly the directory itself, on the run where the
+                # worker that scanned the root went on to wedge.
+                inflight[slot_id].add(d_parts[0] if d_parts else _ROOT_SCAN)
             seen_here += 1
 
             children = []  # type: List[Tuple[str, Tuple[str, ...]]]
@@ -1084,21 +1095,33 @@ def walk(
     # proves the *directories* were processed, not that their tallies arrived.
     # Ranking such a subtree is the exact failure `finished_tops` exists to
     # prevent, so it is abandoned like any other unfinished one.
+    root_stranded = False
     for i in stranded:
+        if _ROOT_SCAN in inflight[i]:
+            root_stranded = True
         abandoned_tops |= inflight[i]
     res.abandoned_workers = door[1]
     res.elapsed = time.perf_counter() - t0
     with links_lock:
         res.hardlinked_inodes = len(seen_links)
-    res.finished_tops = finished_tops - abandoned_tops
-    # A depth-1 plain file is complete the moment the root was scanned; only
-    # directories can be caught mid-walk. The dirname check is load-bearing: at
-    # depth > 1 dir_agg also holds deeper entries, and adding the basename of a
-    # file at `a/b` would mark a *different*, still-unfinished top-level
-    # directory named `b` as complete.
-    for entry in res.dir_agg.values():
-        if not entry.is_dir and os.path.dirname(entry.path) == root:
-            res.finished_tops.add(os.path.basename(entry.path))
+    if root_stranded:
+        # The root's scan charges every depth-1 entry with its own inode and its
+        # own blocks, so losing it leaves *all* of them short by exactly
+        # themselves. A uniform small error is still an error, and the promise
+        # `finished_tops` makes is exactness, not closeness -- so nothing is
+        # rankable and the report says the walk was abandoned.
+        res.finished_tops = set()
+        abandoned_tops.add(_ROOT_SCAN)
+    else:
+        res.finished_tops = finished_tops - abandoned_tops
+        # A depth-1 plain file is complete the moment the root was scanned; only
+        # directories can be caught mid-walk. The dirname check is load-bearing: at
+        # depth > 1 dir_agg also holds deeper entries, and adding the basename of a
+        # file at `a/b` would mark a *different*, still-unfinished top-level
+        # directory named `b` as complete.
+        for entry in res.dir_agg.values():
+            if not entry.is_dir and os.path.dirname(entry.path) == root:
+                res.finished_tops.add(os.path.basename(entry.path))
     if progress is not None:
         progress.finished = True
     return res
