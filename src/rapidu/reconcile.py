@@ -83,6 +83,37 @@ def _tolerance(quota_value: int, kind: str) -> int:
     return max(frac, MIN_TOLERANCE_BYTES)
 
 
+# The floor may absorb noise; it may never absorb most of the comparison. A tenth
+# is the line: five times the 2% fraction, so it never binds on a real quota, and
+# small enough that a difference which is most of what was measured cannot hide
+# under it.
+_FLOOR_SHARE_OF_SCALE = 10
+
+
+def _effective_tolerance(quota_value: int, accounted: int, kind: str) -> int:
+    """:func:`_tolerance`, capped so it cannot swallow the measurement.
+
+    The absolute floors exist to keep rounding noise on a small tree from reading
+    as a discrepancy, and unbounded they did the opposite of what this module is
+    for. With a quota row reporting 0 and a walk of 4.7 MiB, the 8 MiB floor made
+    the verdict ``reconciles ... (within 8.0 MiB)`` -- a comparison that never
+    happened, printed in green, which ``MIN_TOLERANCE_BYTES``' own comment names
+    as the thing it must not do.
+
+    So the floor is capped at a tenth of the larger operand. On any realistic
+    quota the 2% fraction dominates and this changes nothing; on a small one the
+    tolerance shrinks with what is being compared, which is the only way a
+    difference of 100% of the measurement cannot be called agreement.
+    """
+    raw = _tolerance(quota_value, kind)
+    scale = max(abs(quota_value), abs(accounted))
+    if not scale:
+        # Nothing on either side. There is no measurement to swallow, and a
+        # zero-vs-zero comparison closes on the exact figures anyway.
+        return raw
+    return min(raw, max(scale // _FLOOR_SHARE_OF_SCALE, 1))
+
+
 def _fileset_hint(path: str, mount: str) -> str:
     """The fileset ``path`` most likely belongs to: its first component below ``mount``.
 
@@ -216,9 +247,16 @@ def reconcile(
             return rec
 
     # ---- what the walk saw, restricted to the same population as the quota ----
+    # Both halves of `accounted` have to be narrowed to the quota's population,
+    # not just the walk. Adding every unlinked-but-open inode on the node to a
+    # uid-filtered walk figure compared two different populations and called the
+    # remainder a gap -- and the /proc scan is precisely where another user's
+    # bytes show up, because the motivating case is a shared group directory.
     my_uid = os.getuid()
+    user_scoped = row.scope == "user"
+    mine = deleted.owned_by(my_uid) if user_scoped else deleted.files
     if kind == "blocks":
-        if row.scope == "user":
+        if user_scoped:
             rec.walk_value = res.by_uid.get(my_uid, (0, 0))[0]
             if len(res.by_uid) > 1:
                 rec.notes.append(
@@ -229,15 +267,33 @@ def reconcile(
                 )
         else:
             rec.walk_value = res.size
-        rec.deleted_value = deleted.total_size
+        rec.deleted_value = sum(f.size for f in mine)
     else:
-        if row.scope == "user":
+        if user_scoped:
             rec.walk_value = res.by_uid.get(my_uid, (0, 0))[1]
+            # The same sentence the blocks branch has always printed. Without it
+            # the files comparison silently dropped every inode owned by someone
+            # else and then reported the shortfall as a difference, with nothing on
+            # screen to say the two sides counted different things.
+            if len(res.by_uid) > 1:
+                rec.notes.append(
+                    "the quota row is user-scoped, so only the {} inodes you own "
+                    "of the {} walked are compared".format(
+                        human_count(rec.walk_value), human_count(res.inodes)
+                    )
+                )
         else:
             rec.walk_value = res.inodes
-        rec.deleted_value = len(deleted.files)
+        rec.deleted_value = len(mine)
+    if user_scoped and len(mine) != len(deleted.files):
+        rec.notes.append(
+            "{} of the {} unlinked-but-open inodes found are owned by other "
+            "users and are excluded from this user-scoped comparison".format(
+                len(deleted.files) - len(mine), len(deleted.files)
+            )
+        )
 
-    rec.tolerance = _tolerance(row.used, kind)
+    rec.tolerance = _effective_tolerance(row.used, rec.accounted or 0, kind)
     rec.gap = row.used - (rec.accounted or 0)
 
     # ---- does the walk even cover the same tree the quota counts? ----

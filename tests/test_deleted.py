@@ -91,12 +91,27 @@ def test_same_inode_from_two_fds_counted_once(tmp_path):
 
 
 def test_reports_what_it_could_not_inspect():
-    """On a shared node other users' processes are EACCES, and that is a floor."""
+    """On a shared node other users' processes are EACCES, and that is a floor.
+
+    ``complete`` means "nothing was hidden from us", and there are three ways to
+    be hidden, not one: another user's process (EACCES), a PID namespace that
+    shows only its own processes, and a sweep abandoned on a hung mount. This
+    used to assert ``complete == (unreadable_pids == 0)``, which was the
+    definition *before* the other two were added -- so it passed on a login node
+    (775 processes unreadable, both sides False) and on GitHub's runners, and
+    failed in any container where you are the only user: nothing unreadable,
+    namespaced anyway.
+    """
     scan = D.scan()
     assert scan.available
     assert scan.scanned_pids > 0
-    # complete == "no process was hidden from us"
-    assert scan.complete == (scan.unreadable_pids == 0)
+    assert scan.complete == (
+        scan.unreadable_pids == 0 and not scan.namespaced and not scan.timed_out
+    )
+    # And the part that was worth asserting all along: any one of the three is
+    # enough to make the figure a floor.
+    if scan.unreadable_pids or scan.namespaced or scan.timed_out:
+        assert not scan.complete
 
 
 def test_under_preserves_incompleteness():

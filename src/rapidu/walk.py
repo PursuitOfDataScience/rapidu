@@ -36,6 +36,12 @@ DEFAULT_THREADS = 8
 # A file modified this recently may not have its blocks allocated yet on GPFS.
 DEFAULT_SETTLE_WINDOW_S = 120.0
 
+# How long an interrupted walk waits for its workers *in total* before publishing
+# what it has. A worker inside `scandir` on a hung mount cannot be woken -- the
+# syscall is uninterruptible and no signal reaches it -- so the wait has to end
+# somewhere, and ^C has to stay responsive when it does.
+STOP_GRACE_S = 5.0
+
 # What skipping `stat` is worth. Held on both trees it has been measured on --
 # 782k GPFS inodes (27.3s -> 3.4s) and 1.69M (58.7s -> 7.1s) -- which is why the
 # README states one figure for both. Defined here once because the walk
@@ -106,6 +112,27 @@ WATCHED_DIR_NAMES = frozenset(
 )
 
 
+class _NoEntries:
+    """An empty stand-in for a ``ScandirIterator``, for a directory never opened.
+
+    Used when the walk was stopped while the rate limiter held this directory:
+    the bookkeeping at the end of the loop body still has to run -- it releases
+    the directory's pending count, and skipping it deadlocks the walk -- so the
+    scan is emptied rather than jumped over.
+    """
+
+    def __enter__(self) -> Tuple:
+        return ()
+
+    def __exit__(self, *exc: Any) -> None:
+        # None, not False: `typing.Literal` is the alternative mypy accepts here
+        # and it does not exist on the 3.6 floor this package still runs on.
+        return None
+
+
+_NO_ENTRIES = _NoEntries()
+
+
 class TokenBucket:
     """Rate limiter over directory opens. Disabled when ``rate <= 0``."""
 
@@ -116,19 +143,38 @@ class TokenBucket:
         self._last = time.monotonic()
         self._lock = threading.Lock()
 
-    def take(self) -> None:
+    def take(self, stop: Optional["threading.Event"] = None) -> bool:
+        """Wait for one token. False when ``stop`` was set before one arrived.
+
+        **The stop event is checked, because ``--max-dirs-per-sec`` is a
+        deliberate way to park a worker for a long time.** At 0.2 dirs/sec a
+        thread sits here for seconds per directory, and a version of this loop
+        that only slept could not be woken: after ^C the walk's bounded join
+        expired with workers still queued for a token, and they were abandoned
+        holding measurements the report then had to do without. A rate limit is
+        the one place in the walk where the blocking is ours to interrupt, so it
+        is interruptible.
+        """
         if self.rate <= 0:
-            return
+            return True
         while True:
+            if stop is not None and stop.is_set():
+                return False
             with self._lock:
                 now = time.monotonic()
                 self._tokens = min(self.capacity, self._tokens + (now - self._last) * self.rate)
                 self._last = now
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
-                    return
+                    return True
                 deficit = (1.0 - self._tokens) / self.rate
-            time.sleep(min(deficit, 0.25))
+            if stop is not None:
+                # Woken by the stop event rather than by the clock, so a ^C is
+                # felt immediately instead of up to 0.25s later.
+                if stop.wait(min(deficit, 0.25)):
+                    return False
+            else:
+                time.sleep(min(deficit, 0.25))
 
 
 class Progress:
@@ -278,6 +324,11 @@ class WalkResult:
         # the result that can honestly be reported, because a subtree still in
         # flight has an arbitrary fraction of its contents counted.
         self.finished_tops = set()  # type: Set[str]
+        # Worker threads still blocked when an interrupted walk stopped waiting
+        # for them. Their measurements were discarded (see `walk`), so this is not
+        # a diagnostic detail -- it is the reason the figures below are lower than
+        # what the walk had already counted, and the report says so.
+        self.abandoned_workers = 0
 
     @property
     def complete(self) -> bool:
@@ -316,13 +367,35 @@ class WalkResult:
         """
         return self.files + self.dirs - self.hardlink_extra_refs
 
+    @property
+    def density_floor(self) -> int:
+        """Inodes a subtree needs before it may enter a density ranking.
+
+        Exposed rather than kept local to :meth:`top_dirs` because a filter that
+        can empty a whole table has to be nameable by whatever prints "nothing
+        here met it" -- an empty table with no explanation is the same failure as
+        a wrong one.
+        """
+        return max(100, self.inodes // 100)
+
     def top_dirs(self, n: int, key: str = "size", finished_only: bool = False) -> List[Entry]:
         """Reported directories ranked by ``size``, ``files`` or ``density``.
 
         ``finished_only`` drops entries whose subtree was still being walked,
         which is what an interrupted run must report: a half-counted directory
         placed in a ranking is not a small error, it is the wrong answer.
+
+        **A stat-free walk cannot be ranked by bytes.** Every ``size`` is zero
+        after ``-c``, and sorting an all-zero key is not a ranking: it returns
+        dict insertion order, which is thread merge order, which changes from run
+        to run. Six consecutive ``rdu -c`` runs on one tree produced four
+        different orderings, and at ``-n 3`` the second-largest directory in the
+        tree was hidden behind "2 more". So the key falls back to the one
+        measurement the walk actually has, rather than silently ranking by a
+        column of zeroes.
         """
+        if self.count_only and key in ("size", "density"):
+            key = "files"
         aggs = [a for a in self.dir_agg.values() if a.path != self.root]
         if finished_only:
             aggs = [a for a in aggs if self.is_finished(a)]
@@ -332,7 +405,7 @@ class WalkResult:
             # Files per GiB: the "what should I pack" signal. Restricted to
             # subtrees that hold enough inodes to be worth packing, so the
             # ranking is not won by a 4 KiB directory with three files in it.
-            floor = max(100, self.inodes // 100)
+            floor = self.density_floor
             aggs = [a for a in aggs if a.inodes >= floor and a.size > 0]
             aggs.sort(key=lambda a: a.inodes / max(a.size / float(1 << 30), 1e-9), reverse=True)
         else:
@@ -397,6 +470,15 @@ def walk(
       a few percent of inodes and keeps the flag honest; before, it was accepted
       and silently ignored.
 
+    **An interrupted walk publishes a snapshot, not a live object.** ``stop`` and
+    ^C cannot reach a worker blocked inside ``scandir`` on a hung mount, so after
+    :data:`STOP_GRACE_S` the walk stops waiting and shuts the merge door: threads
+    that are still running can no longer write to the returned
+    :class:`WalkResult`, and every depth-1 subtree they took work from is excluded
+    from ``finished_tops``. The cost is real and is reported rather than hidden --
+    ``abandoned_workers`` counts the threads whose tallies were dropped, so the
+    reader knows the figures are lower than what the walk had already counted.
+
     Memory grows with the tree and is not bounded. Measured at 19-35 bytes of RSS
     per inode, but the spread is the point: the per-inode figure is a property of
     hard-link density and frontier width, not of inode count, so it does not
@@ -455,6 +537,24 @@ def walk(
     links_lock = threading.Lock()
 
     merge_lock = threading.Lock()
+    # The merge door. An interrupted walk stops waiting for workers that are
+    # blocked in an uninterruptible `scandir` (a hung mount is the case that
+    # matters), and those threads stay live. Before this existed they went on to
+    # merge into `res` minutes after `walk` had returned it: measured on a hung
+    # fixture, the caller was handed 2.3 MiB / 601 files and the *same object*
+    # read 8.3 MiB / 1,600 files thirty seconds later, with the renderer already
+    # iterating `dir_agg` while it grew. `deleted.scan` bounds exactly this hazard
+    # by snapshotting its results; the walk now does the same, by shutting the
+    # door under the lock every merge already takes.
+    #
+    # [0] closed, [1] how many workers never got through it.
+    door = [False, 0]
+    merged = [False] * nthreads
+    # Per worker, the depth-1 subtrees it has taken work from. A worker's tallies
+    # live in thread locals until it exits, so if it never merges, every subtree
+    # it touched is missing an unknown fraction of its contents -- which is
+    # precisely what `finished_tops` promises cannot happen.
+    inflight = [set() for _ in range(nthreads)]  # type: List[Set[str]]
 
     def account_root() -> None:
         # du counts the root directory's own inode. In count mode there are no
@@ -518,6 +618,13 @@ def walk(
                     cv.notify_all()
                     break
                 d, d_parts = queue.popleft()
+                # Recorded under `cv`, which this already holds, and never
+                # cleared: a worker merges once, at exit, so until then every
+                # subtree in here has tallies that exist nowhere else. No worker
+                # reaches this line after `stop_ev` is set, so the main thread can
+                # read these sets as final once it has stopped the walk.
+                if d_parts:
+                    inflight[slot_id].add(d_parts[0])
             seen_here += 1
 
             children = []  # type: List[Tuple[str, Tuple[str, ...]]]
@@ -567,19 +674,22 @@ def walk(
                         watch.append(wslot)
             dsep = d if d.endswith(sep) else d + sep
 
-            try:
-                if bucket is not None:
-                    bucket.take()
-            except Exception as exc:  # noqa: BLE001  (a hang is worse than a report)
-                failure = "rate limiter: {}".format(exc)
-
             k = 0
             # Did this directory's own scan stop early? A truncated scan means the
             # subtree is not complete even when it enqueued no children, so it
             # cannot be allowed to mark its top-level ancestor finished. See #19.
             d_truncated = False
             try:
-                with scandir(d) as it:
+                if bucket is not None and not bucket.take(stop_ev):
+                    # Stopped while queued for a token, so this directory was
+                    # never opened at all. Not an error and not unreadable -- just
+                    # work the walk did not do, which is what `d_truncated` means.
+                    d_truncated = True
+            except Exception as exc:  # noqa: BLE001  (a hang is worse than a report)
+                failure = "rate limiter: {}".format(exc)
+
+            try:
+                with _NO_ENTRIES if d_truncated else scandir(d) as it:
                     if count_only:
                         # No stat: d_type from getdents is enough to tell a
                         # directory from anything else, and that is all a count
@@ -868,6 +978,13 @@ def walk(
                     cv.notify_all()
 
         with merge_lock:
+            if door[0]:
+                # The result was published without us. Merging now would rewrite
+                # numbers the caller has already read and may already have
+                # printed, so these tallies are dropped -- and `abandoned_workers`
+                # is what tells the reader they existed.
+                return
+            merged[slot_id] = True
             res.size += l_size
             res.apparent += l_app
             res.files += l_files
@@ -921,23 +1038,58 @@ def walk(
     ]
     for w in workers:
         w.start()
-    try:
-        for w in workers:
-            w.join()
-    except KeyboardInterrupt:
-        stop_ev.set()
-        with cv:
-            cv.notify_all()
-        for w in workers:
-            w.join(timeout=5.0)
+    # Unbounded until something asks the walk to stop, bounded after. A slow walk
+    # is not an error and has to be allowed to finish; a *stopped* one must not
+    # leave the caller waiting on a syscall that will never return.
+    #
+    # One deadline for the whole wait, not one per worker. `join(timeout=5.0)` in a
+    # loop is five seconds *each*: measured at 11s with two blocked workers and 40s
+    # at the default -t 8, so the bound that exists to keep ^C responsive scaled
+    # with the thread count it was meant to be independent of. And the bound now
+    # covers the `stop` parameter too, which had none at all -- a caller that set
+    # `stop` against a hung mount waited on `join()` forever, which is the same
+    # unbounded-blocking-call-on-the-emergency-path that `deleted.scan` exists to
+    # avoid.
+    deadline = None  # type: Optional[float]
+    pending = list(workers)
+    while pending:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        try:
+            pending[0].join(timeout=0.25)
+            if not pending[0].is_alive():
+                pending.pop(0)
+        except KeyboardInterrupt:
+            stop_ev.set()
+            with cv:
+                cv.notify_all()
+        if deadline is None and stop_ev.is_set():
+            deadline = time.monotonic() + STOP_GRACE_S
     # Any stop, not just a KeyboardInterrupt. `stop` is a documented parameter, and
     # a caller that used it got early termination with `partial` still False -- so
     # `complete` depended only on unreadable/unstatable counts and a walk that
     # halted at 18% of the tree could report as a finished measurement.
     if stop_ev.is_set():
         res.partial = True
+    # Shut the merge door before reading anything out of `res`. Everything below
+    # -- and everything the caller does afterwards -- then runs against a result
+    # no worker can still be writing to. It also makes the `dir_agg` iteration
+    # below safe: a worker merging concurrently would resize the dict mid-loop.
+    with merge_lock:
+        door[0] = True
+        stranded = [i for i, ok in enumerate(merged) if not ok]
+        door[1] = len(stranded)
+    # A subtree an abandoned worker took work from is missing an unknown fraction
+    # of its contents, whatever `outstanding` says: the counter reaching zero
+    # proves the *directories* were processed, not that their tallies arrived.
+    # Ranking such a subtree is the exact failure `finished_tops` exists to
+    # prevent, so it is abandoned like any other unfinished one.
+    for i in stranded:
+        abandoned_tops |= inflight[i]
+    res.abandoned_workers = door[1]
     res.elapsed = time.perf_counter() - t0
-    res.hardlinked_inodes = len(seen_links)
+    with links_lock:
+        res.hardlinked_inodes = len(seen_links)
     res.finished_tops = finished_tops - abandoned_tops
     # A depth-1 plain file is complete the moment the root was scanned; only
     # directories can be caught mid-walk. The dirname check is load-bearing: at
@@ -978,7 +1130,10 @@ class SettleCheck:
         self.sampled_of = 0  # how many recent files existed, if we sampled
         self.drift = 0  # SIGNED change in allocated blocks since the walk
         self.gone = 0  # files that disappeared between walk and re-stat
-        self.window = DEFAULT_SETTLE_WINDOW_S
+        # No `window` field. It was assigned here and again in
+        # `recheck_settling`, and read nowhere: every consumer -- `render_settle`,
+        # `to_json` -- reads `WalkResult.settle_window`, which is where the window
+        # is actually decided. Two homes for one number is how they drift apart.
         self.gap = 0.0  # seconds between the walk reading and the re-stat
         self.ran = False
 
@@ -1018,7 +1173,6 @@ def recheck_settling(res: WalkResult, wait: float = 0.0) -> SettleCheck:
     drift instead of merely suspecting it.
     """
     chk = SettleCheck()
-    chk.window = res.settle_window
     chk.sampled_of = res.recent_files
     if not res.recent_sample:
         # Nothing was written recently, so there is nothing to be unsettled.

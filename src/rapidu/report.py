@@ -78,6 +78,43 @@ def _counter(n: Optional[int]) -> str:
     return human_count(n)
 
 
+# `-n 0` means every entry. Large enough to be every entry of anything, small
+# enough to slice a list with.
+_ALL = 10**9
+
+
+def _limit(top: int) -> int:
+    """``-n`` as a slice bound. ``0`` means *all*, never *none*.
+
+    ``main`` validates ``-n 0`` with the words "0 means every entry" and
+    :func:`render_entries` honoured that -- but ``to_json`` and
+    :func:`render_deleted` passed the raw value straight into a slice, where 0
+    means the opposite. So ``rdu --json -n 0`` published an empty ``top_by_size``
+    and ``rdu -D -n 0`` listed no files at all and then printed "... and 3 more",
+    announcing the rows it had just been asked to show. One reading of the flag,
+    in one place.
+    """
+    return top if top > 0 else _ALL
+
+
+def _sort_key(sort: str, by_inodes: bool, res: WalkResult) -> str:
+    """The one ranking key, resolved once for every consumer of a listing.
+
+    The table, the hairline sized to it and the JSON document have to agree about
+    what the rows were ranked by. They did not: ``render_entries`` took the CLI's
+    key, ``_entry_names`` recomputed a *different* one from ``by_inodes`` alone,
+    and the count-mode fallback that would have caught it was dead because the CLI
+    always passes a non-empty ``sort``.
+    """
+    key = sort or ("files" if (by_inodes or res.count_only) else "size")
+    # A stat-free walk has no bytes to rank or divide by. `top_dirs` enforces this
+    # too, for a direct caller; doing it here as well keeps the header, the tones
+    # and the note below in step with the rows.
+    if res.count_only and key in ("size", "density"):
+        key = "files"
+    return key
+
+
 def render_quota(
     snap: QuotaSnapshot, paths: Optional[List[str]] = None, style: Optional[ui.Style] = None
 ) -> List[str]:
@@ -277,7 +314,15 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
     if not groups:
         return []
 
-    ranked = sorted(groups.items(), key=lambda kv: sum(v[0] for v in kv[1]), reverse=True)
+    # A stat-free walk has no bytes for any of these, so the ranking and the
+    # figures both move to the one measurement it does have. Ranking by an all-zero
+    # key returns thread merge order, and printing `0 B` for a real cache is the
+    # fabricated zero this module's docstring forbids.
+    counts = res.count_only
+    weight = (
+        (lambda hits: sum(h[1] for h in hits)) if counts else (lambda hits: sum(h[0] for h in hits))
+    )
+    ranked = sorted(groups.items(), key=lambda kv: weight(kv[1]), reverse=True)
     out = ["", ui.heading("RECLAIMABLE", style)]
     out.extend(
         _wrapped(
@@ -287,12 +332,20 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
             "  ",
         )
     )
-    total = 0
-    for pattern, hits in ranked[:6]:
-        hits.sort(reverse=True)
+    # Every kind, not the six that are printed. `total` used to accumulate inside
+    # the display loop, so on any tree with more than six kinds of cache -- a home
+    # directory with conda, pip, uv, HF, node_modules and a couple of tool caches
+    # is already past it -- the figure labelled "in total" was the top six only,
+    # and the share of the tree computed from it was understated with it.
+    total = sum(sum(h[0] for h in hits) for _pattern, hits in ranked)
+    total_inodes = sum(sum(h[1] for h in hits) for _pattern, hits in ranked)
+    shown = ranked[:6]
+    for pattern, hits in shown:
+        hits.sort(
+            key=(lambda h: (h[1], h[0])) if counts else (lambda h: (h[0], h[1])), reverse=True
+        )
         size = sum(h[0] for h in hits)
         inodes = sum(h[1] for h in hits)
-        total += size
         # One hit names the actual directory; several name the pattern and count.
         # Printing the *pattern* for a single hit dropped the one thing the reader
         # needs -- which directory it is -- in favour of restating the rule.
@@ -302,7 +355,9 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
             label = "{}x {}".format(len(hits), pattern)
         out.append(
             "  {:>10}  {:>10} files  {}".format(
-                style.paint(human_bytes(size), "bold"), human_count(inodes), label
+                style.paint("n/a" if counts else human_bytes(size), "bold"),
+                human_count(inodes),
+                label,
             )
         )
         command = commands.get(pattern)
@@ -311,14 +366,33 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
         )
         if len(hits) > 1:
             examples = ", ".join(
-                "{} ({})".format(os.path.relpath(h[2], res.root), human_bytes(h[0]))
+                "{} ({})".format(
+                    os.path.relpath(h[2], res.root),
+                    "{} files".format(human_count(h[1])) if counts else human_bytes(h[0]),
+                )
                 for h in hits[:2]
             )
             out.extend(_wrapped("largest: " + examples, style, "              "))
-    if len(ranked) > 6:
-        out.append(style.paint("  ... and {} more kinds".format(len(ranked) - 6), "dim"))
-    share = " ({} of the tree)".format(pct(total / float(res.size), 1.0)) if res.size else ""
-    out.append(style.paint("  {} reclaimable in total{}".format(human_bytes(total), share), "dim"))
+    if len(ranked) > len(shown):
+        rest = ranked[len(shown) :]
+        out.append(
+            style.paint(
+                "  ... and {} more kinds ({}), counted in the total below".format(
+                    len(rest),
+                    "{} files".format(human_count(sum(sum(h[1] for h in v) for _p, v in rest)))
+                    if counts
+                    else human_bytes(sum(sum(h[0] for h in v) for _p, v in rest)),
+                ),
+                "dim",
+            )
+        )
+    if counts:
+        share = " ({} of the tree)".format(pct(total_inodes, res.inodes)) if res.inodes else ""
+        figure = "{} files".format(human_count(total_inodes))
+    else:
+        share = " ({} of the tree)".format(pct(total, res.size)) if res.size else ""
+        figure = human_bytes(total)
+    out.append(style.paint("  {} reclaimable in total{}".format(figure, share), "dim"))
     return out
 
 
@@ -399,11 +473,12 @@ def render_entries(
     # contents, and placing that in an ordered table is not an approximation --
     # it is the wrong answer, presented with the authority of the right one.
     # -n 0 means "all of them", not "none".
-    limit = top if top > 0 else 10**9
-    key = sort or ("files" if by_inodes else "size")
+    limit = _limit(top)
+    key = _sort_key(sort, by_inodes, res)
     ranked = res.top_dirs(limit, key, finished_only=res.partial)
     if not ranked:
         return []
+    by_density = key == "density"
 
     rest_size = max(0, res.size - sum(e.size for e in ranked))
     rest_inodes = max(0, res.inodes - sum(e.inodes for e in ranked))
@@ -416,26 +491,49 @@ def render_entries(
     # leftover is exactly the root directory's own inode -- which belongs to no
     # child -- and reporting that as "(0 more)" is noise.
     hidden = _other_count(res, ranked)
-    show_rest = hidden > 0 and rest_size > 0 and not res.partial and _entries_partition_tree(res)
+    # A remainder row carries the leftover bytes and inodes, which is a sum. A
+    # density is a ratio, so there is nothing to sum and no bar to draw for "the
+    # rest" -- and the rows missing from a density listing are mostly missing
+    # because of the inode floor, not because of -n, so the row's "use -n 0 for
+    # all" would be a false instruction.
+    show_rest = (
+        hidden > 0
+        and rest_size > 0
+        and not res.partial
+        and not by_density
+        and _entries_partition_tree(res)
+    )
     # The remainder row carries bytes, so it is only well defined when the listed
     # rows are siblings that partition the tree -- at depth > 1 they nest and it
     # would double-count. But "there are rows you are not seeing" is true at any
     # depth, and the table used to just stop without saying so: at `-d 2 -n 10` it
     # showed ten of fifty-nine and looked complete. A count with no byte figure
     # attached is honest at every depth.
-    say_hidden = hidden > 0 and not show_rest and not res.partial
+    # "N more -- use -n 0 for all" is a false instruction on a density listing:
+    # what is missing is mostly below the inode floor, and -n will not bring it
+    # back. `_density_floor_note` says the true thing instead, and `_table` adds it
+    # *after* the rows -- prose in here would end up sizing the hairline, which is
+    # measured off the widest row it is drawn over.
+    say_hidden = hidden > 0 and not show_rest and not res.partial and not by_density
 
     # The bar and the share must measure whatever the rows were ranked by, or a
     # -i listing shows an inode ordering with byte-length bars and reads as
     # though it were mis-sorted.
     def metric(e):
-        return e.inodes if (by_inodes or res.count_only) else e.size
+        if by_density:
+            return files_per_gib(e.size, e.inodes) or 0.0
+        return e.inodes if key == "files" else e.size
 
     # A share needs a denominator. After an interrupt there is no tree total, so
     # the column is blanked rather than filled with a fraction of an accident.
-    if res.partial:
+    #
+    # Density has no total either, and for a different reason: files-per-GiB is a
+    # ratio, so densities do not add up to a tree's density and no row is a
+    # "share" of anything. The bar falls back to ranking against the densest row
+    # and the percentage column is left empty, exactly as after an interrupt.
+    if res.partial or by_density:
         total = 0
-    elif by_inodes or res.count_only:
+    elif key == "files":
         total = res.inodes or 1
     else:
         total = res.size or 1
@@ -457,7 +555,7 @@ def render_entries(
     # rows share a tone only when they are genuinely the same size.
     tones = style.heat_scale([metric(e) for e in ranked])
 
-    ranked_by_files = bool(by_inodes or res.count_only)
+    ranked_by_files = key == "files"
     rows = [
         _entry_line(
             os.path.relpath(e.path, res.root) + ("/" if e.is_dir else ""),
@@ -471,6 +569,8 @@ def render_entries(
             indent,
             size_hidden=res.count_only,
             ranked_by_files=ranked_by_files,
+            density=files_per_gib(e.size, e.inodes) if by_density else None,
+            ranked_by_density=by_density,
         )
         for e, tone in zip(ranked, tones)
     ]
@@ -493,6 +593,8 @@ def render_entries(
                 aggregate=True,
                 size_hidden=res.count_only,
                 ranked_by_files=ranked_by_files,
+                density=files_per_gib(rest_size, rest_inodes) if by_density else None,
+                ranked_by_density=by_density,
             )
         )
     elif say_hidden:
@@ -508,6 +610,42 @@ def render_entries(
     return rows
 
 
+def _density_floor_note(
+    res: WalkResult, style: ui.Style, indent: str = "  ", shown: int = 0
+) -> List[str]:
+    """Why a density ranking is short, or empty.
+
+    ``top_dirs`` drops any subtree holding fewer than
+    :attr:`WalkResult.density_floor` inodes, because files-per-GiB is won by the
+    smallest denominator and a 4 KiB directory with three files in it is not the
+    answer to "what should I pack". That filter is right and it is also invisible:
+    on an ordinary tree it removes *everything*, and ``rdu --sort density`` printed
+    a headline, no table, and exited 0 -- which reads as "there is nothing dense
+    here" when what happened is that the question was never answered.
+
+    Two lines at most, and only when something was actually dropped.
+    """
+    total = _entry_total(res)
+    dropped = total - shown
+    if dropped <= 0:
+        return []
+    tail = (
+        ""
+        if shown
+        else " Nothing here clears it, so there is no density ranking to show;"
+        " --sort files ranks the same tree by inode count."
+    )
+    return _wrapped(
+        "{} of {} entries hold fewer than {} files and cannot be ranked by "
+        "density -- the measure is files per GiB, so a nearly empty directory "
+        "wins it on the denominator alone.{}".format(
+            human_count(dropped), human_count(total), human_count(res.density_floor), tail
+        ),
+        style,
+        indent,
+    )
+
+
 _BAR_W = 18
 
 
@@ -515,7 +653,7 @@ def _entry_line(
     name: str,
     size: int,
     inodes: int,
-    value: int,
+    value: float,
     fraction: float,
     total: int,
     tone: str,
@@ -524,6 +662,8 @@ def _entry_line(
     aggregate: bool = False,
     size_hidden: bool = False,
     ranked_by_files: bool = False,
+    density: Optional[float] = None,
+    ranked_by_density: bool = False,
 ) -> str:
     """One row. ``fraction`` drives the bar; ``tone`` is assigned by the listing.
 
@@ -546,20 +686,34 @@ def _entry_line(
     it takes a hatched bar and the muted tone throughout: it still shows its true
     length -- a quarter of the tree is worth seeing -- without impersonating a
     single directory that size.
+
+    ``density`` adds the files-per-GiB column, and only ``--sort density`` passes
+    it. Before that the rows were *ordered* by a number that appeared nowhere in
+    the output -- neither column moved monotonically down the table and the reader
+    had no way to see the value they had asked to rank by, or to check the ranking
+    against anything. A ranking whose key is invisible is indistinguishable from a
+    broken sort.
     """
     lead = style.muted if aggregate else tone
     bar = ui.bar(fraction, _BAR_W, style, accent=lead, hatched=aggregate)
     # In count mode there are no sizes at all, so the column is omitted rather
     # than left as ten blank characters the eye has to step over.
-    size_tone = style.muted if (ranked_by_files and not aggregate) else lead
-    files_tone = lead if (ranked_by_files or aggregate) else style.muted
+    quiet = ranked_by_files or ranked_by_density
+    size_tone = style.muted if (quiet and not aggregate) else lead
+    files_tone = lead if ((ranked_by_files and not ranked_by_density) or aggregate) else style.muted
     size_cell = "" if size_hidden else style.paint(human_bytes(size).rjust(10), size_tone) + "  "
-    return "{}{}{}  {}  {}  {}".format(
+    if density is None:
+        dens_cell = ""
+    else:
+        dens_tone = style.muted if aggregate else lead
+        dens_cell = "  " + style.paint("{:>10,.0f}".format(density), dens_tone)
+    return "{}{}{}  {}  {}{}  {}".format(
         indent,
         size_cell,
         bar,
         style.paint("{:>6}".format(pct(value, total) if total else ""), lead),
         style.paint("{:>9}".format(human_count(inodes)), files_tone),
+        dens_cell,
         # `muted`, not `dim`. The remainder row names real content -- "91 more" is
         # a measurement of the tree, not a caveat about it -- and painting it the
         # context grey made the one row that tells you the table is truncated the
@@ -569,11 +723,7 @@ def _entry_line(
     )
 
 
-# indent + size(10) + 2 + bar + 2 + share(6) + 2 + files(9) + 2
-_FIXED_COLS = 2 + 10 + 2 + 2 + 6 + 2 + 9 + 2
-
-
-def _entries_rule(style: ui.Style, names: List[str], indent: str = "  ") -> str:
+def _entries_rule(style: ui.Style, rows: List[str], indent: str = "  ") -> str:
     """A hairline between the header and the table, sized to the table.
 
     One dim rule separates the header from the table. It is drawn in the same
@@ -584,10 +734,21 @@ def _entries_rule(style: ui.Style, names: List[str], indent: str = "  ") -> str:
     forty characters past the last column looks like a mistake. That also means it
     is *narrower* than the frame around it, which is deliberate: the frame bounds
     the report, the rule divides one section of it.
+
+    **Measured off the rows it is drawn over, not reconstructed from a column
+    tally.** The tally was wrong twice over: it double-counted the indent, so the
+    rule overhung by two columns on every listing ever printed, and it counted the
+    12-column size field in ``-c`` mode where that field is not printed at all, for
+    a 14-column overhang. It also took its widest name from a *differently sorted*
+    list than the table, so ``--sort density`` sized the rule from rows that were
+    not in it. Passing the rendered rows in makes all three impossible, and keeps
+    the rule right when a column is added -- as the density column just was.
+    ``ui.visible_width`` is what does the work: escapes are free and a wide glyph
+    costs two columns.
     """
     glyph = "\u2500" if style.unicode else "-"
-    widest = max([len(n) for n in names] or [8])
-    span = min(style.width - len(indent) - 1, _FIXED_COLS + _BAR_W + widest)
+    widest = max([ui.visible_width(r) for r in rows] or [len(indent) + 8])
+    span = min(style.width - 1, widest) - len(indent)
     # The same near-background grey the bar tracks use, so the rule and the
     # eighteen boxes below it read as one frame rather than two greys.
     return style.paint(indent + glyph * max(20, span), style.track)
@@ -599,6 +760,7 @@ def _entries_header(
     size_label: str = "size",
     bar_label: str = "share",
     ranked_by_files: bool = False,
+    density: bool = False,
 ) -> str:
     """Column labels, with the one the table is sorted by marked.
 
@@ -644,17 +806,24 @@ def _entries_header(
     # the number but not the picture of the same measurement is the same mistake
     # one level down.
     ranked, plain = "bold", "dim"
-    size_tone = plain if ranked_by_files else ranked
-    files_tone = ranked if ranked_by_files else plain
+    # `density` is a third ranked column, so it takes the accent off both of the
+    # others: under `--sort density` neither the bytes nor the file count is what
+    # the table was ordered by, and marking one of them would point at the wrong
+    # number as confidently as the right one.
+    size_tone = plain if (ranked_by_files or density) else ranked
+    files_tone = ranked if (ranked_by_files and not density) else plain
     head = "" if not size_label else style.paint("{:>10}".format(size_label), size_tone) + "  "
-    return "{}{}{}  {}  {}  {}".format(
+    dens = "" if not density else "  " + style.paint("{:>10}".format("files/GiB"), ranked)
+    # The bar draws whichever metric was ranked, so its label inherits that
+    # column's weight rather than having one of its own.
+    bar_tone = ranked if density else (files_tone if ranked_by_files else size_tone)
+    return "{}{}{}  {}  {}{}  {}".format(
         indent,
         head,
-        style.paint(
-            "{:<{}}".format(bar_label, _BAR_W), files_tone if ranked_by_files else size_tone
-        ),
+        style.paint("{:<{}}".format(bar_label, _BAR_W), bar_tone),
         " " * 6,
         style.paint("{:>9}".format("files"), files_tone),
+        dens,
         style.paint("entry", plain),
     )
 
@@ -667,15 +836,6 @@ def _entries_partition_tree(res: WalkResult) -> bool:
     """True when every reported entry is a direct child of the root."""
     parents = {os.path.dirname(e.path) for e in res.dir_agg.values() if e.path != res.root}
     return parents == {res.root}
-
-
-def _entry_names(res: WalkResult, top: int, by_inodes: bool) -> List[str]:
-    limit = top if top > 0 else 10**9
-    key = "files" if (by_inodes or res.count_only) else "size"
-    return [
-        os.path.relpath(e.path, res.root) + ("/" if e.is_dir else "")
-        for e in res.top_dirs(limit, key, finished_only=res.partial)
-    ]
 
 
 def _entry_total(res: WalkResult) -> int:
@@ -823,22 +983,61 @@ def render_compact(
     out.extend(_hard_warnings(res, settle, style))
     out.extend(render_allocation(res, style))
     hint = _count_hint(res, by_inodes, style)
-    body = render_entries(res, top, by_inodes, style, sort=sort)
-    if body:
-        out.append(_entries_rule(style, _entry_names(res, top, by_inodes)))
-        out.append(
-            _entries_header(
-                style,
-                size_label="" if res.count_only else "size",
-                # An interrupted walk has no total to be a share of, so the bar
-                # falls back to ranking against the largest row and says so.
-                bar_label="vs largest" if res.partial else "share",
-                ranked_by_files=bool(by_inodes or res.count_only),
-            )
-        )
-        out.extend(body)
+    out.extend(_table(res, top, by_inodes, style, sort))
     out.extend(hint)
     return out
+
+
+def _table(
+    res: WalkResult,
+    top: int,
+    by_inodes: bool,
+    style: ui.Style,
+    sort: str,
+    indent: str = "  ",
+) -> List[str]:
+    """Rule, header and rows -- or the reason there are none.
+
+    Assembled in one place because the three have to agree about the sort key, the
+    column set and the width, and when they were assembled twice (once for the
+    compact view, once for the full report) they drifted: the header was told
+    ``by_inodes`` while the rows were ranked by ``sort``, and the rule was sized
+    from a third list again. It is also the only place that can notice a table came
+    back empty and say why, which ``--sort density`` needed and did not have.
+    """
+    key = _sort_key(sort, by_inodes, res)
+    body = render_entries(res, top, by_inodes, style, indent=indent, sort=sort)
+    note = []  # type: List[str]
+    if key == "density":
+        # The inode floor can shorten a density listing or empty it, and either way
+        # the reader has to be told. Kept out of `render_entries` and appended after
+        # the rows, so a paragraph of prose never ends up sizing the hairline --
+        # which is measured off the widest row it is drawn over.
+        shown = len(res.top_dirs(_limit(top), key, finished_only=res.partial))
+        note = _density_floor_note(res, style, indent, shown)
+    if not body:
+        # No rows at all: either the floor took everything, which is worth
+        # explaining, or the tree has no reportable children and there is nothing
+        # to say.
+        return ([""] + note) if note else []
+    return (
+        [
+            _entries_rule(style, body, indent),
+            _entries_header(
+                style,
+                indent=indent,
+                size_label="" if res.count_only else "size",
+                # An interrupted walk has no total to be a share of, and a density
+                # is not a share of anything, so the bar falls back to ranking
+                # against the largest row and says so.
+                bar_label="vs largest" if (res.partial or key == "density") else "share",
+                ranked_by_files=key == "files",
+                density=key == "density",
+            ),
+        ]
+        + body
+        + note
+    )
 
 
 # Below this a walk is over before the hint could have saved anything.
@@ -901,17 +1100,41 @@ def _hard_warnings(
                 style,
             )
         )
-        out.append(
-            style.paint(
-                "  {} of {} top-level entries were walked to completion and are"
-                " listed below; the rest is unknown, so there is no total and no"
-                " share of anything.".format(
-                    len(res.top_dirs(10**6, finished_only=True)),
-                    len([e for e in res.dir_agg.values() if e.path != res.root]),
-                ),
-                "dim",
+        # No denominator. It used to read "N of M top-level entries", with M taken
+        # from `dir_agg` -- the entries that had been *merged* -- so on an
+        # interrupted walk with a blocked worker it printed "2 of 2", meaning "all
+        # of them", while four subtrees had finished and two were being withheld.
+        # A ratio whose denominator is the same partial state as its numerator
+        # cannot say what it looks like it says, and there is no honest M here:
+        # how many entries the tree has is exactly what the walk did not find out.
+        out.extend(
+            _wrapped(
+                "{} top-level entries were walked to completion and are listed"
+                " below; the rest is unknown, so there is no total and no share of"
+                " anything.".format(human_count(len(res.top_dirs(10**6, finished_only=True)))),
+                style,
+                "  ",
             )
         )
+        if res.abandoned_workers:
+            # The measurements those threads held were dropped rather than merged
+            # into a result the caller had already been handed. That makes every
+            # figure below lower than what the walk had actually counted, which is
+            # not a detail -- it is the difference between "small tree" and
+            # "abandoned walk".
+            out.extend(
+                _wrapped(
+                    "{} walk thread{} still blocked -- almost certainly a stat or"
+                    " getdents on an unresponsive mount -- so the counts they had"
+                    " already made were discarded. The figures below are lower than"
+                    " what the walk had reached.".format(
+                        res.abandoned_workers,
+                        " was" if res.abandoned_workers == 1 else "s were",
+                    ),
+                    style,
+                    "  ",
+                )
+            )
     elif not res.complete:
         detail = []
         if res.unreadable_dirs:
@@ -956,12 +1179,19 @@ def render_walk(
     style = style or ui.resolve_style("never")
     # Same rule as the compact view and the table: the accent marks what the
     # listing was ranked by, so under `-i` it belongs on the count, not the bytes.
+    #
+    # In count mode there is no byte figure at all, and this printed `0 B` -- and
+    # `apparent 0 B` under it -- which is the one thing this module's own docstring
+    # forbids: an absent measurement prints `n/a` with a reason, never `0`. A
+    # reader given "0 B" for a tree with 165 files has been told something false,
+    # while `render_compact` on the same walk said "counts only, no sizes".
+    headline = "n/a" if res.count_only else human_bytes(res.size)
     out = [
         "",
         "{}  {}   {}".format(
             ui.heading("WALK", style),
             style.paint(ui.truncate(res.root, max(24, style.width - 28)), "bold"),
-            style.paint(human_bytes(res.size), VALUE if by_inodes else ACCENT),
+            style.paint(headline, VALUE if (by_inodes or res.count_only) else ACCENT),
         ),
     ]
 
@@ -974,13 +1204,20 @@ def render_walk(
         "{:.2f}s at {} threads ({:,.0f} files/s)".format(
             res.elapsed, res.threads, res.inodes / res.elapsed if res.elapsed > 0 else 0.0
         ),
+    ]
+    if res.count_only:
+        # The reason the headline is n/a, on the line where the reader looks for
+        # the number that is missing.
+        facts.insert(0, "counts only, no sizes: -c skips stat entirely")
+    else:
         # Stated as a ratio, not as a bare second number. "apparent 23.6 MiB"
         # beside "187.6 MiB" left the reader to divide.
-        "apparent {}{}".format(
-            human_bytes(res.apparent),
-            " ({:.1f}x allocated)".format(res.alloc_ratio) if res.alloc_ratio else "",
-        ),
-    ]
+        facts.append(
+            "apparent {}{}".format(
+                human_bytes(res.apparent),
+                " ({:.1f}x allocated)".format(res.alloc_ratio) if res.alloc_ratio else "",
+            )
+        )
     if res.alloc_unit:
         facts.append("{} allocation unit".format(human_bytes(res.alloc_unit)))
     if res.hardlinked_inodes:
@@ -1044,20 +1281,7 @@ def render_walk(
                 )
             )
 
-    body = render_entries(res, top, by_inodes, style, sort=sort)
-    if body:
-        out.append(_entries_rule(style, _entry_names(res, top, by_inodes)))
-        out.append(
-            _entries_header(
-                style,
-                size_label="" if res.count_only else "size",
-                # An interrupted walk has no total to be a share of, so the bar
-                # falls back to ranking against the largest row and says so.
-                bar_label="vs largest" if res.partial else "share",
-                ranked_by_files=bool(by_inodes or res.count_only),
-            )
-        )
-        out.extend(body)
+    out.extend(_table(res, top, by_inodes, style, sort))
     # Only in the full report. `rdu .` is asked how big a tree is, not for an
     # audit -- the same reason the quota and /proc sections sit behind -a.
     out.extend(render_age(res, style))
@@ -1357,7 +1581,8 @@ def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] =
         )
         out.append(style.paint("  (invisible to du, to ls, and to this tool's own walk)", "dim"))
         out.append("")
-        for f in scan.files[:top]:
+        limit = _limit(top)
+        for f in scan.files[:limit]:
             holders = ", ".join(
                 "{} {}".format(p, c.split()[0] if c else "?") for p, c in f.holders[:3]
             )
@@ -1368,8 +1593,8 @@ def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] =
                 )
             )
             out.append("                  {}".format(f.path))
-        if len(scan.files) > top:
-            out.append(style.paint("      ... and {} more".format(len(scan.files) - top), "dim"))
+        if len(scan.files) > limit:
+            out.append(style.paint("      ... and {} more".format(len(scan.files) - limit), "dim"))
     scope = [
         "",
         "  scope: {}, {} processes inspected".format(
@@ -1503,6 +1728,10 @@ def to_json(
     # probing for keys. Bumped when a key changes meaning or disappears, not when
     # one is added.
     doc = {"tool": "rapidu", "schema": 1}  # type: Dict[str, Any]
+    # `-n 0` means every entry here too. It used to reach the slices raw, so the
+    # flag documented as "0 means every entry" published empty rankings and an
+    # empty file list -- the JSON consumer got *less* than at the default.
+    limit = _limit(top)
 
     if snap is not None:
         doc["quota"] = {
@@ -1578,11 +1807,11 @@ def to_json(
             # sitting three keys above, where a ranking consumer never looks.
             "top_by_size": [
                 {"path": a.path, "bytes": a.size, "inodes": a.inodes}
-                for a in res.top_dirs(top, "size", finished_only=res.partial)
+                for a in res.top_dirs(limit, "size", finished_only=res.partial)
             ],
             "top_by_inodes": [
                 {"path": a.path, "bytes": a.size, "inodes": a.inodes}
-                for a in res.top_dirs(top, "files", finished_only=res.partial)
+                for a in res.top_dirs(limit, "files", finished_only=res.partial)
             ],
             "top_by_density": [
                 {
@@ -1591,7 +1820,7 @@ def to_json(
                     "inodes": a.inodes,
                     "files_per_gib": files_per_gib(a.size, a.inodes),
                 }
-                for a in res.top_dirs(top, "density", finished_only=res.partial)
+                for a in res.top_dirs(limit, "density", finished_only=res.partial)
             ],
         }
 
@@ -1634,7 +1863,7 @@ def to_json(
                     "pids": f.pids,
                     "holders": [c for _, c in f.holders],
                 }
-                for f in scan.files[:top]
+                for f in scan.files[:limit]
             ],
         }
 

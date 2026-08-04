@@ -6,7 +6,12 @@ through here so that units are stated exactly once, in one place.
 
 from typing import Optional
 
-_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+# Up to EiB, because `quota.parse_size` accepts an `E` suffix and the two have to
+# agree: stopping at PiB meant a figure this module could read back it could not
+# print, rendering 1 EiB as "1024.0 PiB". Nothing here will meet an exabyte soon,
+# but a formatter and its parser disagreeing about the top of the scale is the
+# kind of thing that is only ever noticed by the person it confuses.
+_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB")
 
 
 def human_bytes(n: Optional[int], precision: int = 1) -> str:

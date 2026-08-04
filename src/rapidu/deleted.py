@@ -32,14 +32,24 @@ _DELETED_SUFFIX = " (deleted)"
 _PROC = "/proc"
 
 
+# `st_uid` of an inode whose owner was never read. Not 0: that is root, and a
+# root-owned deleted file is an ordinary thing to find.
+UID_UNKNOWN = -1
+
+
 class DeletedFile:
     """One unlinked-but-open inode, with the processes holding it."""
 
-    def __init__(self, dev: int, ino: int, size: int, path: str) -> None:
+    def __init__(self, dev: int, ino: int, size: int, path: str, uid: int = UID_UNKNOWN) -> None:
         self.dev = dev
         self.ino = ino
         self.size = size  # allocated blocks, st_blocks*512
         self.path = path  # the path it had before it was unlinked
+        # Who the *inode* is charged to. The holding process may not own it -- a
+        # shared group directory is the whole reason this scan exists -- so a
+        # user-scoped quota can only be reconciled against the subset this
+        # matches. See `reconcile`.
+        self.uid = uid
         self.holders = []  # type: List[Tuple[int, str]]  # (pid, command)
 
     def add_holder(self, pid: int, comm: str) -> None:
@@ -74,6 +84,15 @@ class DeletedScan:
     def total_size(self) -> int:
         return sum(f.size for f in self.files)
 
+    def owned_by(self, uid: int) -> "List[DeletedFile]":
+        """The inodes charged to ``uid``, plus any whose owner was never read.
+
+        An unknown owner is included rather than dropped: this figure is already
+        documented as a floor, and silently discarding an inode that may well be
+        yours would make the floor lower than the evidence supports.
+        """
+        return [f for f in self.files if f.uid in (uid, UID_UNKNOWN)]
+
     @property
     def complete(self) -> bool:
         """False when other users' processes could not be inspected."""
@@ -93,34 +112,48 @@ class DeletedScan:
         return out
 
 
+# Inode of the initial PID namespace. A kernel constant -- PROC_PID_INIT_INO in
+# include/linux/proc_ns.h -- and the only *authoritative* way to ask "is this the
+# node's namespace or a container's" without root.
+_INIT_PID_NS_INO = 0xEFFFFFFC
+
+
 def _in_pid_namespace() -> bool:
     """Does /proc show a PID namespace rather than the whole node?
 
-    Two independent signals, either of which is sufficient:
+    Two signals, in order of how much they prove:
 
-    * ``/proc/self/status``'s ``NSpid`` lists one entry per namespace this
-      process is visible in, so more than one means we are nested.
-    * pid 1 in the root namespace is the init system. Inside a container it is
-      whatever the container started.
+    * ``/proc/self/ns/pid``'s inode. In the initial namespace it is the kernel
+      constant :data:`_INIT_PID_NS_INO`; anywhere else it is an allocated one.
+      This is decisive in *both* directions and is checked first.
+    * ``/proc/self/status``'s ``NSpid``, as a fallback for a kernel without
+      ``/proc/*/ns``. More than one entry means we are nested. One entry proves
+      nothing -- the field lists only the namespaces the reader is in, so a
+      container reading its own status sees exactly one.
 
-    Both are read-only files in procfs and cannot block. A false *negative* just
-    restores the previous behaviour, so this is safe to get wrong quietly.
+    **No pid-1 name test.** It used to finish with "pid 1's ``comm`` is not one of
+    ``{systemd, init, openrc-init}``, therefore we are in a container", and that
+    is a false positive on every host running runit, s6 or dinit: it flips
+    ``complete`` to False and prints a container caveat on a bare-metal node. The
+    docstring justified the guess by saying a wrong answer was safe, but only
+    checked that reasoning against a false *negative* -- which restores the old
+    behaviour -- and not against the false positive, which invents a finding. The
+    namespace inode answers the question outright, so nothing has to be guessed.
     """
+    try:
+        return os.stat("{}/self/ns/pid".format(_PROC)).st_ino != _INIT_PID_NS_INO
+    except OSError:
+        pass
     try:
         with open("{}/self/status".format(_PROC)) as fh:
             for line in fh:
                 if line.startswith("NSpid:"):
-                    if len(line.split()) > 2:
-                        return True
-                    break
+                    return len(line.split()) > 2
     except OSError:
         pass
-    try:
-        with open("{}/1/comm".format(_PROC)) as fh:
-            return fh.read().strip() not in ("systemd", "init", "openrc-init")
-    except OSError:
-        # pid 1 not visible at all is itself evidence of a restricted view.
-        return True
+    # Neither signal available: report the wider view rather than claiming a
+    # restriction we could not observe.
+    return False
 
 
 def _read_comm(pid: int) -> str:
@@ -161,6 +194,14 @@ def scan(prefix: Optional[str] = None, timeout: float = DEFAULT_SCAN_TIMEOUT_S) 
     abandoned thread stays parked in D state until the mount recovers; being a
     daemon, it does not delay interpreter exit. Whatever it had already found is
     reported, with ``timed_out`` set so the caller can say coverage is partial.
+
+    **What is returned is a snapshot.** The abandoned thread keeps going, so it is
+    given a scan object of its own to write into and the counters are copied out
+    once. Handing it the returned object meant ``scanned_pids`` kept climbing
+    after the caller had it: the coverage sentence a reader saw
+    ("none found in the 30 of 1440 processes this scan can inspect") could not be
+    reproduced from the object it was printed from, and two consumers of one scan
+    disagreed about the denominator.
     """
     res = DeletedScan()
     if not os.path.isdir(_PROC):
@@ -173,8 +214,11 @@ def scan(prefix: Optional[str] = None, timeout: float = DEFAULT_SCAN_TIMEOUT_S) 
     # thread can safely read a prefix of this list after abandoning the worker.
     found = []  # type: List[DeletedFile]
     done = threading.Event()
+    # The worker's own object, never handed out. Same signature as before, so a
+    # test that substitutes `_sweep` still sees four arguments.
+    work = DeletedScan()
     worker = threading.Thread(
-        target=_sweep, args=(res, found, prefix, done), name="rapidu-deleted", daemon=True
+        target=_sweep, args=(work, found, prefix, done), name="rapidu-deleted", daemon=True
     )
     worker.start()
     done.wait(timeout)
@@ -184,6 +228,8 @@ def scan(prefix: Optional[str] = None, timeout: float = DEFAULT_SCAN_TIMEOUT_S) 
             "the /proc sweep was abandoned after {:.0f}s, which means a stat() "
             "blocked on an unresponsive mount; results below are partial".format(timeout)
         )
+    res.scanned_pids = work.scanned_pids
+    res.unreadable_pids = work.unreadable_pids
     res.files = sorted(found[:], key=lambda f: f.size, reverse=True)
     return res
 
@@ -245,7 +291,7 @@ def _sweep(
             key = (st.st_dev, st.st_ino)
             rec = by_inode.get(key)
             if rec is None:
-                rec = DeletedFile(st.st_dev, st.st_ino, st.st_blocks * 512, path)
+                rec = DeletedFile(st.st_dev, st.st_ino, st.st_blocks * 512, path, st.st_uid)
                 by_inode[key] = rec
                 found.append(rec)
             if comm is None:

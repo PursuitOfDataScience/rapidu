@@ -501,6 +501,14 @@ def _parse_quota_row(line: str, mount: Optional[str]) -> Optional[QuotaRow]:
         return None
 
     def conv(tok: str) -> Optional[int]:
+        # `*` marks a figure that is over its limit, which is the one row in the
+        # table that matters. Without this strip `parse_size` (anchored on `$`)
+        # returned None for `35.00G*`, `used` came back None, and the row was
+        # dropped -- so a fileset in grace disappeared from the report at exactly
+        # the moment it became the finding, and a user over both limits got
+        # "could not parse `quota -s` output" with no rows at all. Both sibling
+        # parsers in this module already strip it; this one did not.
+        tok = tok.rstrip("*")
         if kind == "files":
             try:
                 return int(tok)
@@ -524,6 +532,24 @@ def _parse_quota_row(line: str, mount: Optional[str]) -> Optional[QuotaRow]:
     return QuotaRow(fileset, kind, scope, used, soft, hard, grace, resolved, guessed)
 
 
+def _is_figure(tok: str) -> bool:
+    """Does this token read as one of the six numeric columns?
+
+    A grace timer never does: every spelling ``quota`` uses -- ``6days``,
+    ``13:20``, ``2weeks``, ``none`` -- fails :func:`parse_size`, while every
+    numeric column passes it under either header (``1048576`` under ``blocks``,
+    ``1000M`` under ``space``, a bare count for files), with an optional ``*``
+    marking an exceeded limit. That asymmetry is what lets a row with one grace
+    timer be read instead of discarded.
+    """
+    return parse_size(tok.rstrip("*")) is not None
+
+
+# `Disk quotas for user someone (uid 1000):` -- the line that says whose figures
+# the table below belongs to.
+_QUOTA_SCOPE_RE = re.compile(r"disk\s+quotas\s+for\s+(user|group|project)\b", re.IGNORECASE)
+
+
 def _parse_stock_quota(out: str) -> List[QuotaRow]:
     """Stock ``quota`` layout: a ``Filesystem`` header then one row per fs.
 
@@ -533,14 +559,35 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
     suffix. Reading a ``blocks`` figure as bytes under-reports by 1024x -- a
     30 GiB home quota would print as 30 MiB -- so the header decides the scale.
 
-    Grace columns are printed only when a limit is exceeded, so a data row
-    carries 7 fields normally and 9 when both graces are present. An 8-field row
-    is ambiguous -- which of the two graces is present cannot be determined --
-    and is skipped rather than guessed at.
+    Three things this got wrong, all of which discarded the row that mattered:
+
+    **Every table, not just the first.** It ``break``\\ ed out after one
+    ``Filesystem`` header, so the ``Disk quotas for group ...`` section was
+    silently dropped -- and a group quota is routinely the binding limit on a
+    shared project directory, which is where an HPC user actually runs out.
+
+    **The scope is read, not assumed.** Every row was hard-coded ``user``, so even
+    if the group table had been parsed its rows would have claimed to be personal
+    ones, and ``reconcile._pick_row`` prefers user-scoped rows -- it would have
+    compared a group figure against one user's walk.
+
+    **A row with one grace timer is read.** Graces print only for an exceeded
+    limit, so 6 figures means nothing is over, 8 means both are, and **7 means
+    exactly one is** -- the commonest over-quota shape there is. Counting fields
+    could not tell which of the two was present, so the row was skipped and the
+    loop stopped, which meant ``quota -s`` parsed to zero rows precisely when the
+    user was over. The position of the non-numeric token settles it: index 3 is a
+    block grace, index 6 a file grace. See :func:`_is_figure`.
     """
     rows = []  # type: List[QuotaRow]
     lines = out.splitlines()
+    table = read_mount_table()
+    scope = "user"
     for i, line in enumerate(lines):
+        found = _QUOTA_SCOPE_RE.search(line)
+        if found:
+            scope = found.group(1).lower()
+            continue
         if "Filesystem" not in line:
             continue
         if "blocks" not in line and "space" not in line:
@@ -553,7 +600,6 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
                 return None
             return v * 1024 if kib else v
 
-        table = read_mount_table()
         pending = None  # type: Optional[str]
         for nxt in lines[i + 1 :]:
             parts = nxt.split()
@@ -562,7 +608,7 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
             # `quota` wraps a long device name onto its own line and indents the
             # figures onto the next. Requiring name-and-numbers on one line lost
             # every row at sites whose device names are long, which is most NFS.
-            if len(parts) == 1 and parse_size(parts[0].rstrip("*")) is None:
+            if len(parts) == 1 and not _is_figure(parts[0]):
                 pending = parts[0]
                 continue
             if pending is not None:
@@ -570,14 +616,20 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
                 pending = None
             else:
                 fs, nums = parts[0], parts[1:]
-            # A data row is 6 figures, or 8 when both grace timers are printed.
-            # The end of the table is anything else. The previous test -- "the
-            # first column starts with /" -- rejected the whole table at any site
-            # whose device is `server:/export` or `//host/share`, i.e. every NFS
-            # and CIFS mount, before a single number was read.
-            if len(nums) == 6:
+            # Six figures plus a grace timer for each limit that is over. The end
+            # of the table is anything else -- including the next section's
+            # `Disk quotas for group ...`, whose tokens are not figures. The
+            # previous test, "the first column starts with /", rejected the whole
+            # table at any site whose device is `server:/export` or `//host/share`,
+            # i.e. every NFS and CIFS mount, before a single number was read.
+            graces = [n for n, tok in enumerate(nums) if not _is_figure(tok)]
+            if len(nums) == 6 and not graces:
                 bidx, fidx, bgrace, fgrace = 0, 3, "", ""
-            elif len(nums) >= 8:
+            elif len(nums) == 7 and graces == [3]:
+                bidx, fidx, bgrace, fgrace = 0, 4, nums[3], ""
+            elif len(nums) == 7 and graces == [6]:
+                bidx, fidx, bgrace, fgrace = 0, 3, "", nums[6]
+            elif len(nums) >= 8 and graces[:2] == [3, 7]:
                 bidx, fidx, bgrace, fgrace = 0, 4, nums[3], nums[7]
             else:
                 break
@@ -616,11 +668,10 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
                 if used is None:
                     continue
                 row = QuotaRow(
-                    fs, kind, "user", used, soft or None, hard or None, grace, mount, guessed
+                    fs, kind, scope, used, soft or None, hard or None, grace, mount, guessed
                 )
                 row.mounts = list(mounts)
                 rows.append(row)
-        break
     return rows
 
 

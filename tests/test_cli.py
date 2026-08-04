@@ -132,11 +132,23 @@ def test_no_density_ranking_section(small_tree, capsys):
     """A files/GiB ranking is won by the smallest denominator.
 
     It nominated a 260 KiB .git directory as the "best candidate to pack" ahead
-    of one holding ten times the inodes. Density is a column now, not a ranking.
+    of one holding ten times the inodes, so the standing section was removed:
+    density is reachable through ``--sort density`` and nowhere else, and it
+    carries an inode floor.
+
+    This docstring used to claim "density is a column now, not a ranking", and
+    neither half was true -- ``--sort density`` is a ranking, and ``files_per_gib``
+    appeared only in the JSON document, so the rows were ordered by a number that
+    was printed nowhere. It is a column now (see
+    ``test_a_density_ranking_shows_the_value_it_ranked_by``), and it is still not
+    a section of the default report.
     """
     cli.main([small_tree, "-a", "--no-quota", "--no-deleted", "-n", "5", "--no-box"])
     out = capsys.readouterr().out
     assert "DENSEST" not in out
+    # Not volunteered: the density column costs a column and answers a question
+    # only `--sort density` asked.
+    assert "files/GiB" not in out
 
 
 def test_clean_deleted_scan_is_one_line(small_tree, capsys):

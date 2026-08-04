@@ -198,7 +198,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="rank by size (default), file count, or density -- files per GiB. "
         "Density is the 'what should I pack' signal: a subtree with a million "
         "small files costs inodes and allocation padding out of proportion to its "
-        "bytes. It was implemented and reachable only through --json.",
+        "bytes. It adds a files/GiB column, and it skips subtrees too small to be "
+        "worth packing -- files per GiB is won on the denominator, so a directory "
+        "holding three files would otherwise top the table. Needs sizes, so it "
+        "cannot be combined with -c.",
     )
     p.add_argument(
         "--no-box",
@@ -379,7 +382,21 @@ def cmd_quota(args: argparse.Namespace) -> int:
 
 
 def cmd_deleted(args: argparse.Namespace) -> int:
-    targets = _resolve_paths(args.paths) if args.paths else [None]
+    # `None` means "the whole node", which is what -D with no path asks for. The
+    # annotation is a comment because the ternary this replaced inferred
+    # `List[str]` from its first branch and then rejected the `None` in its second
+    # -- an error under mypy 1.x and not under 2.x, so the type of this line
+    # depended on which supported checker happened to be installed.
+    targets = [None]  # type: List[Optional[str]]
+    if args.paths:
+        targets = list(_resolve_paths(args.paths))
+        if not targets:
+            # Every path was rejected, and `_resolve_paths` has already said why on
+            # stderr. Falling through printed no report at all and still exited 0,
+            # so a script saw "success, nothing held" -- `cmd_walk` returns
+            # EXIT_ERROR for exactly this and there is no reason for the two to
+            # disagree.
+            return EXIT_ERROR
     rcode = EXIT_OK
     for target in targets:
         scan = deletedmod.scan(target)
@@ -611,10 +628,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     # `-i` predates `--sort` and means `--sort files`. Keeping both is right --
     # `-i` is the flag someone reaches for when the quota says "files" -- so
     # resolve them here rather than making every renderer take two arguments.
+    #
+    # All three arms of this were wrong in one direction or another, and every one
+    # of them showed the reader a table whose ordering did not match its own
+    # emphasis:
+    #
+    # * `-c` was not consulted, so plain `rdu -c` resolved to `sort="size"` -- and
+    #   a count-only walk has no sizes, so every key was 0, the sort was stable on
+    #   an all-zero key, and the ordering was dict insertion order (thread merge
+    #   order). Six runs on one tree gave four different orderings, the bars went
+    #   2.4%, 55.8%, 5.5%, 10.3%, 25.5% down the table, and at `-n 3` the
+    #   second-largest directory in the tree sat behind "2 more".
+    # * `--sort size` did not clear `-i`, so `rdu -i --sort size` ordered rows by
+    #   bytes while the bar, the share and the accented header column all measured
+    #   inodes.
+    # * `-c` cannot answer `--sort size` or `--sort density` at all -- both need
+    #   bytes -- and silently pretending otherwise is what produced the first case.
+    #   It is refused out loud instead.
+    if args.count and args.sort in ("size", "density"):
+        parser.error(
+            "--sort {0} needs byte sizes and -c does not measure them (it skips "
+            "stat entirely). Use `-c --sort files`, or drop -c to rank by "
+            "{0}.".format(args.sort)
+        )
     if args.sort is None:
-        args.sort = "files" if args.inodes else "size"
+        args.sort = "files" if (args.inodes or args.count) else "size"
     elif args.sort == "files":
         args.inodes = True
+    elif args.sort == "size":
+        args.inodes = False
 
     if args.depth < 1:
         parser.error(
