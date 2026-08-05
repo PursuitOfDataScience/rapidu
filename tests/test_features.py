@@ -176,8 +176,61 @@ def test_watched_subtrees_carry_real_totals(tree):
     hits = {p: v for p, v in res.watched.items() if p.endswith("huggingface")}
     assert hits, "the huggingface directory was not accumulated"
     size, inodes = list(hits.values())[0]
-    assert inodes == 1
+    # The blob plus the directory holding it. A watched subtree is counted the way
+    # `Entry` counts one -- directories included, the watched directory itself
+    # included -- because RECLAIMABLE draws rows from `watched` and from `dir_agg`
+    # into one `files` column, and in count mode that column is the ranking key.
+    assert inodes == 2
     assert size >= 0  # blocks may still be settling on GPFS
+
+
+def test_watched_and_dir_agg_agree_on_a_path_they_both_reach(tmp_path):
+    """One `files` column, one meaning, whichever source a RECLAIMABLE row came from.
+
+    `watched` was incremented only in the stat arm's *file* branch, which sits below
+    the directory `continue` -- so it held regular files while `dir_agg` held files
+    plus directories. Cosmetic while the column was decoration; it became the
+    ranking key in count mode.
+    """
+    root = str(tmp_path / "t")
+    deep = os.path.join(root, "pkg", "__pycache__", "nested")
+    os.makedirs(deep)
+    for i in range(3):
+        with open(os.path.join(deep, "m%d.pyc" % i), "wb") as fh:
+            fh.write(b"w" * 4096)
+    with open(os.path.join(root, "pkg", "__pycache__", "top.pyc"), "wb") as fh:
+        fh.write(b"w" * 4096)
+    for count_only in (False, True):
+        res = walk(root, threads=2, depth=3, count_only=count_only)
+        key = os.path.join(root, "pkg", "__pycache__")
+        assert key in res.watched, res.watched
+        entry = res.dir_agg[key]
+        size, inodes = res.watched[key]
+        # 4 files + __pycache__ + nested
+        assert inodes == 6, (count_only, inodes)
+        assert (size, inodes) == (entry.size, entry.inodes), count_only
+
+
+def test_a_count_only_walk_still_counts_its_caches(tmp_path):
+    """`rdu -a -c` reported `0 files` for every cache and `0.0% of the tree`.
+
+    The watch slots were allocated on both paths but incremented only on the stat
+    path, so after `-c` every watched directory carried (0, 0) -- and because
+    `render_reclaimable` lists `watched` first and dedupes by path, that zero
+    shadowed the real count `dir_agg` was holding. A fabricated zero, which this
+    module's docstring rules out.
+    """
+    root = str(tmp_path / "t")
+    for name in ("__pycache__", os.path.join(".cache", "pip")):
+        os.makedirs(os.path.join(root, name))
+        with open(os.path.join(root, name, "f"), "wb") as fh:
+            fh.write(b"x" * 4096)
+    res = walk(root, threads=2, depth=1, count_only=True)
+    assert all(n for _b, n in res.watched.values()), res.watched
+    text = "\n".join(report.render_reclaimable(res, ui.resolve_style("never")))
+    assert "0 files" not in text
+    assert "(0.0% of the tree)" not in text
+    assert "4 files reclaimable in total" in text
 
 
 def test_a_nested_match_is_not_counted_twice(tmp_path):

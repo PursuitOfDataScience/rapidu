@@ -16,7 +16,7 @@ from . import reconcile as rc
 from . import ui
 from . import walk as walkmod
 from .deleted import DeletedScan
-from .fmt import files_per_gib, human_bytes, human_count, human_duration, pct
+from .fmt import files_per_gib, human_bytes, human_count, human_duration, pct, plural
 from .quota import QuotaSnapshot
 from .walk import SettleCheck, WalkResult
 
@@ -368,7 +368,7 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
             examples = ", ".join(
                 "{} ({})".format(
                     os.path.relpath(h[2], res.root),
-                    "{} files".format(human_count(h[1])) if counts else human_bytes(h[0]),
+                    plural(h[1], "file") if counts else human_bytes(h[0]),
                 )
                 for h in hits[:2]
             )
@@ -379,7 +379,7 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
             style.paint(
                 "  ... and {} more kinds ({}), counted in the total below".format(
                     len(rest),
-                    "{} files".format(human_count(sum(sum(h[1] for h in v) for _p, v in rest)))
+                    plural(sum(sum(h[1] for h in v) for _p, v in rest), "file")
                     if counts
                     else human_bytes(sum(sum(h[0] for h in v) for _p, v in rest)),
                 ),
@@ -388,7 +388,7 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
         )
     if counts:
         share = " ({} of the tree)".format(pct(total_inodes, res.inodes)) if res.inodes else ""
-        figure = "{} files".format(human_count(total_inodes))
+        figure = plural(total_inodes, "file")
     else:
         share = " ({} of the tree)".format(pct(total, res.size)) if res.size else ""
         figure = human_bytes(total)
@@ -435,7 +435,7 @@ def render_age(res: WalkResult, style: ui.Style) -> List[str]:
         if byte_share >= inode_share:
             measure = "{} ({})".format(human_bytes(cold_bytes), pct(byte_share, 1.0))
         else:
-            measure = "{} files ({})".format(human_count(cold_inodes), pct(inode_share, 1.0))
+            measure = "{} ({})".format(plural(cold_inodes, "file"), pct(inode_share, 1.0))
         out.extend(
             _wrapped(
                 "{} has not been modified in over a year. On a full quota that is "
@@ -611,7 +611,7 @@ def render_entries(
 
 
 def _density_floor_note(
-    res: WalkResult, style: ui.Style, indent: str = "  ", shown: int = 0
+    res: WalkResult, style: ui.Style, indent: str = "  ", shown: int = 0, qualifying: int = 0
 ) -> List[str]:
     """Why a density ranking is short, or empty.
 
@@ -623,27 +623,62 @@ def _density_floor_note(
     a headline, no table, and exited 0 -- which reads as "there is nothing dense
     here" when what happened is that the question was never answered.
 
+    **Two reasons, two sentences.** ``qualifying`` is how many entries clear the
+    floor and ``shown`` is how many ``-n`` then left, and conflating them made
+    this note state, as a fact, something that was false: with all four entries of
+    a tree above the floor, ``-n 1`` printed "3 of 4 entries hold fewer than 100
+    files". The arithmetic was measuring the slice. It matters more here than it
+    would elsewhere, because :func:`render_entries` deliberately suppresses both
+    the remainder row and the "N more" line for a density listing -- so this is
+    the *only* signal that rows are missing, and it was pointing away from the
+    flag that would show them.
+
     Two lines at most, and only when something was actually dropped.
     """
     total = _entry_total(res)
-    dropped = total - shown
-    if dropped <= 0:
+    below_floor = max(0, total - qualifying)
+    truncated = max(0, qualifying - shown)
+    if not below_floor and not truncated:
         return []
-    tail = (
-        ""
-        if shown
-        else " Nothing here clears it, so there is no density ranking to show;"
-        " --sort files ranks the same tree by inode count."
-    )
-    return _wrapped(
-        "{} of {} entries hold fewer than {} files and cannot be ranked by "
-        "density -- the measure is files per GiB, so a nearly empty directory "
-        "wins it on the denominator alone.{}".format(
-            human_count(dropped), human_count(total), human_count(res.density_floor), tail
-        ),
-        style,
-        indent,
-    )
+    out = []  # type: List[str]
+    if below_floor:
+        tail = (
+            ""
+            if qualifying
+            else " Nothing here clears it, so there is no density ranking to show;"
+            " --sort files ranks the same tree by inode count."
+        )
+        out.extend(
+            _wrapped(
+                "{} of {} entries hold fewer than {} files and cannot be ranked by "
+                "density -- the measure is files per GiB, so a nearly empty directory "
+                "wins it on the denominator alone.{}".format(
+                    human_count(below_floor),
+                    human_count(total),
+                    human_count(res.density_floor),
+                    tail,
+                ),
+                style,
+                indent,
+            )
+        )
+    if truncated:
+        # The one case where "use -n 0 for all" is a true instruction: these rows
+        # cleared the floor and were cut by the limit, so raising it brings them
+        # back.
+        out.extend(
+            _wrapped(
+                "{} more {} the floor but {} cut by -n {} use -n 0 for all.".format(
+                    human_count(truncated),
+                    "clears" if truncated == 1 else "clear",
+                    "was" if truncated == 1 else "were",
+                    ui.dash(style),
+                ),
+                style,
+                indent,
+            )
+        )
+    return out
 
 
 _BAR_W = 18
@@ -943,7 +978,7 @@ def render_compact(
     if res.count_only:
         out = _header(
             style,
-            "{} files".format(human_count(res.inodes)),
+            plural(res.inodes, "file"),
             res.root,
             _facts(
                 style,
@@ -960,8 +995,8 @@ def render_compact(
             human_bytes(res.size),
             res.root,
             style.paint(
-                "PARTIAL {} {} files scanned before the interrupt".format(
-                    ui.dash(style), human_count(res.inodes)
+                "PARTIAL {} {} scanned before the interrupt".format(
+                    ui.dash(style), plural(res.inodes, "file")
                 ),
                 "yellow",
             ),
@@ -974,7 +1009,11 @@ def render_compact(
             _facts(
                 style,
                 [
-                    (human_count(res.inodes), "files", (files_tone,)),
+                    (
+                        human_count(res.inodes),
+                        "file" if res.inodes == 1 else "files",
+                        (files_tone,),
+                    ),
                     ("{:.2f}s".format(res.elapsed), "", (VALUE,)),
                 ],
             ),
@@ -1013,8 +1052,12 @@ def _table(
         # the reader has to be told. Kept out of `render_entries` and appended after
         # the rows, so a paragraph of prose never ends up sizing the hairline --
         # which is measured off the widest row it is drawn over.
+        # Both counts come from `top_dirs`, one limited and one not, so the note
+        # can separate "below the floor" from "cut by -n" instead of charging the
+        # floor for both.
+        qualifying = len(res.top_dirs(_ALL, key, finished_only=res.partial))
         shown = len(res.top_dirs(_limit(top), key, finished_only=res.partial))
-        note = _density_floor_note(res, style, indent, shown)
+        note = _density_floor_note(res, style, indent, shown, qualifying)
     if not body:
         # No rows at all: either the floor took everything, which is worth
         # explaining, or the tree has no reportable children and there is nothing
@@ -1107,11 +1150,21 @@ def _hard_warnings(
         # A ratio whose denominator is the same partial state as its numerator
         # cannot say what it looks like it says, and there is no honest M here:
         # how many entries the tree has is exactly what the walk did not find out.
+        # "and are listed below" named a table that is not there when the count is
+        # zero: `render_entries` returns [] once `finished_only` has filtered
+        # everything, which is exactly the case this sentence is most likely to
+        # describe (every worker blocked on a slow mount, so nothing finished).
+        finished = len(res.top_dirs(_ALL, finished_only=True))
         out.extend(
             _wrapped(
-                "{} top-level entries were walked to completion and are listed"
-                " below; the rest is unknown, so there is no total and no share of"
-                " anything.".format(human_count(len(res.top_dirs(10**6, finished_only=True)))),
+                "{} top-level {} walked to completion{}; the rest is unknown, so"
+                " there is no total and no share of anything.".format(
+                    human_count(finished),
+                    "entry was" if finished == 1 else "entries were",
+                    (" and is listed below" if finished == 1 else " and are listed below")
+                    if finished
+                    else "",
+                ),
                 style,
                 "  ",
             )
@@ -1196,8 +1249,8 @@ def render_walk(
     ]
 
     facts = [
-        "{} files ({} regular + {} dirs)".format(
-            human_count(res.inodes),
+        "{} ({} regular + {} dirs)".format(
+            plural(res.inodes, "file"),
             human_count(res.files - res.hardlink_extra_refs),
             human_count(res.dirs),
         ),
@@ -1490,12 +1543,14 @@ def render_allocation(res: WalkResult, style: ui.Style, indent: str = "  ") -> L
             mean = res.padded_apparent // res.padded_files
             out.extend(
                 _wrapped(
-                    "{} files average {} against a {} allocation unit, so they"
-                    " occupy {} of padding. Packing them (tar, squashfs, a single"
-                    " archive) returns it.".format(
-                        human_count(res.padded_files),
+                    "{} {} {} against a {} allocation unit, so {} occupy {} of"
+                    " padding. Packing them (tar, squashfs, a single archive)"
+                    " returns it.".format(
+                        plural(res.padded_files, "file"),
+                        "averages" if res.padded_files == 1 else "average",
                         human_bytes(mean),
                         human_bytes(unit),
+                        "it" if res.padded_files == 1 else "they",
                         human_bytes(res.padding),
                     ),
                     style,
@@ -1805,23 +1860,40 @@ def to_json(
             # subtrees the text renderer refuses to show -- /usr/lib64 at 17% of
             # its real size, /usr/mpi at 0 bytes -- with "interrupted": true
             # sitting three keys above, where a ranking consumer never looks.
-            "top_by_size": [
-                {"path": a.path, "bytes": a.size, "inodes": a.inodes}
-                for a in res.top_dirs(limit, "size", finished_only=res.partial)
-            ],
+            # A stat-free walk has no bytes, so neither of these rankings exists.
+            # `top_dirs` coerces the key to "files" -- right for the terminal,
+            # where the column header says so -- but through here it published a
+            # files ranking under the name `top_by_size` (byte-for-byte identical
+            # to `top_by_inodes`, every row `"bytes": 0`) and a `top_by_density`
+            # whose density was null on every row. `main` refuses `-c --sort size`
+            # out loud; the document says the same thing the way a document can,
+            # with the null the `"schema": 1` contract already defines as "no
+            # measurement".
+            "top_by_size": (
+                None
+                if res.count_only
+                else [
+                    {"path": a.path, "bytes": a.size, "inodes": a.inodes}
+                    for a in res.top_dirs(limit, "size", finished_only=res.partial)
+                ]
+            ),
             "top_by_inodes": [
                 {"path": a.path, "bytes": a.size, "inodes": a.inodes}
                 for a in res.top_dirs(limit, "files", finished_only=res.partial)
             ],
-            "top_by_density": [
-                {
-                    "path": a.path,
-                    "bytes": a.size,
-                    "inodes": a.inodes,
-                    "files_per_gib": files_per_gib(a.size, a.inodes),
-                }
-                for a in res.top_dirs(limit, "density", finished_only=res.partial)
-            ],
+            "top_by_density": (
+                None
+                if res.count_only
+                else [
+                    {
+                        "path": a.path,
+                        "bytes": a.size,
+                        "inodes": a.inodes,
+                        "files_per_gib": files_per_gib(a.size, a.inodes),
+                    }
+                    for a in res.top_dirs(limit, "density", finished_only=res.partial)
+                ]
+            ),
         }
 
     if res is not None and settle is not None:

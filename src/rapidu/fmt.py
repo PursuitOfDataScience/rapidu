@@ -37,6 +37,21 @@ def human_count(n: Optional[int]) -> str:
     return "n/a" if n is None else "{:,}".format(n)
 
 
+def plural(n: Optional[int], noun: str, suffix: str = "s") -> str:
+    """``1 file``, ``12 files``, ``n/a files`` -- the count and a noun that agrees.
+
+    Every count this tool prints alongside a noun goes through here, for the same
+    reason every byte figure goes through :func:`human_bytes`: the agreement rule
+    is stated once. It was not, and so an empty directory reported ``1 files`` on
+    the facts line and an interrupted walk reported ``PARTIAL -- 1 files scanned``,
+    while ``render_settle`` two sections down got the identical case right.
+
+    ``None`` is unknown, not one: it renders ``n/a`` with the plural noun, because
+    ``n/a file`` reads as a singular measurement that was taken.
+    """
+    return "{} {}".format(human_count(n), noun if n == 1 else noun + suffix)
+
+
 def human_duration(seconds: Optional[float]) -> str:
     """Coarse human duration used for snapshot ages. ``None`` -> ``unknown``."""
     if seconds is None:

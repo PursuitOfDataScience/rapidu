@@ -137,6 +137,25 @@ class _NoEntries:
 _NO_ENTRIES = _NoEntries()
 
 
+def _seed_watch(slots: Dict[str, List[int]], path: str, blocks: int) -> None:
+    """Charge a watched directory's own inode to its own subtree total.
+
+    A worker resolves the *watched ancestors* of every directory it scans, so a
+    cache directory's contents are charged to it -- but nothing ever charged the
+    directory itself, because at the moment its own name is recognised the slot
+    it belongs to is the parent's, not its own. Called from the parent's scan,
+    where both its inode and its allocated blocks are known.
+
+    ``slots`` is a thread-local dict merged under the lock at the end, so a
+    directory discovered by one worker and scanned by another still sums.
+    """
+    slot = slots.get(path)
+    if slot is None:
+        slot = slots[path] = [0, 0]
+    slot[0] += blocks
+    slot[1] += 1
+
+
 class TokenBucket:
     """Rate limiter over directory opens. Disabled when ``rate <= 0``."""
 
@@ -307,6 +326,13 @@ class WalkResult:
         # reported depth, and letting them into `dir_agg` would put nested rows in
         # a ranking that is supposed to partition the tree, and break the
         # remainder row that depends on that.
+        #
+        # (bytes, inodes) with the same meaning `Entry` gives them -- directories
+        # included, the watched directory itself included -- so the RECLAIMABLE
+        # table's columns mean one thing whichever of the two sources a row came
+        # from. It is populated on *both* walk paths: `-c` has no bytes and leaves
+        # those at zero (the report prints `n/a`), but its inode counts are exact
+        # and are what that mode ranks on.
         self.watched = {}  # type: Dict[str, Tuple[int, int]]
         self.dir_agg = {}  # type: Dict[str, Entry]
         self.unreadable_dirs = []  # type: List[Tuple[str, str]]
@@ -397,23 +423,42 @@ class WalkResult:
         tree was hidden behind "2 more". So the key falls back to the one
         measurement the walk actually has, rather than silently ranking by a
         column of zeroes.
+
+        **Ties are broken deterministically**, on the other measurement and then
+        on the path. Python's sort is stable, so without a secondary key equal
+        entries kept ``dir_agg`` insertion order -- which is the order worker
+        threads took ``merge_lock``, and therefore different on every run. Ties
+        are not exotic: every directory whose contents round to one allocation
+        unit lands on the same byte figure, and ``--sort files`` ties more
+        readily still. That made two reports of an unchanged tree fail to
+        ``diff``, and under ``-n`` it changed *which* entries were listed rather
+        than only their order. ``path`` is an absolute path and unique within
+        ``dir_agg``, so the ordering it completes is total.
         """
         if self.count_only and key in ("size", "density"):
             key = "files"
         aggs = [a for a in self.dir_agg.values() if a.path != self.root]
         if finished_only:
             aggs = [a for a in aggs if self.is_finished(a)]
+        # The path tiebreaker ascends while the metrics descend, so it is applied
+        # as a separate stable pre-sort rather than negated inside the key -- a
+        # string has no negation, and `reverse=True` would otherwise order tied
+        # rows z-to-a.
+        aggs.sort(key=lambda a: a.path)
         if key == "files":
-            aggs.sort(key=lambda a: a.inodes, reverse=True)
+            aggs.sort(key=lambda a: (a.inodes, a.size), reverse=True)
         elif key == "density":
             # Files per GiB: the "what should I pack" signal. Restricted to
             # subtrees that hold enough inodes to be worth packing, so the
             # ranking is not won by a 4 KiB directory with three files in it.
             floor = self.density_floor
             aggs = [a for a in aggs if a.inodes >= floor and a.size > 0]
-            aggs.sort(key=lambda a: a.inodes / max(a.size / float(1 << 30), 1e-9), reverse=True)
+            aggs.sort(
+                key=lambda a: (a.inodes / max(a.size / float(1 << 30), 1e-9), a.inodes),
+                reverse=True,
+            )
         else:
-            aggs.sort(key=lambda a: a.size, reverse=True)
+            aggs.sort(key=lambda a: (a.size, a.inodes), reverse=True)
         return aggs[:n]
 
     def is_finished(self, entry: "Entry") -> bool:
@@ -751,6 +796,11 @@ def walk(
                                     if slot is None:
                                         slot = l_agg[key] = [0, 0, 0, 1]
                                     slot[2] += 1
+                                if watch:
+                                    for wslot in watch:
+                                        wslot[1] += 1
+                                if name in watch_names:
+                                    _seed_watch(l_watch, dsep + name, 0)
                             else:
                                 l_files += 1
                                 if b0 is not None:
@@ -764,6 +814,9 @@ def walk(
                                     if slot is None:
                                         slot = l_agg[key] = [0, 0, 0, 0]
                                     slot[1] += 1
+                                if watch:
+                                    for wslot in watch:
+                                        wslot[1] += 1
                         # NOTE: no `continue` here. It would target the worker's
                         # outer loop and skip the block that decrements the
                         # pending-directory counter, so the walk would never
@@ -808,6 +861,21 @@ def walk(
                                     slot = l_agg[key] = [0, 0, 0, 1]
                                 slot[0] += blocks
                                 slot[2] += 1
+                            # A directory is part of the subtree it sits in, so it
+                            # is part of what deleting a cache reclaims. This block
+                            # used to sit below the `continue` at the end of this
+                            # branch, so `watched` held regular files only while
+                            # `dir_agg` held files plus directories -- two different
+                            # meanings for one `files` column in RECLAIMABLE.
+                            if watch:
+                                for wslot in watch:
+                                    wslot[0] += blocks
+                                    wslot[1] += 1
+                            if name in watch_names:
+                                # The watched directory's own inode. Charged by the
+                                # parent's scan, because `watch` for a directory
+                                # holds its watched *ancestors* and never itself.
+                                _seed_watch(l_watch, dsep + name, blocks)
                             l_size += blocks
                             l_app += st.st_size
                             l_dirs += 1

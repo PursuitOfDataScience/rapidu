@@ -22,7 +22,7 @@ from typing import List, Optional, Tuple
 
 from . import walk as walkmod
 from .deleted import DeletedScan
-from .fmt import human_bytes, human_count
+from .fmt import human_bytes, human_count, plural
 from .quota import QuotaRow, QuotaSnapshot
 
 # Comparison verdicts.
@@ -345,10 +345,11 @@ def reconcile(
             )
         elif res.recent_files:
             rec.blockers.append(
-                "{} files were modified within the last {:.0f}s and their blocks "
-                "may not be final{}".format(
-                    res.recent_files,
+                "{} {} modified within the last {:.0f}s and {} blocks may not be final{}".format(
+                    plural(res.recent_files, "file"),
+                    "was" if res.recent_files == 1 else "were",
                     res.settle_window,
+                    "its" if res.recent_files == 1 else "their",
                     ""
                     if settle.conclusive
                     else " (the re-stat was immediate, so it could not have seen "

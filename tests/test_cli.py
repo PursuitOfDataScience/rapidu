@@ -261,9 +261,16 @@ def test_interrupted_output_states_no_total_and_no_shares(small_tree, capsys, mo
     monkeypatch.setattr(walkmod, "walk", interrupted)
     cli.main([small_tree, "--no-progress", "--no-box"])
     out = capsys.readouterr().out
+    # The prose is wrapped to the terminal, so match it unwrapped -- otherwise the
+    # assertion is really about where the line happens to break.
+    flat = " ".join(out.split())
     assert "INTERRUPTED" in out
     assert "PARTIAL" in out
-    assert "no total and no share" in out
+    assert "no total and no share" in flat
+    # Nothing finished, so nothing is listed: the sentence must not name a table
+    # that is not there.
+    assert "0 top-level entries were walked to completion;" in flat
+    assert "listed below" not in flat
     # No percentage may be printed, because there is no denominator.
     assert "%" not in out
 
