@@ -171,14 +171,27 @@ def test_caches_are_found_below_the_reported_depth(tree):
     assert "__pycache__" in text
 
 
-def test_the_reclaim_command_is_printed_and_nothing_is_deleted(tree):
+def test_the_reclaim_command_is_printed_and_nothing_is_deleted(tree, monkeypatch):
+    """A command is offered for the cache, whichever of them this host can run.
+
+    Pinning one string made this assert a fact about the machine. `huggingface-cli`
+    was renamed to `hf`, and where neither is installed `reclaim_command` falls
+    through to the quoted `rm -rf` form -- which is the RD-12 behaviour and is
+    correct, but is a third answer. Both worlds are forced here so the test does
+    not depend on what happens to be on PATH.
+    """
     res = walk(tree, threads=2, depth=1)
+
+    monkeypatch.setattr(
+        report.shutil, "which", lambda tool: "/usr/bin/hf" if tool == "hf" else None
+    )
     text = "\n".join(report.render_reclaimable(res, ui.resolve_style("never")))
-    # *A* command for the cache, not one particular vintage of the tool's name.
-    # `huggingface-cli` was renamed to `hf`, so which of the two is right depends
-    # on the host -- pinning either made this test assert a fact about this
-    # machine rather than about the report.
-    assert "hf cache prune" in text or "huggingface-cli delete-cache" in text, text
+    assert "hf cache prune" in text, text
+
+    monkeypatch.setattr(report.shutil, "which", lambda _tool: None)
+    monkeypatch.setattr(report, "_modulefile_for", lambda _tool: "")
+    text = "\n".join(report.render_reclaimable(res, ui.resolve_style("never")))
+    assert "rm -rf " in text, text
     # The tool's authority comes from being a measurement instrument.
     assert os.path.isdir(os.path.join(tree, "sub", ".cache", "huggingface"))
     assert os.path.isdir(os.path.join(tree, "pkg", "__pycache__"))

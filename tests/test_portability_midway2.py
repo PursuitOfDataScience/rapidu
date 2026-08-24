@@ -2567,9 +2567,17 @@ def test_the_cold_data_share_uses_the_population_it_counted(tmp_path):
 
     res = walkmod.walk(str(tmp_path), threads=2, depth=1)
     assert res.dirs > res.files, "the fixture has to be directory-heavy to show it"
-    text = "\n".join(report.render_age(res, _plain()))
-    assert "4 files (100.0%)" in text
-    assert "16.0%" not in text
+    # The *sentence*, not the whole block. `16.0%` was the wrong divisor's answer
+    # (4 of 25 inodes) and this asserted its absence anywhere in the section -- but
+    # the table above the sentence carries byte shares, and on a filesystem whose
+    # directories cost 4 KiB the cold bucket's share is legitimately 16384/102400,
+    # which renders as exactly that string. The claim is about the divisor in the
+    # sentence, so the sentence is what is read.
+    lines = report.render_age(res, _plain())
+    sentence = " ".join(" ".join(ln.split()) for ln in lines if "not been modified" in ln)
+    assert sentence, lines
+    assert "(100.0%)" in sentence, sentence
+    assert "(16.0%)" not in sentence, sentence
 
 
 # --------------------------------------------------------------------------
