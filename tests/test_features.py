@@ -116,8 +116,14 @@ def test_the_cold_finding_fires_on_inodes_when_bytes_are_still_settling(tree):
     res.size = 0
     res.by_age = [(0, 0)] * (len(AGE_BUCKET_LABELS) - 1) + [(0, res.inodes)]
     text = "\n".join(report.render_age(res, ui.resolve_style("never")))
-    assert "has not been modified in over a year" in text
-    assert "files" in text
+    # The claim is that the finding *fires*; matching the verb too pinned
+    # "has not been modified" for a count of several, which is the
+    # disagreement that wording was later fixed for.
+    assert "not been modified in over a year" in text
+    # The count half of the sentence, which is what fires when bytes are zero. It
+    # reads "N files" rather than "N inodes" since RD-13: `by_age` buckets regular
+    # files only, and the share is now taken over that same population.
+    assert "files (" in text
 
 
 def test_the_cold_finding_prefers_bytes_when_they_are_the_bigger_share(tree):
@@ -125,7 +131,10 @@ def test_the_cold_finding_prefers_bytes_when_they_are_the_bigger_share(tree):
     res.size = 1000
     res.by_age = [(0, 0)] * (len(AGE_BUCKET_LABELS) - 1) + [(900, 1)]
     text = "\n".join(report.render_age(res, ui.resolve_style("never")))
-    assert "has not been modified in over a year" in text
+    # The claim is that the finding *fires*; matching the verb too pinned
+    # "has not been modified" for a count of several, which is the
+    # disagreement that wording was later fixed for.
+    assert "not been modified in over a year" in text
 
 
 def test_a_tree_with_nothing_cold_says_nothing(tree):
@@ -165,7 +174,11 @@ def test_caches_are_found_below_the_reported_depth(tree):
 def test_the_reclaim_command_is_printed_and_nothing_is_deleted(tree):
     res = walk(tree, threads=2, depth=1)
     text = "\n".join(report.render_reclaimable(res, ui.resolve_style("never")))
-    assert "huggingface-cli delete-cache" in text
+    # *A* command for the cache, not one particular vintage of the tool's name.
+    # `huggingface-cli` was renamed to `hf`, so which of the two is right depends
+    # on the host -- pinning either made this test assert a fact about this
+    # machine rather than about the report.
+    assert "hf cache prune" in text or "huggingface-cli delete-cache" in text, text
     # The tool's authority comes from being a measurement instrument.
     assert os.path.isdir(os.path.join(tree, "sub", ".cache", "huggingface"))
     assert os.path.isdir(os.path.join(tree, "pkg", "__pycache__"))
@@ -230,7 +243,7 @@ def test_a_count_only_walk_still_counts_its_caches(tmp_path):
     text = "\n".join(report.render_reclaimable(res, ui.resolve_style("never")))
     assert "0 files" not in text
     assert "(0.0% of the tree)" not in text
-    assert "4 files reclaimable in total" in text
+    assert "4 inodes reclaimable in total" in text
 
 
 def test_a_nested_match_is_not_counted_twice(tmp_path):
@@ -242,13 +255,13 @@ def test_a_nested_match_is_not_counted_twice(tmp_path):
         fh.write(b"z" * 4096)
     res = walk(root, threads=1, depth=1)
     lines = report.render_reclaimable(res, ui.resolve_style("never"))
-    rows = [ln for ln in lines if "huggingface" in ln and "files" in ln]
+    rows = [ln for ln in lines if "huggingface" in ln and "inodes" in ln]
     assert len(rows) == 1, rows
 
 
 def test_watched_names_and_patterns_agree():
     """A pattern whose last component is not watched can never fire."""
-    for pattern, _command in report._RECLAIMABLE:
+    for pattern, _command, _delete_ok in report._RECLAIMABLE:
         leaf = pattern.replace("/", os.sep).split(os.sep)[-1]
         assert leaf in WATCHED_DIR_NAMES or leaf.lstrip(".") in WATCHED_DIR_NAMES, (
             "{!r} is unreachable: {!r} is not in WATCHED_DIR_NAMES".format(pattern, leaf)
@@ -290,10 +303,19 @@ def test_json_carries_what_a_human_reader_is_shown(tree, capsys):
     """A machine consumer could not see the caveats a human gets."""
     cli.main([tree, "--json", "--no-quota", "--no-deleted", "--no-settle-check"])
     doc = json.loads(capsys.readouterr().out)
-    assert doc["schema"] == 1
+    # This is the one place that pins the current number, so a bump is never
+    # silent. 4: under `-c` every stat-derived figure is `null` rather than 0 (or
+    # `true`, for `settled`) -- Constraint 10, which the terminal already obeyed.
+    # 3 was `walk.recent_bytes` becoming `settling.recent_allocated_bytes`: it
+    # held *allocated* blocks under a bare `bytes`. 2 was `by_age[].inodes`
+    # becoming `by_age[].files`: always a file count, so summing it against
+    # `inodes` came up short by every directory.
+    assert doc["schema"] == 4
     walk_doc = doc["walk"]
-    for key in ("by_gid", "by_age", "unreadable_dir_paths", "recent_bytes"):
+    for key in ("by_gid", "by_age", "unreadable_dir_paths"):
         assert key in walk_doc, key
+    assert "recent_bytes" not in walk_doc
+    assert "recent_allocated_bytes" in doc["settling"]
     assert [b["bucket"] for b in walk_doc["by_age"]] == list(AGE_BUCKET_LABELS)
 
 
@@ -330,9 +352,11 @@ def test_the_header_states_only_measurements_of_the_tree(tree):
     """
     res = walk(tree, threads=2, depth=1)
     header = report.render_compact(res, SettleCheck(), 4, False, ui.resolve_style("never"))[1]
+    # The removed fact was worded "95 entries"; the count that remains is nouned
+    # `inodes` since RD-9 (`entries` is reserved for the -c name count).
     assert "entries" not in header
-    assert "files" in header
-    assert "of" not in header.split("files")[1]
+    assert "inodes" in header
+    assert "of" not in header.split("inodes")[1]
 
 
 def test_a_truncated_table_says_so_at_depth_one(tree):
@@ -438,7 +462,7 @@ def test_a_value_is_never_painted_at_the_label_weight(tree):
     elapsed = "{:.2f}s".format(res.elapsed)
     assert _tone_of(facts, elapsed) != report.LABEL_SGR
     # ...while the noun beside a number still is a label.
-    assert _tone_of(facts, "files") == report.LABEL_SGR
+    assert _tone_of(facts, "inodes") == report.LABEL_SGR
 
 
 def test_the_column_header_emphasises_only_the_sorted_column(tree):
@@ -446,14 +470,14 @@ def test_the_column_header_emphasises_only_the_sorted_column(tree):
     style = _colour_style()
     head_size = report._entries_header(style, ranked_by_files=False)
     head_files = report._entries_header(style, ranked_by_files=True)
-    assert _tone_of(head_size, "size") != _tone_of(head_size, "files")
-    assert _tone_of(head_files, "files") != _tone_of(head_files, "size")
+    assert _tone_of(head_size, "size") != _tone_of(head_size, "inodes")
+    assert _tone_of(head_files, "inodes") != _tone_of(head_files, "size")
     # `entry` names no measurement, so it is a label under either ranking.
     assert _tone_of(head_size, "entry") == _tone_of(head_files, "entry") == report.LABEL_SGR
     # `share` labels the bar, which draws whichever metric was ranked, so it
     # inherits that column's weight rather than having one of its own.
     assert _tone_of(head_size, "share") == _tone_of(head_size, "size")
-    assert _tone_of(head_files, "share") == _tone_of(head_files, "files")
+    assert _tone_of(head_files, "share") == _tone_of(head_files, "inodes")
 
 
 def test_the_remainder_row_is_one_weight_throughout(tree):

@@ -23,7 +23,7 @@ import json
 import os
 import sys
 import threading
-from typing import Dict, List, Optional  # noqa: F401  (`# type:` use)
+from typing import Dict, List, Optional, Tuple  # noqa: F401  (`# type:` use)
 
 from . import deleted as deletedmod
 from . import quota as quotamod
@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="examples:\n"
         "  rdu                    how big is this tree, and what is big inside it\n"
         "  rdu ~/scratch -n 20    another tree, listing 20 directories\n"
-        "  rdu -i                 rank by file count instead of bytes\n"
+        "  rdu -i                 rank by inode count instead of bytes\n"
         "  rdu -a                 the full report: quota, /proc scan, reconciliation\n"
         "  rdu -Q                 just the quota table and the age of its figures\n"
         "  rdu -D                 unlinked-but-open space held on this node\n"
@@ -102,11 +102,24 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="directories to walk (default: the current directory)",
     )
-    p.add_argument("--json", action="store_true", dest="as_json", help="machine-readable output")
+    # The shape is stated because it *varies with argc*: one path yields the
+    # document, several yield a list of them. A script written against one path
+    # (`rdu --json /project/me | jq .walk.size_bytes`) returns null the day
+    # someone adds a second, silently. Changing it to always emit a list would fix
+    # the contract and break every existing single-path consumer for a stylistic
+    # gain, so it is documented rather than changed -- but it is documented, which
+    # it was not.
+    p.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="machine-readable output: one document per PATH, or a list of them "
+        "when several are given",
+    )
     p.add_argument(
         "-t",
         "--threads",
-        type=int,
+        type=_positive_int,
         default=walkmod.DEFAULT_THREADS,
         metavar="N",
         help="walk concurrency, clamped to {} (default: %(default)s). "
@@ -171,7 +184,12 @@ def build_parser() -> argparse.ArgumentParser:
         "-i",
         "--inodes",
         action="store_true",
-        help="rank by file count instead of bytes -- what an inode quota limits. "
+        # `inodes`, not "file count": this ranks the column headed `inodes`, which
+        # counts directories too. The package's own rule since RD-9 is `inodes`
+        # everywhere it counts inodes and `files` only where it means regular
+        # files; the flag that exists *for* the inode question was the last place
+        # still saying the other word.
+        help="rank by inode count instead of bytes -- what an inode quota limits. "
         "Add -c to answer it without stat -- ~{:.0f}x faster on GPFS, less on a "
         "page-cached local filesystem -- at the cost of counting a hard-linked "
         "file once per name rather than once per inode.".format(walkmod.COUNT_SPEEDUP),
@@ -195,7 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("size", "files", "density"),
         default=None,
         metavar="KEY",
-        help="rank by size (default), file count, or density -- files per GiB. "
+        help="rank by size (default), files (the inode count, as the column is "
+        "headed), or density -- files per GiB. "
         "Density is the 'what should I pack' signal: a subtree with a million "
         "small files costs inodes and allocation padding out of proportion to its "
         "bytes. It adds a files/GiB column, and it skips subtrees too small to be "
@@ -266,24 +285,112 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _resolve_paths(raw: List[str]) -> List[str]:
+def _default_path() -> Optional[str]:
+    """The current directory, or ``None`` if it no longer exists.
+
+    ``os.getcwd()`` **raises** when the directory the process sits in has been
+    removed, and both entry points called it unguarded as the default path. On a
+    cluster that is routine rather than exotic -- a scratch directory reclaimed by
+    a cleanup policy, or removed by another job, while a shell sits in it -- and
+    rapidu answered with an unhandled ``FileNotFoundError`` traceback before doing
+    any work. That is the failure mode this campaign filed against two of the
+    sibling packages; rapidu had a third variant of it.
+
+    Returning ``None`` lets the caller say what happened and what to do about it,
+    which is more useful than a traceback and is the whole difference between the
+    two.
+    """
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
+def _expand(path: str) -> Tuple[str, str]:
+    """``path`` with ``~`` resolved, or the reason it could not be.
+
+    ``os.path.expanduser`` **does not raise** when it cannot resolve a tilde: it
+    returns the string unchanged. With no ``$HOME`` and no passwd entry -- the
+    ordinary state of a compute node under ``sbatch --export=NONE`` at some sites
+    -- ``~/scratch`` comes back as the literal ``~/scratch``, which then reads as
+    a relative directory named ``~`` in the job's working directory.
+
+    Refusing it is right, and rapidu already did. Calling it "no such path" was
+    not: the path is not missing, the tilde is unexpanded, and the reader goes
+    looking for a directory that was never named. Same mistake as reporting a
+    broken `quota` wrapper as "not on PATH" -- a real failure with the wrong cause
+    attached. So the *result* is guarded rather than only the exception.
+
+    ``~someone`` for a user who does not exist lands here too, and gets its own
+    reason, because "no such user" and "no ``$HOME``" send the reader to different
+    places.
+    """
+    expanded = os.path.expanduser(path)
+    if not expanded.startswith("~"):
+        return expanded, ""
+    who = expanded.split(os.sep)[0][1:]
+    if who:
+        return expanded, "no such user `{}`".format(who)
+    return expanded, "$HOME is unset and this user has no passwd entry"
+
+
+def _resolve_paths(raw: List[str]) -> Tuple[List[str], int]:
+    """The measurable paths among ``raw``, and how many were refused.
+
+    The count is returned rather than left on stderr because the exit code has to
+    know. `rdu /project/a /project/b` where `b` has been deleted or unmounted
+    walked `a`, said "no such path" about `b` on stderr, and exited **0** -- so a
+    cron job asking about two trees was told everything was fine having measured
+    one. The all-rejected case already returns `EXIT_ERROR` for precisely this
+    reason ("a script saw 'success, nothing held'"), and there is no reason for
+    the partial case to disagree with it.
+    """
     out = []  # type: List[str]
-    for p in raw or [os.getcwd()]:
-        ap = os.path.abspath(os.path.expanduser(p))
+    refused = 0
+    requested = list(raw)
+    if not requested:
+        here = _default_path()
+        if here is None:
+            sys.stderr.write(
+                "rapidu: the current directory no longer exists, so there is no "
+                "default path -- name one explicitly\n"
+            )
+            return [], 1
+        requested = [here]
+    for p in requested:
+        expanded, why = _expand(p)
+        if why:
+            sys.stderr.write(
+                ui.encode_safe(
+                    "rapidu: {}: cannot expand `~` -- {}\n".format(ui.printable(p), why),
+                    sys.stderr,
+                )
+            )
+            refused += 1
+            continue
+        ap = os.path.abspath(expanded)
         if not os.path.exists(ap):
-            sys.stderr.write("rapidu: {}: no such path\n".format(p))
+            # The argument is echoed back, so it is escaped: a path is user data
+            # on stderr exactly as it is in the report.
+            sys.stderr.write(
+                ui.encode_safe("rapidu: {}: no such path\n".format(ui.printable(p)), sys.stderr)
+            )
             # Only when it is not a real directory: if ./quota exists it is a
             # path, unambiguously, and gets measured like any other.
+            refused += 1
             if p in _LEGACY_COMMANDS:
                 sys.stderr.write(
                     "rapidu: `{0}` is no longer a subcommand -- the only "
                     "positional argument is a path. Did you mean `rdu {1}`?\n".format(
-                        p, _LEGACY_COMMANDS[p]
+                        ui.printable(p), _LEGACY_COMMANDS[p]
                     )
                 )
             continue
         if not os.path.isdir(ap):
-            sys.stderr.write("rapidu: {}: not a directory\n".format(p))
+            sys.stderr.write(
+                ui.encode_safe("rapidu: {}: not a directory\n".format(ui.printable(p)), sys.stderr)
+            )
+            refused += 1
             continue
         # A symlink to a directory has to be resolved *here*, because the two
         # halves of this tool disagreed about what the argument was: this
@@ -298,7 +405,31 @@ def _resolve_paths(raw: List[str]) -> List[str]:
         if os.path.islink(ap):
             ap = os.path.realpath(ap)
         out.append(ap)
-    return out
+    return out, refused
+
+
+def _positive_int(raw: str) -> int:
+    """A thread count, rejected here rather than silently repaired later.
+
+    The upper bound is *clamped* and says so in ``--help``, which sets the
+    expectation that this option is validated -- and then ``-t 0`` and ``-t -5``
+    were quietly raised to 1. Zero threads is not a request anyone can mean and a
+    negative one is a typo (``-t -5`` is what you get from ``-t`` followed by a
+    stray flag), so argparse rejects them with the value named. Rejecting is the
+    honest direction: a clamp is a decision the tool can defend, a negative count
+    is not a decision at all.
+    """
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("{!r} is not a whole number".format(raw)) from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            "{} threads is not a walk; give 1 or more (the cap is {})".format(
+                value, walkmod.MAX_THREADS
+            )
+        )
+    return value
 
 
 def _warn_threads(requested: int) -> None:
@@ -309,6 +440,9 @@ def _warn_threads(requested: int) -> None:
             "metadata load stops being polite.\n".format(requested, walkmod.MAX_THREADS)
         )
     elif requested < 1:
+        # Unreachable from the command line -- `_positive_int` rejects it there --
+        # and kept for a caller that builds a Namespace itself, where the walk
+        # still clamps to 1 and should say so.
         sys.stderr.write("rapidu: --threads {} raised to 1\n".format(requested))
 
 
@@ -346,7 +480,21 @@ def _framed(lines: List[str], style: ui.Style, boxed: bool) -> str:
 
     The frame derives its own width from the terminal, not from ``style.width`` --
     which ``_box_style`` has already reduced by the chrome for the renderers' sake.
+
+    Every line passes :func:`ui.sanitize_line` on the way out. The renderers
+    already escape the names they lay out -- that is where the width arithmetic
+    happens, so it has to be there -- and this is the floor under them: one place
+    that guarantees no control character reaches the terminal, whichever renderer
+    produced the line and whether or not it is framed. It runs *before* the box,
+    because a border can only be padded to a width that is already true.
     """
+    # Two different failures with the same consequence, and both have to happen
+    # *before* the box: `sanitize_line` handles characters the terminal would act
+    # on, `encode_safe` characters the stream cannot represent. An escape is wider
+    # than what it replaces, so padding computed before either one is padding
+    # computed against the wrong width -- which is the RD-6 mistake, and it puts
+    # the right-hand border in the wrong column.
+    lines = [ui.encode_safe(ui.sanitize_line(line)) for line in lines]
     if boxed:
         lines = ui.box(lines, style)
     return "\n".join(lines)
@@ -368,10 +516,29 @@ def _box_style(color: str, ascii_only: bool, boxed: bool) -> "ui.Style":
 
 
 def cmd_quota(args: argparse.Namespace) -> int:
-    paths = [os.path.abspath(os.path.expanduser(p)) for p in args.paths]
-    snap = quotamod.read_best(paths[0] if paths else os.getcwd(), args.quota_timeout)
+    paths = []  # type: List[str]
+    for raw in args.paths:
+        expanded, why = _expand(raw)
+        if why:
+            # The quota reader maps rows to a path, so an unexpanded `~` here
+            # would silently ask about a relative directory named `~`.
+            sys.stderr.write("rapidu: {}: cannot expand `~` -- {}\n".format(ui.printable(raw), why))
+            return EXIT_ERROR
+        paths.append(os.path.abspath(expanded))
+    if not paths:
+        here = _default_path()
+        if here is None:
+            sys.stderr.write(
+                "rapidu: the current directory no longer exists, so there is no "
+                "path to look a quota up for -- name one explicitly\n"
+            )
+            return EXIT_ERROR
+        paths = [here]
+    snap = quotamod.read_best(paths[0], args.quota_timeout)
     if args.as_json:
-        print(json.dumps(report.to_json(None, None, snap, None, None), indent=2))
+        # `paths[0]` explicitly: there is no walk in `-Q` mode, so the document
+        # has no other way to know which filesystem it is describing.
+        print(json.dumps(report.to_json(None, None, snap, None, None, path=paths[0]), indent=2))
     else:
         boxed = not args.no_box
         style = _box_style(args.color, args.ascii, boxed)
@@ -388,8 +555,10 @@ def cmd_deleted(args: argparse.Namespace) -> int:
     # -- an error under mypy 1.x and not under 2.x, so the type of this line
     # depended on which supported checker happened to be installed.
     targets = [None]  # type: List[Optional[str]]
+    refused = 0
     if args.paths:
-        targets = list(_resolve_paths(args.paths))
+        resolved, refused = _resolve_paths(args.paths)
+        targets = list(resolved)
         if not targets:
             # Every path was rejected, and `_resolve_paths` has already said why on
             # stderr. Falling through printed no report at all and still exited 0,
@@ -408,6 +577,10 @@ def cmd_deleted(args: argparse.Namespace) -> int:
             print(_framed(report.render_deleted(scan, args.top, style), style, boxed))
         if scan.files:
             rcode = EXIT_ATTENTION
+    if refused:
+        # Some of what the caller named could not be scanned. Reporting on the
+        # rest is right; reporting success for it is not.
+        return EXIT_ERROR
     return rcode
 
 
@@ -475,7 +648,7 @@ def _walk_with_progress(
 
 
 def cmd_walk(args: argparse.Namespace) -> int:
-    paths = _resolve_paths(args.paths)
+    paths, refused = _resolve_paths(args.paths)
     if not paths:
         return EXIT_ERROR
     _warn_threads(args.threads)
@@ -527,7 +700,8 @@ def cmd_walk(args: argparse.Namespace) -> int:
         try:
             res = _walk_with_progress(path, args, style)
         except OSError as exc:
-            sys.stderr.write("rapidu: {}\n".format(exc))
+            # An OSError's string carries the path that failed.
+            sys.stderr.write("rapidu: {}\n".format(ui.printable(str(exc))))
             rcode = EXIT_ERROR
             continue
 
@@ -599,6 +773,10 @@ def cmd_walk(args: argparse.Namespace) -> int:
 
     if args.as_json and docs:
         print(json.dumps(docs[0] if len(docs) == 1 else docs, indent=2))
+    if refused:
+        # See `_resolve_paths`: a named path that could not be measured is not a
+        # successful run, however well the others went.
+        return EXIT_ERROR
     return rcode
 
 
@@ -673,10 +851,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         if args.quota_only:
-            return cmd_quota(args)
-        if args.deleted_only:
-            return cmd_deleted(args)
-        return cmd_walk(args)
+            code = cmd_quota(args)
+        elif args.deleted_only:
+            code = cmd_deleted(args)
+        else:
+            code = cmd_walk(args)
+        # Flushed *inside* the guard. Left to interpreter shutdown, a failed write
+        # is reported by Python rather than by this tool: `rdu . > /report.txt` on
+        # a full filesystem printed
+        #
+        #     Exception ignored in: <_io.TextIOWrapper name='<stdout>' ...>
+        #     OSError: [Errno 28] No space left on device
+        #
+        # and exited **120**, which is not one of this tool's three codes. A full
+        # filesystem is the condition a quota tool is run in, so that is the one
+        # write failure it must report properly.
+        sys.stdout.flush()
+        return code
     except KeyboardInterrupt:
         sys.stderr.write("\nrapidu: interrupted\n")
         return EXIT_ERROR
@@ -685,6 +876,39 @@ def main(argv: Optional[List[str]] = None) -> int:
         with contextlib.suppress(Exception):
             sys.stdout.close()
         return EXIT_OK
+    except OSError as exc:
+        # Caught after BrokenPipeError, which is a subclass of this, and closed
+        # the same way rather than redirected. Two reasons:
+        #
+        # * The interpreter's own shutdown flush must not re-raise and re-print
+        #   this as an "ignored exception" -- closing settles that, as the pipe
+        #   case already demonstrates.
+        # * A failed flush leaves the unwritten report *in the buffer*. Pointing
+        #   fd 1 elsewhere leaves it there, and an in-process caller then gets the
+        #   stale report emitted into whatever stream comes next -- observed:
+        #   a report written to a full device reappeared on the terminal during a
+        #   later call. Closing discards it.
+        with contextlib.suppress(Exception):
+            sys.stdout.close()
+        # And the diagnosis itself is best-effort: `rdu . > out 2>&1` on a full
+        # filesystem puts stderr on the same full device, so writing there raises
+        # too. Unguarded that escaped the handler and the process died at
+        # interpreter shutdown with exit 120 and an "ignored exception" dump --
+        # the very outcome this branch exists to replace. There is nowhere left to
+        # say it, so the exit code carries the whole message.
+        try:
+            sys.stderr.write("rapidu: cannot write the report: {}\n".format(exc))
+            sys.stderr.flush()
+        except Exception:
+            # Nowhere left to say it, so discard the buffered message too. Left in
+            # place, the interpreter's shutdown flush fails on it and *replaces*
+            # this exit code with 120 plus an "ignored exception" dump -- which is
+            # exactly the outcome this branch exists to prevent, arriving by a
+            # second route. stderr is only closed when writing to it has already
+            # failed; a working stderr is never touched.
+            with contextlib.suppress(Exception):
+                sys.stderr.close()
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":

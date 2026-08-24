@@ -18,6 +18,7 @@ gap with candidate explanations listed -- never as an accusation.
 """
 
 import os
+import shutil
 from typing import List, Optional, Tuple
 
 from . import walk as walkmod
@@ -59,6 +60,17 @@ class Reconciliation:
         self.blockers = []  # type: List[str]
         self.candidates = []  # type: List[str]
         self.notes = []  # type: List[str]
+
+    @property
+    def within_tolerance(self) -> bool:
+        """Do the two figures agree, ignoring whether the comparison was sound?
+
+        A property because two places need the same test and they disagreed about
+        what to do with it: the verdict treated it as sufficient for ``CLOSES``
+        and :func:`verdict_line` had no way to say "they agree, and that is not
+        evidence".
+        """
+        return self.gap is not None and abs(self.gap) <= self.tolerance
 
     @property
     def accounted(self) -> Optional[int]:
@@ -135,6 +147,113 @@ def _fileset_hint(path: str, mount: str) -> str:
     return target[len(stem) + 1 :].split(os.sep)[0]
 
 
+def _changed_phrase(res: "walkmod.WalkResult") -> str:
+    """What changed inside the settle window, without claiming which kind."""
+    parts = []  # type: List[str]
+    if res.recent_files:
+        parts.append(
+            "{} {} written".format(
+                plural(res.recent_files, "file"), "was" if res.recent_files == 1 else "were"
+            )
+        )
+    if res.touched_files:
+        parts.append("{} changed without being written".format(plural(res.touched_files, "inode")))
+    return " and ".join(parts)
+
+
+# How to confirm which fileset a path belongs to, per filesystem. `mmlsattr -L`
+# prints the fileset name on GPFS; `lfs project -d` prints the project id on
+# Lustre. The flag matters: GPFS documents `-L` for this, and the note used to
+# suggest `mmlsattr --get-fileset`, which is not among mmlsattr's options -- so a
+# reader who pasted it got a usage error rather than an answer. Unverified here
+# (no mm* command is installed on either cluster in this campaign), so it is
+# stated from the GPFS CLI reference rather than measured.
+_FILESET_PROBES = (("mmlsattr", "mmlsattr -L"), ("lfs", "lfs project -d"))
+
+
+def _fileset_probe_hint() -> str:
+    """How to confirm the fileset, naming only tools that exist on this host.
+
+    RD-12's rule, applied outside the reclaim table: *nothing is printed as a
+    command unless it was checked against this host.* This note exists to tell the
+    reader how to resolve an ambiguity the tool could not, so suggesting two
+    commands that both answer `command not found` is the one thing it must not do
+    -- and on any site that is neither GPFS nor Lustre, both were exactly that.
+
+    Returns ``""`` where neither is available, and the caller then says the
+    ambiguity stands rather than pointing at nothing.
+    """
+    usable = [form for tool, form in _FILESET_PROBES if shutil.which(tool)]
+    if not usable:
+        return ""
+    return " -- confirm with {}".format(" or ".join("`{}`".format(u) for u in usable))
+
+
+def _row_gid(row: QuotaRow) -> Optional[int]:
+    """The gid a group-scoped row is charged to, if it can be resolved.
+
+    A group quota is charged **by gid**, and reconcile compared group rows against
+    the *whole* walked tree. The two differ exactly where it matters, which
+    `walk.WalkResult.by_gid` was added to capture: a file written into a shared
+    project directory whose setgid bit is missing lands in the writer's personal
+    group, so those bytes are charged somewhere nobody is looking -- while the
+    comparison counted them toward the project group. Measured on a synthetic
+    half-and-half tree: a row charged 400 GiB was compared against 800 GiB and the
+    -400 GiB difference was reported as a gap, blamed on a stale quota figure and
+    on sparse blocks.
+
+    The row's fileset column carries the group name for the site-wrapper backends
+    (`rcc-staff`, `labgroup`). Where it does not resolve to a real group -- an
+    `mmlsquota` row is named after its filesystem, and a name service can simply
+    be down -- this returns ``None`` and the caller keeps the whole-tree
+    comparison it has always made, saying that it could not narrow. Guessing a gid
+    would be worse than not narrowing.
+    """
+    if row.scope != "group":
+        return None
+    try:
+        import grp
+
+        return grp.getgrnam(row.fileset).gr_gid
+    except (ImportError, KeyError, TypeError):
+        return None
+
+
+def _others_own_some(res: "walkmod.WalkResult", my_uid: int) -> bool:
+    """Does this walk contain anything owned by somebody other than ``my_uid``?
+
+    Not ``len(res.by_uid) > 1``, which was the old test and which is false in the
+    one case that matters most: a tree where a single *other* person owns
+    everything. Then the user-scoped comparison silently measured zero of theirs
+    and reported the whole quota as a gap.
+    """
+    return any(uid != my_uid for uid in res.by_uid)
+
+
+def _inferred_mount_note(row: QuotaRow) -> str:
+    """Why an inferred mapping cannot support a finding.
+
+    ``QuotaRow.guessed`` says the backend never published a mount point for this
+    row and rapidu worked one out -- from the filesystem name in a section header,
+    or in the worst case from the fileset label. That is a mapping, not a
+    measurement, and an unexplained gap computed across a wrong mapping is a
+    fabricated finding of exactly the kind this module exists to prevent: on a
+    cluster where three filesystems live under one ``/scratch``, the wrong guess
+    reconciles one cluster's tree against another cluster's quota and the
+    arithmetic looks perfectly sound.
+
+    So it is stated as a blocker, which downgrades ``GAP`` to ``INCONCLUSIVE``
+    while leaving the candidate causes visible. A comparison that *closes*
+    survives -- the numbers agreeing is itself evidence the mapping was right --
+    and carries this as a caveat instead.
+    """
+    return (
+        "the mount point for the {} quota row was inferred from its name rather "
+        "than published by the backend, so this comparison may be against a "
+        "different filesystem's quota".format(row.fileset)
+    )
+
+
 # Scope preference when several rows govern one path. A user row measures exactly
 # the person asking; a project row measures the allocation a shared directory is
 # charged against; a group or fileset row measures everybody. Narrowest first.
@@ -182,12 +301,12 @@ def _pick_row(
         notes.append(
             "{} {} quota rows govern this path equally ({}); reconciled against "
             "'{}' because it is the most narrowly scoped, not because it is known "
-            "to be the right one -- confirm with `mmlsattr --get-fileset` or "
-            "`lfs project -d`".format(
+            "to be the right one{}".format(
                 len(matching),
                 kind,
                 ", ".join(sorted({r.fileset for r in others} | {best.fileset})),
                 best.fileset,
+                _fileset_probe_hint(),
             )
         )
     return best, notes
@@ -205,10 +324,14 @@ def reconcile(
     rec = Reconciliation(kind)
 
     if not snap.available:
+        # The backend's own explanation is not repeated here. It is on the
+        # snapshot the caller passed in, the QUOTA panel prints it once, and the
+        # JSON document carries it under `quota.reason` -- while this note is
+        # emitted once per kind, so interpolating a three-line GPFS failure made
+        # it the longest thing in the report and said nothing new the second time.
         rec.notes.append(
-            "no quota backend available ({}), so there is nothing to reconcile against".format(
-                snap.reason or "unknown reason"
-            )
+            "no quota backend available, so there is nothing to reconcile "
+            "against -- see QUOTA for why"
         )
         return rec
 
@@ -254,11 +377,32 @@ def reconcile(
     # bytes show up, because the motivating case is a shared group directory.
     my_uid = os.getuid()
     user_scoped = row.scope == "user"
-    mine = deleted.owned_by(my_uid) if user_scoped else deleted.files
+    row_gid = _row_gid(row)
+    if user_scoped:
+        mine = deleted.owned_by(my_uid)
+    elif row_gid is not None:
+        # Both halves narrowed to the same population, which is the rule this
+        # block opens with: narrowing the walk by gid while adding every unlinked
+        # inode regardless would put two different populations on the two sides of
+        # one sum.
+        mine = deleted.owned_by_gid(row_gid)
+    else:
+        mine = deleted.files
     if kind == "blocks":
-        if user_scoped:
+        if row_gid is not None:
+            rec.walk_value = res.by_gid.get(row_gid, (0, 0))[0]
+            if rec.walk_value != res.size:
+                rec.notes.append(
+                    "the quota row is charged to the '{}' group, so only the {} of "
+                    "the {} walked that is charged to it is compared -- the rest "
+                    "belongs to other groups (a missing setgid bit is the usual "
+                    "reason)".format(
+                        row.fileset, human_bytes(rec.walk_value), human_bytes(res.size)
+                    )
+                )
+        elif user_scoped:
             rec.walk_value = res.by_uid.get(my_uid, (0, 0))[0]
-            if len(res.by_uid) > 1:
+            if _others_own_some(res, my_uid):
                 rec.notes.append(
                     "the quota row is user-scoped, so only the {} you own of the "
                     "{} walked is compared".format(
@@ -267,31 +411,89 @@ def reconcile(
                 )
         else:
             rec.walk_value = res.size
+            if row.scope == "group":
+                rec.notes.append(
+                    "the whole tree is compared against a group row whose gid could "
+                    "not be resolved from '{}', so bytes charged to another group "
+                    "are included".format(row.fileset)
+                )
         rec.deleted_value = sum(f.size for f in mine)
     else:
-        if user_scoped:
+        if row_gid is not None:
+            rec.walk_value = res.by_gid.get(row_gid, (0, 0))[1]
+            if rec.walk_value != res.inodes:
+                rec.notes.append(
+                    # `plural` and agreeing verbs: this read "only the 1 inodes
+                    # of the 13 walked that are charged to it are compared".
+                    "the quota row is charged to the '{}' group, so only the {} "
+                    "of the {} walked that {} charged to it {} compared".format(
+                        row.fileset,
+                        plural(rec.walk_value, "inode"),
+                        human_count(res.inodes),
+                        "is" if rec.walk_value == 1 else "are",
+                        "is" if rec.walk_value == 1 else "are",
+                    )
+                )
+        elif user_scoped:
             rec.walk_value = res.by_uid.get(my_uid, (0, 0))[1]
             # The same sentence the blocks branch has always printed. Without it
             # the files comparison silently dropped every inode owned by someone
             # else and then reported the shortfall as a difference, with nothing on
             # screen to say the two sides counted different things.
-            if len(res.by_uid) > 1:
+            if _others_own_some(res, my_uid):
                 rec.notes.append(
-                    "the quota row is user-scoped, so only the {} inodes you own "
-                    "of the {} walked are compared".format(
-                        human_count(rec.walk_value), human_count(res.inodes)
+                    "the quota row is user-scoped, so only the {} you own "
+                    "of the {} walked {} compared".format(
+                        plural(rec.walk_value, "inode"),
+                        human_count(res.inodes),
+                        "is" if rec.walk_value == 1 else "are",
                     )
                 )
         else:
             rec.walk_value = res.inodes
         rec.deleted_value = len(mine)
     if user_scoped and len(mine) != len(deleted.files):
+        others = len(deleted.files) - len(mine)
         rec.notes.append(
-            "{} of the {} unlinked-but-open inodes found are owned by other "
-            "users and are excluded from this user-scoped comparison".format(
-                len(deleted.files) - len(mine), len(deleted.files)
+            # Both verbs and the noun agree with their counts. The guard above is
+            # `!=`, so `others` is routinely 1 -- one other user's descriptor on a
+            # shared node -- and this read "1 of the 1 unlinked-but-open inodes
+            # found are owned by other users and are excluded".
+            "{} of the {} found {} owned by other users and {} excluded from this "
+            "user-scoped comparison".format(
+                others,
+                plural(len(deleted.files), "unlinked-but-open inode"),
+                "is" if others == 1 else "are",
+                "is" if others == 1 else "are",
             )
         )
+
+    narrowed = user_scoped or row_gid is not None
+    if narrowed and not rec.accounted and (res.size or res.inodes):
+        # The walk found content and none of it is in the population this row
+        # counts. That is not a small difference; it is not a difference at all.
+        # Comparing a user quota against zero bytes of that user produced
+        # "UNEXPLAINED GAP -- 0 B accounted for vs quota 800 GiB", with candidate
+        # causes about unlinked files and snapshots, for a tree whose whole
+        # explanation is that a colleague owns it -- and auditing someone else's
+        # directory, or a shared tree populated by others, is routine on a cluster.
+        # The same applies to a group row once `_row_gid` narrows it: a tree none
+        # of which is charged to that group says nothing about that group's quota.
+        #
+        # Two things this must *not* swallow. A genuinely empty tree still
+        # compares, because "my quota says 800 GiB and this mount holds none of my
+        # files" is a real finding. And the test is bytes *or* inodes, because a
+        # tree of empty files owned by others has no bytes and plenty of inodes.
+        rec.notes.append(
+            "none of the {} walked is {}, so the walk measured nothing this quota "
+            "row counts -- there is no comparison to make".format(
+                human_bytes(res.size) if kind == "blocks" else human_count(res.inodes),
+                "owned by you (this row is user-scoped)"
+                if user_scoped
+                else "charged to the '{}' group".format(row.fileset),
+            )
+        )
+        return rec
 
     rec.tolerance = _effective_tolerance(row.used, rec.accounted or 0, kind)
     rec.gap = row.used - (rec.accounted or 0)
@@ -304,10 +506,18 @@ def reconcile(
     if not covers_whole_tree:
         mount = (row.mount or "").rstrip("/")
         rec.verdict = SUBTREE
+        # The inferred-mount caveat rides in this note rather than adding a
+        # second one. It has to be said -- a subtree of the *wrong* mount is not
+        # a subtree of anything -- but this section already prints one note per
+        # kind, and a three-line sentence repeated for bytes and for files is how
+        # a caveat stops being read.
+        how = "{}-scoped{}".format(
+            row.scope or "un", ", mount inferred from its name" if row.guessed else ""
+        )
         rec.notes.append(
-            "the {} quota covers {} ({}-scoped); this walk covers only {}, so "
+            "the {} quota covers {} ({}); this walk covers only {}, so "
             "the difference is expected, not a discrepancy".format(
-                row.fileset, mount or "an unknown mount", row.scope or "un", root
+                row.fileset, mount or "an unknown mount", how, root
             )
         )
         # A subtree smaller than its quota needs no explanation: the rest of the
@@ -343,13 +553,17 @@ def reconcile(
                     "more" if settle.drift > 0 else "less",
                 )
             )
-        elif res.recent_files:
+        elif res.recent_files or res.touched_files:
             rec.blockers.append(
-                "{} {} modified within the last {:.0f}s and {} blocks may not be final{}".format(
-                    plural(res.recent_files, "file"),
-                    "was" if res.recent_files == 1 else "were",
+                "{} within the last {:.0f}s, so {} blocks may not be final{}".format(
+                    # "written" is only true of the mtime half. A `chmod -R` or a
+                    # `chgrp` bumps ctime on every file in a tree, and asserting a
+                    # write about those made this blocker state something false --
+                    # while still being right to fire, since a delayed allocation
+                    # completing looks identical from a stat.
+                    _changed_phrase(res),
                     res.settle_window,
-                    "its" if res.recent_files == 1 else "their",
+                    "its" if (res.recent_files + res.touched_files) == 1 else "their",
                     ""
                     if settle.conclusive
                     else " (the re-stat was immediate, so it could not have seen "
@@ -367,13 +581,45 @@ def reconcile(
         )
 
     if res.unreadable_dirs:
-        rec.blockers.append(
-            "{} directories could not be read, so the walk total is a floor, not a total".format(
-                len(res.unreadable_dirs)
+        # Two causes, two remedies. "could not be read" points at permissions; a
+        # directory deleted between being listed and being opened points at
+        # something writing to the tree, and the answer there is to re-run when it
+        # is idle, not to chase access. Both still make the total a floor.
+        refused = len(res.unreadable_dirs) - res.vanished_dirs
+        if refused > 0:
+            rec.blockers.append(
+                "{} could not be read, so the walk total is a floor, not a total".format(
+                    plural(refused, "directory", irregular="directories")
+                )
             )
-        )
+        if res.vanished_dirs:
+            rec.blockers.append(
+                "{} vanished between being listed and being walked -- the tree was "
+                "changing underneath, so the total is a floor and a moving "
+                "one".format(plural(res.vanished_dirs, "directory", irregular="directories"))
+            )
     if res.unstatable:
-        rec.blockers.append("{} entries could not be stat'ed".format(res.unstatable))
+        # Same split as the directories above, for the same reason: "could not be
+        # stat'ed" reads as a permission problem, and an entry unlinked while the
+        # walk was reading its directory is not one.
+        unreachable = res.unstatable - res.vanished_entries
+        if unreachable > 0:
+            rec.blockers.append(
+                "{} could not be stat'ed".format(plural(unreachable, "entry", irregular="entries"))
+            )
+        if res.vanished_entries:
+            rec.blockers.append(
+                "{} vanished before {} could be stat'ed -- the tree was changing underneath".format(
+                    plural(res.vanished_entries, "entry", irregular="entries"),
+                    # The pronoun has to agree as well as the noun.
+                    # `render_allocation` already does this -- "it" for one file,
+                    # "they" otherwise -- and writing a new message without reusing
+                    # the idiom produced "1 entry vanished before they could be
+                    # stat'ed". Found by auditing this session's own additions
+                    # against the rule the session had been enforcing.
+                    "it" if res.vanished_entries == 1 else "they",
+                )
+            )
     if res.partial:
         rec.blockers.append("the walk was interrupted before it finished")
 
@@ -383,14 +629,53 @@ def reconcile(
             "with --one-file-system to compare like with like".format(len(res.by_dev))
         )
 
+    if row.guessed:
+        rec.blockers.append(_inferred_mount_note(row))
+
+    if snap.figure_note:
+        # The backend disowned its own numbers. Comparing a walk against a figure
+        # whose publisher says it is inaccurate cannot produce a finding -- it can
+        # only produce a difference of unknown origin, which is what INCONCLUSIVE
+        # is for. Distinct from the staleness blocker: waiting does not fix this.
+        rec.blockers.append(snap.figure_note)
+
     # ---- verdict ----
-    if rec.gap is not None and abs(rec.gap) <= rec.tolerance:
+    #
+    # `CLOSES` used to be decided here, before the blockers above were consulted,
+    # so every one of them was collected and then thrown away whenever the two
+    # figures happened to land within tolerance. The headline then read
+    # "reconciles (difference is within 2.0 GiB)" -- an all-clear, and the
+    # strongest thing this tool says -- directly above a blocker reading "11,267
+    # directories could not be read, so the walk total is a floor, not a total".
+    #
+    # An agreement reached by an unsound comparison is not evidence. If the walk
+    # undercounts, matching the quota means the true total *exceeds* it; if the
+    # walk crossed three filesystems while the quota governs one, the match is
+    # arithmetic coincidence. This is the same discipline `SettleCheck.conclusive`
+    # applies to the settling check -- before believing a null result, ask whether
+    # the instrument could see the effect at all -- and `CLOSES` is a null result.
+    #
+    # It is also what this module's own docstring already promised: *every input
+    # that could invalidate the comparison downgrades the verdict to INCONCLUSIVE
+    # and names itself*. The blockers were named; the downgrade was skipped.
+    if rec.within_tolerance and not rec.blockers:
         rec.verdict = CLOSES
         return rec
 
     if rec.blockers:
         rec.verdict = INCONCLUSIVE
-        rec.candidates = _candidates(rec, res, deleted, kind)
+        if rec.within_tolerance:
+            # Worth saying out loud, because it is genuinely reassuring and the
+            # reader can see the two figures anyway -- but as an observation, not
+            # a verdict. `_candidates` is not called: it exists to explain a gap
+            # and there is no gap to explain.
+            rec.notes.append(
+                "the two figures do agree, but the comparison that produced the "
+                "agreement is not sound, so it is not evidence that the quota is "
+                "explained"
+            )
+        else:
+            rec.candidates = _candidates(rec, res, deleted, kind)
         return rec
 
     rec.verdict = GAP
@@ -472,5 +757,10 @@ def verdict_line(rec: Reconciliation) -> str:
         tol = human_count(rec.tolerance) if rec.kind == "files" else human_bytes(rec.tolerance)
         return "reconciles (difference is within {})".format(tol)
     if rec.verdict == INCONCLUSIVE:
-        return "INCONCLUSIVE -- {}".format(rec.blockers[0] if rec.blockers else "unknown")
+        why = rec.blockers[0] if rec.blockers else "unknown"
+        if rec.within_tolerance:
+            # Naming the agreement without the qualifier would be read as the
+            # all-clear this verdict exists to withhold.
+            return "INCONCLUSIVE -- the figures agree, but not soundly: {}".format(why)
+        return "INCONCLUSIVE -- {}".format(why)
     return "UNEXPLAINED GAP"

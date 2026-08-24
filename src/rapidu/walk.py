@@ -21,6 +21,7 @@ filesystem latency) and the bookkeeping in :class:`WalkResult` that ``du`` does
 not collect at all.
 """
 
+import errno
 import os
 import stat
 import threading
@@ -69,6 +70,10 @@ MIN_ALLOC_UNIT = 4096
 # Bound on how many recently-modified files we retain for the re-stat pass.
 _RECENT_SAMPLE_CAP = 4096
 
+# Bound on how many `--one-file-system` skips we name. The *count* is exact
+# whatever happens; this only limits the list, and three is all the report shows.
+_CROSSED_SAMPLE_CAP = 64
+
 # Age buckets for the cold-data report, in days, youngest first. The last bucket
 # is open-ended.
 #
@@ -77,6 +82,15 @@ _RECENT_SAMPLE_CAP = 4096
 # year" is the answer, and `st_mtime` is already read for every file to drive the
 # settling check and then discarded. This costs one comparison and one adder per
 # file, no extra syscall.
+# Errnos that mean "the tree changed", not "you may not look".
+_VANISHED_ERRNOS = frozenset(
+    x for x in (errno.ENOENT, errno.ESTALE, errno.ENOTDIR) if x is not None
+)
+
+# Enough to identify what went wrong without holding a path per failure on a
+# tree where every stat fails.
+_UNSTAT_SAMPLE_CAP = 64
+
 AGE_BUCKET_DAYS = (7, 30, 90, 365)
 AGE_BUCKET_LABELS = ("< 7d", "7-30d", "30-90d", "90d-1y", "> 1y")
 
@@ -290,10 +304,14 @@ class WalkResult:
         self.under_files = 0
         self.under_apparent = 0
         self.under_alloc = 0
-        # Files whose whole allocation is under one block: the data lives in
-        # the inode. Counted apart from both classes above because it is
-        # neither padding nor sparseness, and because including it in the
-        # padded class set the measured allocation unit to 512 B.
+        # Files the filesystem allocated *nothing* for while they still hold
+        # data: the bytes live in the inode. Counted apart from both classes above
+        # because it is neither padding nor sparseness.
+        #
+        # This used to mean "allocated less than 4 KiB", which is a different
+        # claim and a false one -- such a file has blocks, and the gap between its
+        # data and those blocks is padding. Keeping small allocations out of the
+        # *unit* estimate is still necessary and is done at that site instead.
         self.inline_files = 0
         # Bitwise OR of the allocated sizes of padded files. Every allocation is
         # a whole number of allocation units, and the unit is a power of two, so
@@ -319,7 +337,17 @@ class WalkResult:
         # quota charges all of these" over the *uid* table, which answers a
         # question nobody asked.
         self.by_gid = {}  # type: Dict[int, Tuple[int, int]]
-        # (bytes, inodes) per `AGE_BUCKET_LABELS` entry, by mtime.
+        # (bytes, *files*) per `AGE_BUCKET_LABELS` entry, by mtime -- every
+        # non-directory entry, symlinks included, hard-link duplicates suppressed
+        # only, deliberately: a directory's mtime tracks its contents changing, so
+        # bucketing it would count the same event twice.
+        #
+        # The second element is a **file** count, not an inode count, and it used
+        # to be commented as `(bytes, inodes)`. The name drifted from the quantity
+        # here, again where `report` unpacked it, and again in the `--json` key, and
+        # only the terminal's format string ("N files") restored the truth. A
+        # consumer summing the JSON's `by_age[].inodes` against the document's
+        # `inodes` was short by exactly `dirs` -- 42% on a config directory.
         self.by_age = [(0, 0)] * len(AGE_BUCKET_LABELS)  # type: List[Tuple[int, int]]
         # Subtree totals for directories named in `WATCHED_DIR_NAMES`, at any
         # depth. Kept apart from `dir_agg` on purpose: these are deeper than the
@@ -336,8 +364,64 @@ class WalkResult:
         self.watched = {}  # type: Dict[str, Tuple[int, int]]
         self.dir_agg = {}  # type: Dict[str, Entry]
         self.unreadable_dirs = []  # type: List[Tuple[str, str]]
+        # How many of those were *gone* rather than refused. A directory deleted
+        # between being listed and being opened is not a permissions problem, and
+        # calling it one sends the reader to chase access they already have: on a
+        # shared filesystem the usual cause is another job -- often their own --
+        # writing to the tree while it is walked. Counted separately rather than
+        # widened into the tuple above, so every existing consumer of
+        # `unreadable_dirs` keeps its count, its paths and its `complete`.
+        #
+        # Classified from `errno`, never from the message: `strerror` is localised,
+        # so matching "No such file or directory" would silently stop working on a
+        # host with a non-English locale.
+        self.vanished_dirs = 0
+        # The same two questions for entries as for directories, which only the
+        # directory half could answer. `unstatable` was a bare count with no cause
+        # and no paths: a file deleted mid-walk and one that may not be stat'ed
+        # were the same number, and "40 entries unstatable" named none of them, so
+        # there was nothing to act on. `unreadable_dirs` has carried its paths from
+        # the start -- *"a consumer that knows three directories were unreadable
+        # cannot act on it; one that knows which can"* -- and this is that same
+        # rule, applied to the sibling counter.
+        self.vanished_entries = 0
+        self.unstatable_paths = []  # type: List[str]
         self.unstatable = 0
+        # What `--one-file-system` refused, because it sat on another filesystem.
+        #
+        # This is a cap the tool applies at the user's request, and it was applied
+        # in complete silence: `rdu -x /scratch` on a cluster whose /scratch holds
+        # three cluster filesystems reported `0 B - 1 files` and nothing else,
+        # which reads as "/scratch is empty". Every other bound in this walk is
+        # published -- unreadable directories, unstatable entries, an interrupt --
+        # so this one is too. `complete` deliberately does *not* consider it: the
+        # walk did exactly what it was asked, and a requested scope is not a
+        # failure. It is the total's meaning that changes, not its validity.
+        self.crossed = 0
+        self.crossed_paths = []  # type: List[str]
+        # Files whose *data* changed inside the settle window: `st_mtime`, which
+        # is the signal this window was defined for ("a file modified this
+        # recently may not have its blocks allocated yet").
         self.recent_files = 0
+        # Files whose *inode* changed inside the window without being written --
+        # `st_ctime` new, `st_mtime` old. Counted apart because the two cannot be
+        # reported as the same thing: `chmod -R`, a `chgrp` to share a directory,
+        # or the `utime` pass at the end of `tar -x` bumps ctime on every file in
+        # a tree without touching one block, and folding those into
+        # `recent_files` made the report state "N files were written in the last
+        # 120s and their blocks may not be final" about a tree nobody had written
+        # to. The trigger still fires on them -- a delayed allocation completing
+        # also bumps ctime alone, and that genuinely does move `st_blocks` -- but
+        # which of the two it was is not knowable from a stat, so the report names
+        # both instead of asserting the write.
+        self.touched_files = 0
+        # Files whose mtime is *ahead* of this node's clock. Impossible as an age,
+        # ordinary as an observation: a client clock behind the fileserver's
+        # stamps every write in the future, and a restored archive carries
+        # whatever timestamps it was built with. They are inside any window
+        # forever, so counting them as "just written" makes a tree permanently
+        # unsettled for a reason that is not true.
+        self.future_files = 0
         self.recent_apparent = 0
         self.recent_size = 0
         # (path, blocks_at_walk_time) so the re-stat pass can compare like with like.
@@ -620,8 +704,27 @@ def walk(
 
     def worker(slot_id: int = 0) -> None:
         l_size = l_app = l_files = l_dirs = l_sym = l_unstat = 0
+        l_vanished = 0
+        l_vanished_entries = 0
+        l_unstat_paths = []  # type: List[str]
+
+        def unstatable(exc, path):
+            """Record one failed stat: where it was, and whether it had vanished.
+
+            Only ever reached from an `except` block, so the cost sits on the
+            failure path and the hot loop is untouched. Returns 1 when the cause
+            was the entry going away rather than a permission -- classified from
+            `errno`, because `strerror` is localised.
+            """
+            if len(l_unstat_paths) < _UNSTAT_SAMPLE_CAP:
+                l_unstat_paths.append(path)
+            return 1 if exc.errno in _VANISHED_ERRNOS else 0
+
+        l_crossed = 0
+        l_crossed_paths = []  # type: List[str]
         seen_here = 0
         l_recent = l_recent_app = l_recent_size = 0
+        l_touched = l_future = 0
         l_extra = 0
         l_padn = l_pada = l_padb = 0
         l_inline = 0
@@ -757,8 +860,9 @@ def walk(
                                 break
                             try:
                                 isdir = entry.is_dir(follow_symlinks=False)
-                            except OSError:
+                            except OSError as exc:
                                 l_unstat += 1
+                                l_vanished_entries += unstatable(exc, dsep + entry.name)
                                 continue
                             if isdir:
                                 name = entry.name
@@ -779,9 +883,13 @@ def walk(
                                 if ofs:
                                     try:
                                         if entry.stat(follow_symlinks=False).st_dev != root_dev:
+                                            l_crossed += 1
+                                            if len(l_crossed_paths) < _CROSSED_SAMPLE_CAP:
+                                                l_crossed_paths.append(dsep + name)
                                             continue
-                                    except OSError:
+                                    except OSError as exc:
                                         l_unstat += 1
+                                        l_vanished_entries += unstatable(exc, dsep + name)
                                         continue
                                 children.append((dsep + name, d_parts + (name,)))
                                 l_dirs += 1
@@ -834,8 +942,9 @@ def walk(
                             break
                         try:
                             st = entry.stat(follow_symlinks=False)
-                        except OSError:
+                        except OSError as exc:
                             l_unstat += 1
+                            l_vanished_entries += unstatable(exc, dsep + entry.name)
                             continue
 
                         blocks = st.st_blocks * 512
@@ -844,6 +953,9 @@ def walk(
 
                         if ftype == S_IFDIR:
                             if ofs and st.st_dev != root_dev:
+                                l_crossed += 1
+                                if len(l_crossed_paths) < _CROSSED_SAMPLE_CAP:
+                                    l_crossed_paths.append(dsep + entry.name)
                                 continue
                             name = entry.name
                             children.append((dsep + name, d_parts + (name,)))
@@ -909,6 +1021,9 @@ def walk(
                             continue
 
                         if ofs and st.st_dev != root_dev:
+                            l_crossed += 1
+                            if len(l_crossed_paths) < _CROSSED_SAMPLE_CAP:
+                                l_crossed_paths.append(dsep + entry.name)
                             continue
 
                         if ftype == S_IFLNK:
@@ -929,20 +1044,55 @@ def walk(
                         l_size += blocks
                         l_app += sz
                         # Which way this file's allocation went, and by how much.
-                        # blocks == 0 is a fast symlink or an empty file and is
-                        # evidence of neither direction.
-                        if blocks:
-                            if blocks < MIN_ALLOC_UNIT:
+                        #
+                        # Two separate questions, which used to share one branch.
+                        # An allocation under `MIN_ALLOC_UNIT` must stay out of the
+                        # *unit estimate* -- see that constant for the measurement
+                        # -- but that is not evidence the file was inlined, and it
+                        # was being counted as `inline` on the strength of it. A
+                        # 64-byte file holding one 512-byte sector has `st_blocks
+                        # == 1`: blocks were allocated, and 448 bytes of them are
+                        # padding. Measured on 50,000 such files: `inline_files:
+                        # 50000`, `padding_bytes: 0`, and the packing advice --
+                        # the whole point of the panel -- never printed, on the
+                        # most packable tree there is.
+                        #
+                        # `blocks == 0` with data present is the real inline case:
+                        # the filesystem allocated nothing and the bytes live in
+                        # the inode.
+                        #
+                        # Except when they simply have not landed yet. A file
+                        # written seconds ago on a delayed-allocation filesystem
+                        # also reports `st_blocks == 0`, and calling that "inlined"
+                        # is the same mistake the cold-data finding once made:
+                        # being wrong on exactly the freshly written trees this
+                        # tool is pointed at. Caught by a fixture whose only
+                        # regular file was 4 KiB and one second old. The original
+                        # comment here -- "evidence of neither direction" -- was
+                        # right about that, so recency decides, using the same
+                        # cutoff `SETTLING` reports against.
+                        #
+                        # Symlinks are excluded too: a fast symlink is stored in
+                        # its inode by construction and says nothing about how this
+                        # tree stores its data.
+                        if not blocks:
+                            settled = st.st_mtime < recent_cutoff and st.st_ctime < recent_cutoff
+                            if sz and settled and ftype != S_IFLNK:
                                 l_inline += 1
-                            elif blocks > sz:
-                                l_padn += 1
-                                l_pada += sz
-                                l_padb += blocks
+                        elif blocks > sz:
+                            l_padn += 1
+                            l_pada += sz
+                            l_padb += blocks
+                            # The unit estimate takes only allocations big enough
+                            # to *be* a unit; a 512-byte sector would drag the
+                            # measured unit down from 16 KiB, which is the
+                            # regression `MIN_ALLOC_UNIT` was introduced to fix.
+                            if blocks >= MIN_ALLOC_UNIT:
                                 l_bits |= blocks
-                            elif blocks < sz:
-                                l_undn += 1
-                                l_unda += sz
-                                l_undb += blocks
+                        elif blocks < sz:
+                            l_undn += 1
+                            l_unda += sz
+                            l_undb += blocks
                         if b0 is not None:
                             b0[0] += blocks
                             b0[1] += 1
@@ -998,14 +1148,30 @@ def walk(
                         slot[0] += blocks
                         slot[1] += 1
 
+                        # The union still drives the re-stat sample and the
+                        # byte figures, because re-stat is how you find out
+                        # whether blocks are moving and that must stay
+                        # conservative. Only the attribution is split.
                         if st.st_mtime >= recent_cutoff or st.st_ctime >= recent_cutoff:
-                            l_recent += 1
+                            if st.st_mtime >= recent_cutoff:
+                                l_recent += 1
+                                if st.st_mtime > now:
+                                    l_future += 1
+                            else:
+                                l_touched += 1
                             l_recent_app += st.st_size
                             l_recent_size += blocks
                             if len(l_sample) < cap:
                                 l_sample.append((dsep + entry.name, blocks))
             except OSError as exc:
                 l_unreadable.append((d, exc.strerror or "unreadable"))
+                # ENOENT: deleted under us. ESTALE: an NFS handle whose target was
+                # removed or replaced on the server -- the same event seen through
+                # a network filesystem. ENOTDIR: it was a directory when we listed
+                # it and is not one now. All three are the tree moving, not a
+                # permission being withheld.
+                if exc.errno in _VANISHED_ERRNOS:
+                    l_vanished += 1
             except Exception as exc:  # noqa: BLE001  (a hang is worse than a report)
                 # Anything not an OSError -- MemoryError on a huge frontier, a
                 # latent TypeError, a shadowed name -- must not escape. See the
@@ -1070,8 +1236,19 @@ def walk(
             res.dirs += l_dirs
             res.symlinks += l_sym
             res.unstatable += l_unstat
+            res.vanished_entries += l_vanished_entries
+            if len(res.unstatable_paths) < _UNSTAT_SAMPLE_CAP:
+                res.unstatable_paths.extend(
+                    l_unstat_paths[: _UNSTAT_SAMPLE_CAP - len(res.unstatable_paths)]
+                )
+            res.crossed += l_crossed
+            room = _CROSSED_SAMPLE_CAP - len(res.crossed_paths)
+            if room > 0:
+                res.crossed_paths.extend(l_crossed_paths[:room])
             res.hardlink_extra_refs += l_extra
             res.recent_files += l_recent
+            res.touched_files += l_touched
+            res.future_files += l_future
             res.recent_apparent += l_recent_app
             res.recent_size += l_recent_size
             res.padded_files += l_padn
@@ -1083,6 +1260,7 @@ def walk(
             res.inline_files += l_inline
             res.alloc_bits |= l_bits
             res.unreadable_dirs.extend(l_unreadable)
+            res.vanished_dirs += l_vanished
             room = _RECENT_SAMPLE_CAP - len(res.recent_sample)
             if room > 0:
                 res.recent_sample.extend(l_sample[:room])
@@ -1264,7 +1442,15 @@ def recheck_settling(res: WalkResult, wait: float = 0.0) -> SettleCheck:
     drift instead of merely suspecting it.
     """
     chk = SettleCheck()
-    chk.sampled_of = res.recent_files
+    # The population the sample was actually drawn from, which is the *union* of
+    # written-recently and inode-touched-recently -- `recent_sample` is filled in
+    # that branch. Setting it from `recent_files` alone was correct while the two
+    # were one counter and wrong the moment they were split: a tree with 1,000
+    # written files and 9,000 touched inodes truncates the 4,096-entry sample by
+    # six thousand, and `sampled` compared 1,000 against 4,096 and reported no
+    # truncation at all. A cap that hides itself is the defect this report has
+    # filed twice already.
+    chk.sampled_of = res.recent_files + res.touched_files
     if not res.recent_sample:
         # Nothing was written recently, so there is nothing to be unsettled.
         chk.ran = True

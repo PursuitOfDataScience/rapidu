@@ -556,7 +556,7 @@ def test_a_symlinked_root_is_walked(tmp_path):
     link = str(tmp_path / "link")
     os.symlink(str(real), link)
 
-    resolved = cli._resolve_paths([link])
+    resolved, _refused = cli._resolve_paths([link])
     assert resolved == [str(real)]
     res = walk(resolved[0], threads=1, depth=1)
     assert res.files == 1
@@ -574,7 +574,7 @@ def test_a_symlinked_root_matches_du_following_the_link(tmp_path):
     out = subprocess.check_output(
         ["du", "-s", "--block-size=1", link + "/"], universal_newlines=True
     )
-    walked = walk(cli._resolve_paths([link])[0], threads=1).size
+    walked = walk(cli._resolve_paths([link])[0][0], threads=1).size
     assert walked == int(out.split()[0])
 
 
@@ -582,7 +582,7 @@ def test_a_plain_file_is_still_rejected(tmp_path):
     """Resolving symlinks must not start accepting non-directories."""
     f = tmp_path / "a-file"
     f.write_text("hello")
-    assert cli._resolve_paths([str(f)]) == []
+    assert cli._resolve_paths([str(f)]) == ([], 1), "a refused path is counted, not just logged"
 
 
 # ---------------------------------------------------------------------------

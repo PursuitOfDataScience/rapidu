@@ -97,16 +97,48 @@ def test_rows_for_path_picks_longest_prefix(monkeypatch):
     assert snap.rows_for_path("/nowhere/at/all") == []
 
 
-def test_ambiguous_guessed_mounts_are_dropped():
-    """Midway2-home and Midway3-home must not both claim $HOME silently."""
+def test_ambiguous_guessed_mounts_are_dropped(monkeypatch):
+    """Two filesets guessing one mount, with nothing available to tell them apart.
+
+    RD-10: this used the fileset names ``Midway2-home`` and ``Otherclust-home``
+    and asserted that *neither* keeps the mount -- which is a claim about the
+    machine the test runs on, not about the code. ``_host_tokens`` splits the
+    local hostname and matches it against fileset names, so on a host called
+    ``midway2-login1`` the first row legitimately wins the tie and the assertion
+    fails; likewise on any host named ``otherclust-*``. The one test written
+    about cross-cluster mount ambiguity was the one test that was not itself
+    cluster-agnostic: green on the dev cluster, red on the cluster it describes.
+
+    So the premise is now *stated* rather than assumed. The names cannot collide
+    with a real hostname either, but that alone would only make the collision
+    unlikely -- pinning ``_host_tokens`` makes the outcome independent of the
+    machine by construction, which is the actual requirement.
+    """
+    monkeypatch.setattr(quotamod, "_host_tokens", lambda: [])
     rows = [
-        QuotaRow("Midway2-home", "blocks", "user", 1, None, None, "", "/home/x", True),
-        QuotaRow("Otherclust-home", "blocks", "user", 2, None, None, "", "/home/x", True),
+        QuotaRow("alpha-home", "blocks", "user", 1, None, None, "", "/home/x", True),
+        QuotaRow("beta-home", "blocks", "user", 2, None, None, "", "/home/x", True),
     ]
     _disambiguate_mounts(rows)
-    # Neither name matches this host, so neither may keep the mount.
     assert all(r.mount is None for r in rows)
     assert all(r.mount_note for r in rows)
+
+
+def test_a_matching_hostname_keeps_exactly_one_mount(monkeypatch):
+    """The other branch of the same decision, pinned the same way.
+
+    :func:`test_hostname_breaks_the_tie` covers this through the real
+    ``_host_tokens``, so the hostname *splitting* is exercised too; this isolates
+    the decision from it, so the branch is covered deterministically on any host.
+    """
+    monkeypatch.setattr(quotamod, "_host_tokens", lambda: ["alpha"])
+    rows = [
+        QuotaRow("alpha-home", "blocks", "user", 1, None, None, "", "/home/x", True),
+        QuotaRow("beta-home", "blocks", "user", 2, None, None, "", "/home/x", True),
+    ]
+    _disambiguate_mounts(rows)
+    kept = [r for r in rows if r.mount == "/home/x"]
+    assert len(kept) == 1 and kept[0].fileset == "alpha-home"
 
 
 def test_hostname_breaks_the_tie(monkeypatch):
@@ -129,10 +161,29 @@ def test_published_mounts_are_never_dropped(monkeypatch):
 
 def test_missing_command_is_reported_not_zero(monkeypatch):
     monkeypatch.setattr(quotamod, "_run", lambda cmd, timeout: (127, "", "command not found"))
+    monkeypatch.setattr(quotamod.shutil, "which", lambda cmd: None)
     snap = quotamod.read_quota_command()
     assert not snap.available
     assert "not on PATH" in snap.reason
     assert snap.rows == []
+
+
+def test_exit_127_from_a_broken_wrapper_is_not_reported_as_a_missing_command(monkeypatch):
+    """RD-2: `quota` on PATH, exiting 127 because its *inner* command is gone.
+
+    Measured on midway2: `/software/bin/quota` is a `/bin/sh` wrapper around
+    `/srv/adm/gpfsquota`, which does not exist there. The command is installed and
+    runs; rapidu said it was "not on PATH", contradicting `type -a quota`, and
+    threw away the one line that named the real cause.
+    """
+    broken = "/software/bin/quota: line 3: /srv/adm/gpfsquota: No such file or directory"
+    monkeypatch.setattr(quotamod, "_run", lambda cmd, timeout: (127, "", broken + "\n"))
+    monkeypatch.setattr(quotamod.shutil, "which", lambda cmd: "/software/bin/quota")
+    snap = quotamod.read_quota_command()
+    assert not snap.available
+    assert "not on PATH" not in snap.reason
+    assert "exited 127" in snap.reason
+    assert "/srv/adm/gpfsquota" in snap.reason, "the backend's own explanation is the finding"
 
 
 def test_timeout_is_reported(monkeypatch):

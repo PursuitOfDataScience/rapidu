@@ -40,7 +40,15 @@ UID_UNKNOWN = -1
 class DeletedFile:
     """One unlinked-but-open inode, with the processes holding it."""
 
-    def __init__(self, dev: int, ino: int, size: int, path: str, uid: int = UID_UNKNOWN) -> None:
+    def __init__(
+        self,
+        dev: int,
+        ino: int,
+        size: int,
+        path: str,
+        uid: int = UID_UNKNOWN,
+        gid: int = UID_UNKNOWN,
+    ) -> None:
         self.dev = dev
         self.ino = ino
         self.size = size  # allocated blocks, st_blocks*512
@@ -50,6 +58,11 @@ class DeletedFile:
         # user-scoped quota can only be reconciled against the subset this
         # matches. See `reconcile`.
         self.uid = uid
+        # And which *group* it is charged to, for the same reason: a group quota is
+        # charged by gid, so narrowing the walk by gid while adding every unlinked
+        # inode regardless would compare two different populations on the two
+        # halves of one sum. The stat that produced `uid` already carried this.
+        self.gid = gid
         self.holders = []  # type: List[Tuple[int, str]]  # (pid, command)
 
     def add_holder(self, pid: int, comm: str) -> None:
@@ -92,6 +105,14 @@ class DeletedScan:
         yours would make the floor lower than the evidence supports.
         """
         return [f for f in self.files if f.uid in (uid, UID_UNKNOWN)]
+
+    def owned_by_gid(self, gid: int) -> "List[DeletedFile]":
+        """The inodes charged to ``gid``, plus any whose group was never read.
+
+        The group counterpart of :meth:`owned_by`, and unknown is included for the
+        same reason: this figure is documented as a floor.
+        """
+        return [f for f in self.files if f.gid in (gid, UID_UNKNOWN)]
 
     @property
     def complete(self) -> bool:
@@ -291,7 +312,9 @@ def _sweep(
             key = (st.st_dev, st.st_ino)
             rec = by_inode.get(key)
             if rec is None:
-                rec = DeletedFile(st.st_dev, st.st_ino, st.st_blocks * 512, path, st.st_uid)
+                rec = DeletedFile(
+                    st.st_dev, st.st_ino, st.st_blocks * 512, path, st.st_uid, st.st_gid
+                )
                 by_inode[key] = rec
                 found.append(rec)
             if comm is None:

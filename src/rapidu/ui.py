@@ -312,6 +312,40 @@ def _supports_unicode(stream) -> bool:
     return True
 
 
+def encode_safe(text: str, stream=None) -> str:
+    """``text`` with anything ``stream`` cannot encode replaced by an escape.
+
+    :func:`_supports_unicode` handles *our own* decoration, and can: the glyph
+    set is fixed and known, so it is probed up front and swapped for ASCII. A
+    **filename cannot be probed** -- it is unbounded user data, and it is not
+    decoration, so no ``--ascii`` and no glyph table reaches it.
+
+    Where the stream's encoding is narrower than the filesystem's, printing one
+    raises ``UnicodeEncodeError`` and takes the whole report with it. Measured at
+    ``fs=utf-8, stdout=iso8859-1`` -- what ``PYTHONIOENCODING`` set for a
+    downstream consumer produces, or a UTF-8 filesystem under a latin-1 locale --
+    on a directory holding a single CJK filename: **rc=1, zero bytes emitted**.
+    The tree was measured correctly and none of it was reported.
+
+    So the text is round-tripped through the stream's own encoding with
+    ``backslashreplace``: lossless to read, and encodable by construction.
+    Python 3.7's ``sys.stdout.reconfigure(errors=...)`` does the same thing; this
+    package supports 3.6, so it is done per string instead.
+
+    A stream reporting no encoding (a ``StringIO`` under test) accepts anything
+    and is left alone, matching :func:`_supports_unicode`.
+    """
+    enc = getattr(stream if stream is not None else sys.stdout, "encoding", None)
+    if not enc:
+        return text
+    try:
+        return text.encode(enc, "backslashreplace").decode(enc, "replace")
+    except LookupError:
+        # An encoding name Python does not know. Nothing safe to do but pass it
+        # through and let the stream decide.
+        return text
+
+
 def resolve_style(mode: str = "auto", ascii_only: bool = False, stream=None) -> Style:
     """Decide colour and glyphs for this invocation.
 
@@ -452,20 +486,106 @@ _MIN_INNER = 20
 def visible_width(text: str) -> int:
     """Columns ``text`` occupies on a terminal.
 
-    Three things make this different from ``len``: SGR escapes are invisible,
-    combining marks attach to the previous cell rather than taking their own, and
-    East Asian wide characters take two. The last matters here because a path is
-    user data -- a directory named in Chinese or Japanese is perfectly ordinary,
-    and measuring it with ``len`` puts the right-hand border one column short per
-    character.
+    Four things make this different from ``len``: SGR escapes are invisible,
+    combining marks attach to the previous cell rather than taking their own,
+    East Asian wide characters take two, and a control character takes none. The
+    wide-character case matters because a path is user data -- a directory named
+    in Chinese or Japanese is perfectly ordinary, and measuring it with ``len``
+    puts the right-hand border one column short per character.
+
+    Control characters should never reach here (:func:`printable` replaces them
+    with a visible escape, on the way to every stream) but they are counted at
+    their true zero width anyway, so that a caller which forgets is off by
+    nothing rather than off by one per character.
     """
     plain = _ANSI_RE.sub("", text)
     width = 0
     for ch in plain:
         if unicodedata.combining(ch):
             continue
+        if ch != " " and not ch.isprintable():
+            continue
         width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
     return width
+
+
+def _escape_char(ch: str) -> str:
+    """One non-printable character, as the source escape that denotes it."""
+    code = ord(ch)
+    if code <= 0xFF:
+        return "\\x{:02x}".format(code)
+    if code <= 0xFFFF:
+        return "\\u{:04x}".format(code)
+    return "\\U{:08x}".format(code)
+
+
+def printable(text: str) -> str:
+    r"""``text`` with every non-printable character replaced by a visible escape.
+
+    **Filenames are not trusted input.** On HPC they are frequently written by
+    other people -- group-writable project and scratch directories are the norm
+    -- and this tool's whole job is to report what is using space, so a filename
+    that can rewrite the report is a filename that can misstate the finding.
+    Two things were measured happening, on a tree anyone could create:
+
+    * A **newline** in a name forged a table row. ``rdu`` printed
+      ``999.9 GiB ... TOTALLY-REAL-ENTRY`` as a row inside the frame, and
+      truncated the real name at the newline, so a fabricated entry appeared and
+      the actual one was mislabelled.
+    * An **escape sequence** in a name reached the terminal and ran:
+      ``clear\x1b[2Jgone.txt`` cleared the screen mid-report, and
+      ``ansi\x1b[31mRED\x1b[0m.txt`` painted itself. A bare ``\x01`` also broke
+      width accounting, being counted as a column and rendering as none.
+
+    So names are escaped the way ``ls`` escapes them by default: a control
+    character becomes ``\xNN``, which is four columns wide, visible, and
+    inert. Our *own* SGR sequences are passed through untouched, because they are
+    how this module paints anything at all -- which is why this cannot be a plain
+    ``isprintable`` filter over the finished line.
+
+    Applied to rendered output only. ``--json`` keeps emitting the true name:
+    a machine consumer needs the real bytes, and JSON escapes control characters
+    itself, so there is nothing there to forge.
+
+    This is the **strict** form, for a string that is known to be user data and
+    nothing else -- a filename, a path, a fileset label. It escapes every escape,
+    including a well-formed SGR sequence, because a well-formed SGR sequence in a
+    *filename* is precisely the attack: ``ansi\x1b[31mRED\x1b[0m.txt`` renders
+    itself red. Use it at the point the name enters the report, where the width
+    arithmetic is done. :func:`sanitize_line` is the weaker form for a line that
+    has already been painted.
+    """
+    if text.isprintable():
+        return text
+    return "".join(ch if (ch == " " or ch.isprintable()) else _escape_char(ch) for ch in text)
+
+
+def sanitize_line(text: str) -> str:
+    """A finished output line, with anything non-printable but our own colour escaped.
+
+    The backstop, applied once to everything on its way to a stream (see
+    ``cli._framed``). By this point the line legitimately contains the SGR
+    sequences :meth:`Style.paint` put there, so those are passed through and
+    everything else is escaped. That asymmetry is why it cannot replace
+    :func:`printable`: a renderer that forgets to escape a name lets a
+    well-formed SGR sequence *in the name* through here too. Layer one is the
+    defence; this is the floor under it, and it is what guarantees no control
+    character can reach the terminal from a renderer written later.
+    """
+    if text.isprintable():
+        return text
+    out = []  # type: List[str]
+    index = 0
+    while index < len(text):
+        match = _ANSI_RE.match(text, index)
+        if match:
+            out.append(match.group(0))
+            index = match.end()
+            continue
+        ch = text[index]
+        out.append(ch if (ch == " " or ch.isprintable()) else _escape_char(ch))
+        index += 1
+    return "".join(out)
 
 
 # The frame's gradient, as anchor colours it is interpolated between. Every one
@@ -622,9 +742,16 @@ def box(lines: List[str], style: Style, width: Optional[int] = None) -> List[str
 
     # Wrap first, then measure: the row count is what the vertical half of the
     # gradient is computed from, and wrapping changes it.
+    #
+    # Continuations are indented. Nothing is truncated -- see the docstring -- so a
+    # long path or a wide table row does get broken across lines, and the tail used
+    # to land at column zero, level with the report's own left margin. A ranked row
+    # ending `2  a b` above a bare `c/` read as two entries; a name pushed onto its
+    # own line read as a heading. The frame still closes either way; this only says
+    # which line the tail belongs to.
     rows = []  # type: List[str]
     for line in body:
-        rows.extend(_wrap_ansi(line, inner))
+        rows.extend(_wrap_ansi(line, inner, _CONT_INDENT))
 
     total_w = inner + BOX_CHROME
     total_h = len(rows) + 2
@@ -665,7 +792,10 @@ def box(lines: List[str], style: Style, width: Optional[int] = None) -> List[str
     return out
 
 
-def _wrap_ansi(text: str, width: int) -> List[str]:
+_CONT_INDENT = "    "
+
+
+def _wrap_ansi(text: str, width: int, subsequent_indent: str = "") -> List[str]:
     """Split ``text`` into runs of at most ``width`` visible columns.
 
     Colour makes this more than ``textwrap``. An SGR run has to be closed at the
@@ -681,9 +811,30 @@ def _wrap_ansi(text: str, width: int) -> List[str]:
     can neither read nor grep for, which is most of what a path is for. Slashes are
     where a path is *meant* to come apart, so they are tried first; a space is the
     fallback for prose; and a token with neither still has to fit, so it is cut.
+
+    Preferring a *run* of spaces over a lone one was tried, to keep a table's
+    column padding from losing to a space inside a filename. It does not work and
+    cannot: this function is handed a flat string with no idea where the columns
+    are, and a directory genuinely named ``a b  c`` puts a two-space run inside
+    the name. The guess broke exactly the case it was added for. What is left is
+    what a wrapper can honestly know -- a break is a continuation -- which is what
+    ``subsequent_indent`` is for.
+
+    ``subsequent_indent`` prefixes every piece after the first, and no
+    continuation begins with the padding it was cut out of. Without it a wrapped
+    table row put its tail at column zero, where ``2  a b`` above ``c/`` read as
+    two entries, the second of which does not exist.
     """
     if visible_width(text) <= width or width <= 0:
         return [text]
+    indent_w = visible_width(subsequent_indent)
+    if indent_w >= width:
+        # An indent as wide as the frame leaves no room for content, and an
+        # unindented wrap beats a frame that cannot fit a character.
+        subsequent_indent, indent_w = "", 0
+    # Continuations carry the indent, so every piece is measured against the
+    # narrower budget. Lines that fit took the early return above and pay nothing.
+    budget = width - indent_w
 
     pieces = []  # type: List[str]
     buffered = []  # type: List[str]
@@ -708,7 +859,7 @@ def _wrap_ansi(text: str, width: int) -> List[str]:
             char_w = 0
         else:
             char_w = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-        if visible_width("".join(buffered)) + char_w > width and buffered:
+        if visible_width("".join(buffered)) + char_w > budget and buffered:
             if cut > 0:
                 emit(cut)
                 carry = buffered[cut + drop :]
@@ -727,7 +878,32 @@ def _wrap_ansi(text: str, width: int) -> List[str]:
         index += 1
     if buffered:
         emit(len(buffered))
-    return [piece for piece in pieces if _ANSI_RE.sub("", piece).strip()] or [""]
+    kept = [piece for piece in pieces if _ANSI_RE.sub("", piece).strip()] or [""]
+    if not subsequent_indent:
+        return kept
+    return [kept[0]] + [subsequent_indent + _lstrip_visible(p) for p in kept[1:]]
+
+
+def _lstrip_visible(piece: str) -> str:
+    """Drop leading spaces while keeping any SGR prefix that opens the piece.
+
+    A break taken at column padding can leave the next piece starting with the
+    rest of that padding -- which, once indented, reads as a second level of
+    indentation that means nothing.
+    """
+    out = []  # type: List[str]
+    index = 0
+    while index < len(piece):
+        match = _ANSI_RE.match(piece, index)
+        if match:
+            out.append(match.group(0))
+            index = match.end()
+            continue
+        if piece[index] == " ":
+            index += 1
+            continue
+        break
+    return "".join(out) + piece[index:]
 
 
 def truncate(text: str, width: int) -> str:
@@ -944,7 +1120,10 @@ class Spinner:
     def paint(self, text: str) -> None:
         if not self.enabled:
             return
-        line = "{} {}".format(self.frame(), text)
+        # The progress line carries the directory currently being walked, which is
+        # a name from the filesystem: an escape sequence in it would run on the
+        # terminal exactly as it would in the report. See `printable`.
+        line = "{} {}".format(self.frame(), printable(text))
         # Truncate rather than wrap: a wrapped progress line cannot be erased
         # with a single carriage return and leaves debris behind.
         line = line[: max(0, self.style.width - 1)]
@@ -969,6 +1148,8 @@ def progress_text(path: str, inodes: int, dirs: int, rate: float, elapsed: float
     time are both real, and together they answer the question the user actually
     has, which is "is this moving, and roughly how fast".
     """
-    return "scanning {}  {:,} files  {:,} dirs  {:,.0f}/s  {:.0f}s".format(
+    # `inodes`, not `files`: the figure includes directories, so printing it as
+    # "N files  M dirs" showed a count that already contained the second column.
+    return "scanning {}  {:,} inodes  {:,} dirs  {:,.0f}/s  {:.0f}s".format(
         path, inodes, dirs, rate, elapsed
     )

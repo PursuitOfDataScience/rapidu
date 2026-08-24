@@ -239,8 +239,11 @@ def test_ascii_bar_has_no_partials():
 def test_separators_degrade_to_ascii():
     u = ui.resolve_style("never", stream=FakeTTY(encoding="utf-8"))
     a = ui.resolve_style("never", ascii_only=True, stream=FakeTTY())
-    assert ui.sep(u) != ui.sep(a) and ui.sep(a).isascii()
-    assert ui.dash(a).isascii()
+    # `str.isascii` is 3.7+, and this suite has to run on the 3.6 floor the
+    # package advertises.
+    assert ui.sep(u) != ui.sep(a)
+    assert all(ord(ch) < 128 for ch in ui.sep(a))
+    assert all(ord(ch) < 128 for ch in ui.dash(a))
 
 
 # --- --help ----------------------------------------------------------------

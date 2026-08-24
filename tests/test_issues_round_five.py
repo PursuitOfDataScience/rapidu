@@ -21,6 +21,7 @@ Written against rendered output and the returned object, for the reason
 
 import json
 import os
+import re
 
 import pytest
 
@@ -144,7 +145,7 @@ def test_count_mode_reclaimable_counts_the_inodes_it_walked(caches):
     assert "0 files" not in text
     assert "0.0% of the tree" not in text
     # Two caches, each one file plus its own directory.
-    assert "4 files reclaimable in total" in text
+    assert "4 inodes reclaimable in total" in text
     # The bytes are genuinely absent, and still say so.
     assert "n/a" in text and "0 B" not in text
 
@@ -171,7 +172,7 @@ def test_the_walk_still_finds_caches_below_the_reported_depth_in_count_mode(tmp_
     res = walk(root, threads=2, depth=1, count_only=True)
     text = "\n".join(report.render_reclaimable(res, PLAIN))
     assert "huggingface" in text
-    assert "2 files" in text  # the blob and the directory holding it
+    assert "2 inodes" in text  # the blob and the directory holding it
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +250,10 @@ def test_the_other_metric_breaks_the_tie_before_the_path_does():
     assert [os.path.basename(e.path) for e in res.top_dirs(10**9, "size")] == ["z_many", "a_few"]
 
 
+# Any elapsed time (`0.27s`, `1m 4s`) or throughput (`35,151 inodes/s`).
+_TIMELESS = re.compile(r"\d[\d,]*\.?\d*\s*(?:s\b|(?:inodes|entries|files)/s)")
+
+
 def test_the_whole_report_reproduces_for_an_unchanged_tree(tmp_path, capsys):
     """`--no-box` is documented for "piping into grep, awk or a diff". A report
     that will not diff against itself cannot serve that."""
@@ -267,8 +272,12 @@ def test_the_whole_report_reproduces_for_an_unchanged_tree(tmp_path, capsys):
     for _ in range(4):
         cli.main([root, "--no-box", "--no-quota", "--no-deleted", "--color", "never"])
         out = capsys.readouterr().out
-        # Drop the elapsed time, which legitimately differs run to run.
-        seen.add("\n".join(ln for ln in out.splitlines() if "0.0" not in ln))
+        # Drop the elapsed time and throughput, which legitimately differ run to
+        # run. Matching the *shape* of a timing, not the substring "0.0": that
+        # only caught a sub-0.1s walk, so on a loaded machine -- or a cold GPFS
+        # directory, where seven inodes took 0.27s here -- the timings survived
+        # the filter and two identical reports compared unequal.
+        seen.add(_TIMELESS.sub("", out))
     assert len(seen) == 1, seen
 
 
@@ -333,19 +342,26 @@ def test_plural_agrees_with_its_count():
 
 
 def test_the_facts_line_says_one_file(tmp_path, capsys):
-    """An empty directory is the shortest reproduction: `4.0 KiB · 1 files · 0.00s`."""
+    """An empty directory is the shortest reproduction: `4.0 KiB · 1 inodes · 0.00s`.
+
+    The noun is `inode` since RD-9 (the figure counts directories, and an empty
+    directory is exactly one of them); the agreement rule this pins is unchanged.
+    """
     root = str(tmp_path / "e")
     os.makedirs(root)
     cli.main([root, "--no-box", "--no-quota", "--no-deleted", "--color", "never"])
     out = capsys.readouterr().out
-    assert "1 file " in out and "1 files" not in out
+    assert "1 inode " in out and "1 inodes" not in out
 
 
 def test_the_count_only_headline_says_one_file(tmp_path, capsys):
+    """`-c` counts names, not inodes, so its noun is `entry` -- see RD-9."""
     root = str(tmp_path / "e")
     os.makedirs(root)
     cli.main([root, "-c", "--no-box", "--no-quota", "--no-deleted", "--color", "never"])
-    assert "1 files" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "1 entry" in out
+    assert "1 entries" not in out and "1 inode" not in out
 
 
 def test_the_interrupted_headline_says_one_file(tmp_path, capsys, monkeypatch):
@@ -363,7 +379,7 @@ def test_the_interrupted_headline_says_one_file(tmp_path, capsys, monkeypatch):
     cli.main([root, "--no-progress", "--no-box", "--color", "never"])
     out = capsys.readouterr().out
     assert "PARTIAL" in out
-    assert "1 file scanned before the interrupt" in out
+    assert "1 inode scanned before the interrupt" in out
 
 
 def test_nothing_finished_names_no_table(tmp_path, capsys, monkeypatch):

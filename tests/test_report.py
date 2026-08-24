@@ -51,9 +51,10 @@ def test_a_few_recent_files_get_one_line_not_a_section():
     run where it matters.
     """
     out = report.render_settle(make_walk(recent=23), make_settle(), PLAIN)
-    assert len(out) == 1
-    assert "provisional" in out[0]
-    assert "SETTLING" not in out[0]
+    # One *statement*, which now wraps to the width rather than running past it.
+    assert "provisional" in " ".join(out)
+    assert "SETTLING" not in " ".join(out)
+    assert len(out) <= 2
 
 
 def test_measured_drift_gets_the_full_section():
@@ -61,7 +62,9 @@ def test_measured_drift_gets_the_full_section():
         report.render_settle(make_walk(recent=6000), make_settle(drift=80 << 20, gap=75.0), PLAIN)
     )
     assert "SETTLING" in out
-    assert "6,000 files were written" in out
+    # A noun phrase, not a verb: the same line has to be able to say "and N
+    # inodes changed without being written", which no single verb covers.
+    assert "6,000 files written" in out
     assert "re-stat 75s later found 80.0 MiB MORE allocated" in out
     assert "still moving" in out
 

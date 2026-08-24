@@ -13,6 +13,7 @@ down every import of the package. These tests fail when it happens again.
 import ast
 import os
 import pathlib
+import sys
 
 import pytest
 
@@ -31,10 +32,24 @@ def test_there_are_sources_to_check():
 
 @pytest.mark.parametrize("path", _sources(), ids=lambda p: p.name)
 def test_parses_under_python36(path):
-    """Every shipped module must parse with 3.6 syntax rules."""
+    """Every shipped module must parse with 3.6 syntax rules.
+
+    ``feature_version`` is a **3.8+** parameter, so on 3.6 itself this check used
+    to raise ``TypeError`` for every module -- the guard for the floor interpreter
+    could not run on the floor interpreter, which is the same shape as RD-10 (a
+    test asserting something about an environment it cannot execute in).
+
+    Where it is unavailable the interpreter's own parser is the better check
+    anyway: if the file parses here, it parses on this Python, and on 3.6 that is
+    exactly the question. So the proxy is used on newer interpreters and the real
+    thing on old ones.
+    """
     source = path.read_text()
+    kwargs = {}
+    if sys.version_info >= (3, 8):
+        kwargs["feature_version"] = MIN_FEATURE_VERSION
     try:
-        ast.parse(source, filename=str(path), feature_version=MIN_FEATURE_VERSION)
+        ast.parse(source, filename=str(path), **kwargs)
     except SyntaxError as exc:
         pytest.fail(
             "{} is not valid Python {}.{} syntax: {} (line {})".format(

@@ -345,7 +345,11 @@ def test_the_interrupt_caveat_states_no_denominator_it_cannot_defend(hung):
     res, _took = _stopped_walk(hung)
     lines = report._hard_warnings(res, SettleCheck(), PLAIN)
     text = _flat(lines)
-    assert "top-level entries were walked to completion" in text
+    # How many entries finish before the stop lands is a scheduling outcome, so
+    # the assertion is on the sentence, not on its plural: pinning "entries were"
+    # made this test fail whenever exactly one subtree happened to finish, which
+    # is a property of the machine's load and not of the code under test.
+    assert re.search(r"top-level (entry was|entries were) walked to completion", text), text
     assert re.search(r"\d+ of \d+ top-level", text) is None, text
     assert "still blocked" in text
     # Wrapped, so it cannot tear a frame or run off an 80-column terminal.
@@ -480,7 +484,7 @@ def test_reclaimable_total_counts_every_kind_not_the_six_it_prints(tmp_path):
             matched[path] = size
     nested = {p for p in matched for o in matched if o != p and p.startswith(o + os.sep)}
     expected = sum(s for p, s in matched.items() if p not in nested)
-    assert len([ln for ln in lines if "files  " in ln]) == 6, "still prints six rows"
+    assert len([ln for ln in lines if "inodes  " in ln]) == 6, "still prints six rows"
     assert "more kinds" in "\n".join(lines)
     assert printed is not None
     assert abs(printed - expected) <= expected * 0.02, (printed, expected)
@@ -568,7 +572,7 @@ def test_a_density_ranking_shows_the_value_it_ranked_by(dense, capsys):
     """
     assert cli.main([dense, "--sort", "density", "--color", "never", "--no-box"]) == cli.EXIT_OK
     lines = capsys.readouterr().out.splitlines()
-    header = [ln for ln in lines if "entry" in ln and "files" in ln][0]
+    header = [ln for ln in lines if "entry" in ln and "inodes" in ln][0]
     assert "files/GiB" in header
     values = [
         int(ln.split()[-2].replace(",", ""))

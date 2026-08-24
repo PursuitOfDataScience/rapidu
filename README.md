@@ -28,7 +28,7 @@ rdu                      # this directory: how big, and what is big inside it
 rdu /project/mylab       # any other path
 rdu ~/scratch -n 20      # list 20 entries instead of 10
 
-rdu -i                   # rank by file count -- what an inode quota limits
+rdu -i                   # rank by inode count -- what an inode quota limits
 rdu -c                   # count files only, no stat: ~8x again on GPFS
 rdu -Q                   # the quota table, and the age of its figures
 rdu -D                   # space held by files deleted while still open
@@ -51,25 +51,26 @@ Same total as `du`, to the byte. That is checked on every commit.
 ```
 ╭───────────────────────────────────────────────────────────────────────────────────╮
 │ /project/lab/shared                                                               │
-│ 1.4 TiB  ·  5,435 files  ·  4.12s                                                 │
+│ 1.4 TiB  ·  5,434 inodes  ·  4.12s                                                │
 │                                                                                   │
-│   ──────────────────────────────────────────────────────                          │
-│         size  share                           files  entry                        │
-│    661.5 GiB  █████▏░░░░░░░░░░░░   31.9%        350  checkpoints/                 │
-│    343.8 GiB  ██▊░░░░░░░░░░░░░░░   16.6%        968  datasets/                    │
-│    470.9 GiB  ▒▒▒▒▒▒▒▒░░░░░░░░░░   22.9%      4,117  (84 more — use -n 0 for all) │
+│   ─────────────────────────────────────────────────────────────────────────────── │
+│         size  share                          inodes  entry                        │
+│    661.5 GiB  ████████░░░░░░░░░░   44.8%        350  checkpoints/                 │
+│    343.8 GiB  ████▏░░░░░░░░░░░░░   23.3%        968  datasets/                    │
+│    470.9 GiB  ▒▒▒▒▒▒░░░░░░░░░░░░   31.9%      4,116  (84 more — use -n 0 for all) │
 ╰───────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 The frame carries no title and it always closes: a line too wide for it wraps
-inside, at a path separator, rather than running past the border. Its colour is a
+inside, at a path separator, rather than running past the border, and the
+continuation is indented so it reads as one. Its colour is a
 gradient sweeping from the top-left corner, and it degrades — 24-bit if your
 terminal advertises `COLORTERM=truecolor`, a 12-step ramp at 256 colours, and
 two bright cyan-to-blue tones at 8. `--ascii` turns it into `+--+`; `--no-box` removes it,
 which is what you want when piping into `grep` or a diff.
 
 The path leads, because it is what the report is about; the size is the first of
-the four numbers describing it. `share` labels the bar and the percentage beside
+the three numbers describing it. `share` labels the bar and the percentage beside
 it, which are one measurement in two forms -- the picture and the number. The last
 column is `entry`, not `path`, because it holds plain files as well as directories
 and what is printed is a name relative to the root.
@@ -77,6 +78,10 @@ and what is printed is a name relative to the root.
 The hatched last row is everything not listed, and it names how many that is --
 so a truncated table always says it is truncated. The bar is share of the whole
 walk, so it always agrees with the number beside it.
-The column you sorted by is the one in colour — under `-i`, `files` takes the tone
+The count column is headed `inodes`, not `files`: it counts directories too,
+which is what an inode quota charges for. `files` in this tool means regular
+files and symlinks — the population `BY AGE` buckets — and one word naming two
+quantities is the confusion this heading used to cause.
+The column you sorted by is the one in colour — under `-i`, `inodes` takes the tone
 and `size` steps back. Sizes are cumulative, so any row agrees with `du -s` on
 that path.

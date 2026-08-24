@@ -49,7 +49,7 @@ def test_a_directory_named_like_an_old_subcommand_is_measured(tmp_path, capsys):
             os.chdir(cwd)
         out = capsys.readouterr().out
         assert name in out, name
-        assert "files" in out, name
+        assert "inodes" in out, name
         assert "UNLINKED" not in out, "%s was taken as a subcommand" % name
 
 
@@ -102,12 +102,22 @@ def test_default_answers_how_big_and_nothing_else(small_tree, capsys):
     # Byte totals are not asserted: on GPFS a just-written fixture reports
     # delayed-allocation blocks, which is the effect this package reports
     # elsewhere and has no business making a CLI test flaky.
-    # "files", not "inodes": the quota the reader is up against uses that word.
-    assert "files" in out
+    # `inodes`, since RD-9: `files` in this package means *regular files*, so
+    # using it for a count that includes directories made one word name two
+    # quantities. See `_entries_header`.
+    assert "inodes" in out
     for section in ("QUOTA", "WALK", "RECONCILE", "UNLINKED"):
         assert section not in out, section
     # Headline, blank, column header, then one line per child.
-    assert len(out.strip().splitlines()) <= 8
+    #
+    # The provisional-headline warning is excluded from the budget rather than
+    # paid for out of it. This fixture is three files written a moment ago, so on
+    # a delayed-allocation filesystem the caveat is *correct* -- the same effect
+    # the comment above declines to assert byte totals for -- and letting it eat
+    # the compactness allowance would quietly loosen the claim under test.
+    body = [ln for ln in out.strip().splitlines() if "provisional" not in ln]
+    body = [ln for ln in body if "not yet allocated" not in ln]
+    assert len(body) <= 8, body
 
 
 def test_full_flag_restores_the_whole_report(small_tree, capsys):
@@ -283,7 +293,10 @@ def test_n_zero_shows_everything_and_no_phantom_remainder(small_tree, capsys):
     """
     cli.main([small_tree, "-n", "0", "--no-box"])
     out = capsys.readouterr().out
-    assert "more" not in out
+    # The remainder row's shape, not the bare word "more": every one of them is
+    # built as "... and N more", and matching the word alone made this fail on
+    # unrelated prose that happens to compare two quantities.
+    assert "... and " not in out, out
 
 
 def test_truncated_listing_says_how_to_expand(tmp_path, capsys):

@@ -171,12 +171,21 @@ def test_unmapped_path_is_not_compared():
 
 
 def test_absent_quota_backend_degrades():
+    """No backend degrades to a note, and the note does not restate the reason.
+
+    RD-4: the reason is a *backend* fact, printed once by the QUOTA panel and
+    carried in the JSON document. This note is emitted once per kind, so a
+    multi-line GPFS failure interpolated here appeared three times in one report
+    and was longer than the report.
+    """
     snap = QuotaSnapshot("none")
     snap.available = False
-    snap.reason = "`quota` is not on PATH"
+    snap.reason = "mmlsquota: No quota enabled file system found. Error code 22."
     r = rc.reconcile(make_walk(), fresh_settle(), snap, empty_scan(), "blocks")
     assert r.verdict == rc.NOT_COMPARED
-    assert "not on PATH" in r.notes[0]
+    assert "no quota backend available" in r.notes[0]
+    assert "QUOTA" in r.notes[0], "it has to say where the reason is"
+    assert "Error code 22" not in r.notes[0]
 
 
 def test_crossing_filesystems_blocks_a_finding():
