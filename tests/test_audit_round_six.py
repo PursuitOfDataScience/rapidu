@@ -5572,20 +5572,72 @@ def _tree_census(root):
     )
 
 
+def _dir_size_total(root):
+    """Sum of every directory's own ``st_size``, counted the way the walk counts it.
+
+    By name from the parent, so a subdirectory nobody may enter is still measured
+    -- `os.walk` cannot descend into it and would leave it out, and that entry is
+    exactly what the partly-unreadable tree turns on.
+    """
+    is_dir = 0o040000
+
+    def kind(path):
+        return os.lstat(path).st_mode & 0o170000
+
+    try:
+        total = os.lstat(root).st_size
+    except OSError:
+        return 0
+    stack = [root]
+    while stack:
+        where = stack.pop()
+        try:
+            names = os.listdir(where)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(where, name)
+            try:
+                if kind(path) != is_dir:
+                    continue
+                total += os.lstat(path).st_size
+            except OSError:
+                continue
+            stack.append(path)
+    return total
+
+
+# `du --apparent-size` does not agree with itself across builds about whether a
+# directory's own `st_size` counts. It does on this xfs (56 bytes a directory) and
+# on tmpfs (100); on the ext4 of a CI runner (4096) it reports none of it, so the
+# walk read 15,745,024 against du's 15,740,928 -- a gap of exactly one directory --
+# and 112,288 against 100,000, exactly three. The *allocated* comparison agrees
+# everywhere, and that is the figure the "same total as du, to the byte" claim is
+# about, because allocated blocks are what a quota charges.
+#
+# So allocated stays byte-exact and apparent admits the one term du varies on. A
+# missing or double-counted *file* still fails this: the gap has to be zero or the
+# directory total, and nothing else.
+def _assert_agrees_with_du(res, root):
+    allocated = _du(root, apparent=False)
+    assert res.size == allocated, "allocated: walk=%d du=%d | %s" % (
+        res.size,
+        allocated,
+        _tree_census(root),
+    )
+    apparent = _du(root, apparent=True)
+    dirs = _dir_size_total(root)
+    assert res.apparent - apparent in (0, dirs), (
+        "apparent: walk=%d du=%d gap=%d dir_total=%d | %s"
+        % (res.apparent, apparent, res.apparent - apparent, dirs, _tree_census(root))
+    )
+
+
 def test_du_agrees_to_the_byte_on_a_sparse_tree(tmp_path):
     """Asserting the agreement, not the byte counts, which are per-filesystem."""
     root = _sparse_tree(tmp_path)
     res = walk(root, threads=2, depth=1)
-    assert res.apparent == _du(root, apparent=True), "apparent: walk=%d du=%d | %s" % (
-        res.apparent,
-        _du(root, True),
-        _tree_census(root),
-    )
-    assert res.size == _du(root, apparent=False), "allocated: walk=%d du=%d | %s" % (
-        res.size,
-        _du(root, False),
-        _tree_census(root),
-    )
+    _assert_agrees_with_du(res, root)
 
 
 @needs_enforced_mode
@@ -5600,16 +5652,7 @@ def test_du_agrees_to_the_byte_on_a_partly_unreadable_tree(tmp_path):
     try:
         root = str(tmp_path)
         res = walk(root, threads=2, depth=1)
-        assert res.apparent == _du(root, apparent=True), "apparent: walk=%d du=%d | %s" % (
-            res.apparent,
-            _du(root, True),
-            _tree_census(root),
-        )
-        assert res.size == _du(root, apparent=False), "allocated: walk=%d du=%d | %s" % (
-            res.size,
-            _du(root, False),
-            _tree_census(root),
-        )
+        _assert_agrees_with_du(res, root)
         assert not res.complete
         assert "FLOOR" in _flat(report.render_compact(res, SettleCheck(), 10, False, PLAIN))
     finally:
