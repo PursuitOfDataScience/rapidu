@@ -338,17 +338,29 @@ def test_the_age_denominator_matches_the_population_it_buckets(tmp_path):
     assert bucketed == res.files - res.hardlink_extra_refs
     text = _flat(report.render_age(res, PLAIN))
     if "has not been modified" in text:
-        # The sentence carries a *byte* share, and `(20.0%)` was hard-coded here as
-        # though it were "1 of 5 bucketed entries". Those agree only where all five
-        # entries allocate the same: on this GPFS they do, so the literal passed;
-        # on xfs and tmpfs a short symlink is stored in its inode and allocates
-        # nothing, leaving one cold file in four paying entries -- 25.0%, and a
-        # failure on any cluster but the one this was written on. Computed from the
-        # walk instead, which holds on all three.
-        cold_bytes = res.by_age[-1][0]
-        total_bytes = sum(b for b, _f in res.by_age)
-        share = "({:.1f}%)".format(100.0 * cold_bytes / total_bytes)
-        assert share in text, (share, text)
+        # The sentence carries whichever share is the larger, and the two have
+        # different denominators: bytes over `res.size`, which counts directories,
+        # and files over the bucketed population, which does not. Recomputing a
+        # third denominator -- cold bytes over the sum of `by_age` -- matched
+        # neither, and matched the *printed* string only where directories are
+        # cheap enough to round away. They are 56 bytes on this xfs and 100 on
+        # tmpfs; on ext4 they are 4096 each, which pushes `byte_share` below
+        # `file_share`, makes the renderer print the file measure, and fails a
+        # test looking for a byte one. Reproduced on a CI runner, green here.
+        #
+        # So this asserts what the renderer is actually allowed to say, and --
+        # which is the defect this test was filed for -- that the file share is
+        # not diluted by the directory count.
+        cold_bytes, cold_files = res.by_age[-1]
+        bucketed = res.files - res.hardlink_extra_refs
+        allowed = {
+            "({:.1f}%)".format(100.0 * cold_bytes / res.size) if res.size else None,
+            "({:.1f}%)".format(100.0 * cold_files / bucketed) if bucketed else None,
+        }
+        assert allowed & set(re.findall(r"\(\d+\.\d%\)", text)), (allowed, text)
+        if bucketed and res.inodes != bucketed:
+            diluted = "({:.1f}%)".format(100.0 * cold_files / res.inodes)
+            assert diluted not in text or diluted in allowed, (diluted, text)
 
 
 def test_the_document_still_round_trips(tmp_path):
@@ -5518,12 +5530,62 @@ def _du(root, apparent):
     return int(out.split()[0])
 
 
+def _tree_census(root):
+    """Every st_size in the tree, split by kind, plus the filesystem's name.
+
+    A bare `assert walk == du` that fails tells you two numbers and nothing about
+    which entries they disagree over. Both figures are sums of `st_size` across
+    the same tree, so the disagreement is always a specific set of entries -- and
+    on a filesystem the author did not have, the *directories* are the usual
+    suspect: their `st_size` is 4096 on ext4, 56 on this xfs and 100 on tmpfs, so
+    a test that agrees on one can differ by a whole directory on another.
+    """
+    import subprocess
+
+    dirs, files = {}, {}
+    for where, subdirs, names in os.walk(root):
+        try:
+            dirs[where] = os.lstat(where).st_size
+        except OSError as exc:
+            dirs[where] = "ERR:%s" % exc.errno
+        for name in names:
+            path = os.path.join(where, name)
+            try:
+                files[path] = os.lstat(path).st_size
+            except OSError as exc:
+                files[path] = "ERR:%s" % exc.errno
+        del subdirs
+    try:
+        fstype = subprocess.check_output(["stat", "-f", "-c", "%T", root]).decode().strip()
+    except Exception:  # noqa: BLE001  (a census is diagnostics, not a measurement)
+        fstype = "?"
+    numeric = [v for v in files.values() if isinstance(v, int)]
+    dirsizes = [v for v in dirs.values() if isinstance(v, int)]
+    return "fstype=%s files=%d(sum %d) dirs=%d(sum %d) dir_sizes=%r file_sizes=%r" % (
+        fstype,
+        len(files),
+        sum(numeric),
+        len(dirs),
+        sum(dirsizes),
+        sorted(dirs.items()),
+        sorted(files.items()),
+    )
+
+
 def test_du_agrees_to_the_byte_on_a_sparse_tree(tmp_path):
     """Asserting the agreement, not the byte counts, which are per-filesystem."""
     root = _sparse_tree(tmp_path)
     res = walk(root, threads=2, depth=1)
-    assert res.apparent == _du(root, apparent=True), (res.apparent, _du(root, True))
-    assert res.size == _du(root, apparent=False), (res.size, _du(root, False))
+    assert res.apparent == _du(root, apparent=True), "apparent: walk=%d du=%d | %s" % (
+        res.apparent,
+        _du(root, True),
+        _tree_census(root),
+    )
+    assert res.size == _du(root, apparent=False), "allocated: walk=%d du=%d | %s" % (
+        res.size,
+        _du(root, False),
+        _tree_census(root),
+    )
 
 
 @needs_enforced_mode
@@ -5538,8 +5600,16 @@ def test_du_agrees_to_the_byte_on_a_partly_unreadable_tree(tmp_path):
     try:
         root = str(tmp_path)
         res = walk(root, threads=2, depth=1)
-        assert res.apparent == _du(root, apparent=True), res.apparent
-        assert res.size == _du(root, apparent=False), res.size
+        assert res.apparent == _du(root, apparent=True), "apparent: walk=%d du=%d | %s" % (
+            res.apparent,
+            _du(root, True),
+            _tree_census(root),
+        )
+        assert res.size == _du(root, apparent=False), "allocated: walk=%d du=%d | %s" % (
+            res.size,
+            _du(root, False),
+            _tree_census(root),
+        )
         assert not res.complete
         assert "FLOOR" in _flat(report.render_compact(res, SettleCheck(), 10, False, PLAIN))
     finally:
