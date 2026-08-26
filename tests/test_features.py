@@ -317,13 +317,15 @@ def test_json_carries_what_a_human_reader_is_shown(tree, capsys):
     cli.main([tree, "--json", "--no-quota", "--no-deleted", "--no-settle-check"])
     doc = json.loads(capsys.readouterr().out)
     # This is the one place that pins the current number, so a bump is never
-    # silent. 4: under `-c` every stat-derived figure is `null` rather than 0 (or
+    # silent. 5: `rows[].soft`/`hard` carry the backend's literal 0 rather than
+    # `null`, so a Lustre "no limit" row is distinguishable from an unreadable one.
+    # 4: under `-c` every stat-derived figure is `null` rather than 0 (or
     # `true`, for `settled`) -- Constraint 10, which the terminal already obeyed.
     # 3 was `walk.recent_bytes` becoming `settling.recent_allocated_bytes`: it
     # held *allocated* blocks under a bare `bytes`. 2 was `by_age[].inodes`
     # becoming `by_age[].files`: always a file count, so summing it against
     # `inodes` came up short by every directory.
-    assert doc["schema"] == 4
+    assert doc["schema"] == 5
     walk_doc = doc["walk"]
     for key in ("by_gid", "by_age", "unreadable_dir_paths"):
         assert key in walk_doc, key

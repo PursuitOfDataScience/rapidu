@@ -1118,7 +1118,11 @@ def test_a_future_mtime_is_named_as_a_clock_difference(tmp_path):
     assert res.future_files == 3
     assert res.recent_files == 3, "they are inside the window, which is the problem"
 
-    text = "\n".join(report.render_settle(res, walkmod.recheck_settling(res, 0.0), _plain()))
+    # Collapsed, for the reason `_flat` exists: the note wraps, and "ahead of
+    # this node's clock" is only a substring of the unwrapped sentence.
+    text = " ".join(
+        " ".join(report.render_settle(res, walkmod.recheck_settling(res, 0.0), _plain())).split()
+    )
     assert "ahead of this node's clock" in text
 
     doc = report.to_json(res, walkmod.recheck_settling(res, 0.0), None, None, None)["settling"]
@@ -1222,8 +1226,18 @@ def test_an_unprintable_path_gets_no_command_at_all():
     assert report._shell_command("rm -rf {path}", "/data/ctrl\x01dir") == ""
 
 
-def test_a_tool_that_locates_its_own_store_is_left_alone(tmp_path):
-    """`pip cache purge` needs no path, and must not acquire one."""
+def test_a_tool_that_locates_its_own_store_is_left_alone(tmp_path, monkeypatch):
+    """`pip cache purge` needs no path, and must not acquire one.
+
+    ``which`` is pinned because the claim is about the *template*, not about this
+    host: `reclaim_command` prints a tool only where the tool runs, so on a login
+    node whose system python ships no `pip` binary the correct output is the
+    `rm -rf` fallback and this test failed for being right. Measured on a RHEL8
+    cluster whose `/usr/bin/python3` has no `pip` module at all -- and the suite
+    was green on two other clusters that happen to have one, which is the whole
+    problem with asserting a machine.
+    """
+    monkeypatch.setattr(report.shutil, "which", lambda tool: "/usr/bin/" + tool)
     res = _reclaim_tree(tmp_path, "data/cache/pip")
     text = "\n".join(report.render_reclaimable(res, _plain()))
     assert "pip cache purge" in text
@@ -1294,7 +1308,10 @@ def test_padding_the_other_way_is_untouched(tmp_path):
     res.apparent = 1 << 30
     res.size = 8 << 30
     res.files, res.dirs = 5000, 100
-    text = " ".join(report.render_allocation(res, _plain()))
+    # `" ".join(lines)` is not enough: the continuation of a wrapped warning
+    # carries its own two-space hanging indent, so joining with a space put three
+    # spaces mid-sentence and the substring stopped matching.
+    text = " ".join(" ".join(report.render_allocation(res, _plain())).split())
     assert "8.0x" in text
     assert "Your quota is charged the first number." in text
 
@@ -2429,12 +2446,26 @@ def test_the_real_syscall_path_end_to_end(tmp_path):
     # An absolute PYTHONPATH: the child `cd`s into a directory that is then
     # removed, so a relative entry (`PYTHONPATH=src`, which is how this suite runs
     # against the 3.6 floor) no longer resolves from there.
+    #
+    # **Every** entry, not just the one added here. Prepending an absolute path
+    # and keeping the inherited value verbatim left the relative entry in place,
+    # and from 3.11 the path computation moved into `getpath.py`, which resolves
+    # `sys.path` entries during interpreter startup: a relative one with no cwd
+    # aborts the interpreter before `main` runs, so the child died with
+    # "Exception ignored in running getpath: error evaluating path" and never
+    # reached the message under test. Measured on a RHEL 9 login node's 3.11.13
+    # and 3.13.15 with `PYTHONPATH=src`; the same tree passes there once the
+    # inherited entry is absolute, and 3.9 and 3.12 tolerated it either way,
+    # which is why the suite was green on the two hosts that happened to run
+    # those. The test asserts how this tool reports a missing cwd, so it must not
+    # be decided by how the suite was invoked.
     import rapidu
 
     env = dict(os.environ)
+    inherited = [p for p in (env.get("PYTHONPATH") or "").split(os.pathsep) if p]
     env["PYTHONPATH"] = os.pathsep.join(
         [os.path.dirname(os.path.dirname(os.path.abspath(rapidu.__file__)))]
-        + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        + [os.path.abspath(p) for p in inherited]
     )
     proc = subprocess.run(
         [

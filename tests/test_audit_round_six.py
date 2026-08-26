@@ -31,10 +31,13 @@ import os
 import re
 import sys
 
+import pytest
+from conftest import CHMOD_CAN_DENY, NEEDS_ENFORCED_MODE
+
 from rapidu import report, ui
 from rapidu.fmt import noun, plural, ratio_x
 from rapidu.report import SettleCheck
-from rapidu.walk import WalkResult, walk
+from rapidu.walk import MIN_CONCLUSIVE_GAP_S, WalkResult, walk
 
 PLAIN = ui.resolve_style("never", True)
 
@@ -335,7 +338,17 @@ def test_the_age_denominator_matches_the_population_it_buckets(tmp_path):
     assert bucketed == res.files - res.hardlink_extra_refs
     text = _flat(report.render_age(res, PLAIN))
     if "has not been modified" in text:
-        assert "(20.0%)" in text, text  # 1 of 5 bucketed entries
+        # The sentence carries a *byte* share, and `(20.0%)` was hard-coded here as
+        # though it were "1 of 5 bucketed entries". Those agree only where all five
+        # entries allocate the same: on this GPFS they do, so the literal passed;
+        # on xfs and tmpfs a short symlink is stored in its inode and allocates
+        # nothing, leaving one cold file in four paying entries -- 25.0%, and a
+        # failure on any cluster but the one this was written on. Computed from the
+        # walk instead, which holds on all three.
+        cold_bytes = res.by_age[-1][0]
+        total_bytes = sum(b for b, _f in res.by_age)
+        share = "({:.1f}%)".format(100.0 * cold_bytes / total_bytes)
+        assert share in text, (share, text)
 
 
 def test_the_document_still_round_trips(tmp_path):
@@ -370,7 +383,7 @@ def _unsettled(size=1024, recent_apparent=800000, recent_size=0, recent=4):
 def test_the_default_view_says_the_headline_is_provisional():
     text = _flat(report.render_compact(_unsettled(), SettleCheck(), 10, False, PLAIN))
     assert "provisional" in text, text
-    assert "781.2 KiB not yet allocated" in text, text
+    assert "781.2 KiB unallocated" in text, text
 
 
 def test_the_warning_is_marked_so_it_can_be_found():
@@ -445,7 +458,7 @@ def test_the_full_view_still_says_provisional_without_a_magnitude_when_small():
     r = _unsettled(size=4 << 30, recent_apparent=10240, recent_size=0, recent=1)
     full = _flat(report.render_walk(r, SettleCheck(), style=PLAIN))
     assert "figure is provisional" in full, full
-    assert "not yet allocated" not in full, full
+    assert "unallocated" not in full, full
 
 
 def test_delayed_allocation_on_a_real_filesystem_is_caught_or_absent(tmp_path):
@@ -749,7 +762,7 @@ def test_measured_drift_still_wins_over_the_estimate():
     assert chk.moved
     text = _flat(report.render_compact(r, chk, 10, False, PLAIN))
     assert "still settling" in text, text
-    assert "not yet allocated" not in text, text
+    assert "unallocated" not in text, text
 
 
 def test_the_verdict_without_a_check_is_unchanged():
@@ -882,6 +895,7 @@ def test_no_walk_or_settle_measurement_is_left_unpublished():
         "settle_window": "window_seconds",
         "abandoned_workers": "abandoned_threads",
         "padding": "padding_bytes",
+        "unit_padding_ceiling": "unit_padding_ceiling_bytes",
         "under_files": "under_allocated_files",
         "alloc_ratio": "ratio",
         "alloc_unit": "unit_bytes",
@@ -1825,6 +1839,29 @@ def test_an_interrupted_walk_claims_no_total_or_share():
     assert doc["complete"] is False
 
 
+def _await_walk_start(pid, limit=20.0):
+    """Block until `pid` has built its walk thread pool, or give up and let the
+    caller fall back to a bare wall-clock wait.
+
+    A single-threaded process has one entry in `/proc/<pid>/task`; the walk's
+    pool takes it to `threads + 1` in one step. Anywhere `/proc` does not answer
+    this returns at once and the caller's own sleep is all the margin there is,
+    which is the behaviour this replaced -- no worse, and no new dependency.
+    """
+    import time
+
+    task = "/proc/%d/task" % pid
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        try:
+            if len(os.listdir(task)) > 1:
+                return True
+        except OSError:
+            return False
+        time.sleep(0.01)
+    return False
+
+
 def test_a_real_sigint_yields_a_partial_report_not_a_crash(tmp_path):
     """End to end, made deterministic by the rate limiter rather than by luck.
 
@@ -1835,8 +1872,21 @@ def test_a_real_sigint_yields_a_partial_report_not_a_crash(tmp_path):
 
     With 200 directories at 20/s the burst covers 20 of them and the remaining 180
     are paced, putting a floor of about nine seconds on the walk however fast the
-    host is. A signal at half a second is then reliably mid-walk, and the test
-    still finishes in under a second because the process is killed, not waited on.
+    host is. A signal half a second into the walk is then reliably mid-walk, and
+    the test still finishes in under a second because the process is killed, not
+    waited on.
+
+    **Half a second into the walk, not into the process.** The two are not the
+    same and the difference is the host's: measured with the fixture on an NFS
+    home, the child reached the walk 0.34s after `Popen`, leaving 0.16s of the
+    0.5s margin, and in a full-suite run it did not get there at all -- so the
+    assertion "the rate limiter kept the walk running" failed on a host where the
+    rate limiter was never reached. The nine-second floor was doing its job; the
+    clock was started against the wrong event.
+
+    The walk's own start is observable rather than guessed: it builds a thread
+    pool, so `/proc/<pid>/task` goes from one entry to `threads + 1` at that
+    instant and nowhere else. Measured on the same host, 1 -> 9 at 0.242s.
     """
     import signal
     import subprocess
@@ -1866,11 +1916,21 @@ def test_a_real_sigint_yields_a_partial_report_not_a_crash(tmp_path):
         stderr=subprocess.PIPE,
         env=env,
     )
+    _await_walk_start(proc.pid)
     time.sleep(0.5)
     proc.send_signal(signal.SIGINT)
     out, err = proc.communicate(timeout=60)
     text = out.decode("utf-8", "replace")
     errtext = err.decode("utf-8", "replace")
+    # Flattened for the prose checks, as everywhere else in this suite: the
+    # report soft-wraps to the terminal, so a sentence is not a substring of the
+    # output it is printed in. This one straddled the wrap as
+    # "no total and no\n  share of anything" -- and whether it did depended on
+    # the *digits* one clause earlier, because "0 top-level entries" is a
+    # character shorter than "12 top-level entries" and shifts everything after
+    # it. So the test passed or failed on how far the walk happened to get,
+    # which is the one thing it was written not to depend on.
+    flat = " ".join(text.split())
 
     assert "PARTIAL" in text, (
         "the rate limiter should have kept the walk running past the signal:\n"
@@ -1879,9 +1939,11 @@ def test_a_real_sigint_yields_a_partial_report_not_a_crash(tmp_path):
     )
     assert proc.returncode == 1, (proc.returncode, errtext[-400:])
     assert "INTERRUPTED" in text, text
-    assert "no total and no share of anything" in text, text
-    # The elapsed must not read as instantaneous when inodes were scanned.
-    assert "INTERRUPTED after 0s" not in text, text
+    assert "no total and no share of anything" in flat, text
+    # The elapsed must not read as instantaneous when inodes were scanned. On the
+    # flattened copy too: a negative assertion against wrapped text passes for
+    # the wrong reason the moment the phrase happens to break.
+    assert "INTERRUPTED after 0s" not in flat, text
     # rapidu's own code must not have raised. A KeyboardInterrupt landing during
     # interpreter startup -- inside `site`, importing an unrelated package -- is
     # not its traceback to own, and that is what an early signal produces.
@@ -2124,7 +2186,14 @@ def test_an_ascii_stream_refuses_the_command_end_to_end(tmp_path):
     # The corrupted form must never appear as a command.
     assert "caf\\xe9" not in wide, wide[-500:]
     assert "rm -rf " not in narrow, narrow[-500:]
-    assert "UTF-8 locale" in narrow, narrow[-500:]
+    # Which remedy applies depends on how the name arrived, so pinning one of the
+    # two made this pass for a reason that does not hold on every supported
+    # Python. PEP 538 (3.7+) coerces `LC_ALL=C` to C.UTF-8: the path decodes, only
+    # the *output* encoding is narrow, and the remedy is the UTF-8 locale. On 3.6
+    # there is no coercion, the name arrives surrogate-escaped, and the remedy is
+    # to delete it by inode rather than by pasting a name. Both refuse the command
+    # and both say why -- which is the property under test.
+    assert "UTF-8 locale" in narrow or "unprintable characters" in narrow, narrow[-500:]
 
 
 def test_a_narrow_stream_still_reports_the_tree(tmp_path):
@@ -2390,9 +2459,18 @@ def test_no_message_pairs_a_count_with_a_fixed_verb():
         "more holding it",  # a bare "+N more"
         "of them disappeared between the walk",  # "1 of them" is correct
         "walk thread{} still blocked",  # carries its own was/were
-        "so {} occupy {} of padding",  # carries its own averages/average and it/they;
-        # the unit clause is now optional, so the literal no longer names it
         # Verified to agree, each with a test above.
+        # This one was exempted as "carries its own averages/average and it/they",
+        # which was true and incomplete: `occupy` was a third agreement point and
+        # not conditional, so one padded file read "so it occupy 29.0 MiB". The
+        # sweep never looks at `occupy` -- the entry was allow-listed for the
+        # `them` in "Packing them" -- so the allow-list comment was the only thing
+        # standing behind the verb, and it was wrong. Now paired with a test that
+        # renders both counts.
+        "so {} {} of padding",
+        # "the two readings" is a fixed plural, so `were` always agrees; the count
+        # in the subject comes from `_settle_subject`, which agrees on its own.
+        "the two readings were {} apart",
         "could not be read, so the walk total",
         "vanished between being listed",
         "vanished before {} could",
@@ -3487,3 +3565,2022 @@ def test_a_working_backend_still_suppresses_it_in_both_modes():
     ok.rows = [QuotaRow("lab", "files", "group", 5, 90, 100, mount="/tmp")]
     assert report.to_json(None, None, ok, None, None, path="/tmp")["quota"]["mount"] is None
     assert "the mount at" not in _flat(report.render_quota(ok, ["/tmp"], style=PLAIN))
+
+
+# --- the listing command has to match the population it explains --------------
+#
+# `BY AGE` counts what the walk saw. Under `-x` the walk stops at a mount
+# boundary; `find` without `-xdev` walks straight through it, so the command
+# printed under the finding would enumerate files the finding never counted.
+#
+# `crossed` cannot answer this: a bounded walk with nothing to skip reports 0
+# crossings, exactly like an unbounded one. So the flag itself is recorded.
+
+
+def _cold(tmp_path, one_file_system=False):
+    """Idempotent: several of these tests walk the same tree twice, once bounded."""
+    root = tmp_path / "t"
+    (root / "sub").mkdir(parents=True, exist_ok=True)
+    stamp = 1546300800
+    for i in range(4):
+        target = root / "sub" / ("old%d.txt" % i)
+        target.write_bytes(b"\x5a" * 3000)
+        os.utime(str(target), (stamp, stamp))
+    (root / "new.txt").write_bytes(b"\x5a" * 2000)
+    return walk(str(root), threads=2, one_file_system=one_file_system)
+
+
+def test_the_walk_records_whether_it_was_bounded(tmp_path):
+    assert _cold(tmp_path, one_file_system=True).one_file_system is True
+    assert _cold(tmp_path, one_file_system=False).one_file_system is False
+
+
+def test_a_bounded_walk_emits_xdev(tmp_path):
+    text = _flat(report.render_age(_cold(tmp_path, one_file_system=True), PLAIN))
+    assert " -xdev " in text, text
+
+
+def test_an_unbounded_walk_does_not(tmp_path):
+    text = _flat(report.render_age(_cold(tmp_path, one_file_system=False), PLAIN))
+    assert "find '" in text, text
+    assert "-xdev" not in text, text
+
+
+def test_both_commands_run_and_agree_with_the_bucket(tmp_path):
+    """`-xdev` in the wrong place would make find reject the whole expression."""
+    import subprocess
+
+    for bounded in (False, True):
+        res = _cold(tmp_path, one_file_system=bounded)
+        command = [
+            ln.strip() for ln in report.render_age(res, PLAIN) if ln.strip().startswith("find ")
+        ]
+        assert command, bounded
+        proc = subprocess.Popen(
+            ["bash", "-c", command[0]], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        out, err = proc.communicate()
+        assert proc.returncode == 0, (bounded, err.decode()[:200])
+        found = [ln for ln in out.decode("utf-8", "replace").splitlines() if ln.strip()]
+        assert len(found) == res.by_age[-1][1], (bounded, len(found), res.by_age[-1][1])
+
+
+def test_the_flag_is_published_not_only_its_effect(tmp_path):
+    """A consumer cannot infer it from `skipped_other_filesystem`, which is 0 for
+    a bounded walk that had nothing to skip."""
+    res = _cold(tmp_path, one_file_system=True)
+    w = report.to_json(res, SettleCheck(), None, None, None)["walk"]
+    assert w["one_file_system"] is True
+    assert w["skipped_other_filesystem"] == 0, "the case where the flag is the only evidence"
+    plain = report.to_json(_cold(tmp_path), SettleCheck(), None, None, None)["walk"]
+    assert plain["one_file_system"] is False
+
+
+# --- quota-tools has two ways of saying "you have no quota" -------------------
+#
+# Observed on an ALCF Lustre login node (sophia): `quota -s` prints
+#
+#     Disk quotas for user youzhi (uid 38183): no limited resources used
+#
+# and the regex only knew `none`. So a command that had worked perfectly was
+# reported as "could not parse `quota -s` output" -- a broken backend where the
+# honest answer was "you have no quota here". The comment above that regex already
+# made the argument; only the vocabulary was short.
+
+
+SOPHIA_NO_QUOTA = "Disk quotas for user youzhi (uid 38183): no limited resources used\n"
+MIDWAY_NO_QUOTA = "Disk quotas for user youzhi (uid 38183): none\n"
+
+
+def test_both_spellings_of_no_quota_are_recognised():
+    from rapidu.quota import _QUOTA_NONE_RE
+
+    assert _QUOTA_NONE_RE.search(SOPHIA_NO_QUOTA)
+    assert _QUOTA_NONE_RE.search(MIDWAY_NO_QUOTA)
+    assert _QUOTA_NONE_RE.search(SOPHIA_NO_QUOTA.upper())
+
+
+def test_a_real_table_is_not_mistaken_for_no_quota():
+    from rapidu.quota import _QUOTA_NONE_RE
+
+    table = (
+        "Disk quotas for user youzhi (uid 1):\n"
+        " Filesystem blocks quota limit grace files quota limit grace\n"
+        " /home 100 200 300 - 4 5 6 -\n"
+    )
+    assert not _QUOTA_NONE_RE.search(table)
+
+
+def test_the_phrase_must_follow_the_header():
+    """Anchored, so neither phrase can match prose further down the output."""
+    from rapidu.quota import _QUOTA_NONE_RE
+
+    assert not _QUOTA_NONE_RE.search("something none\nDisk quotas for user x (uid 1):\n")
+    assert not _QUOTA_NONE_RE.search("no limited resources used\n")
+
+
+# --- the Lustre backend, against output from a real Lustre filesystem ---------
+#
+# rapidu's `lfs quota` path had only ever been exercised against hand-written
+# fixtures. These are verbatim from sophia-login-02, including the trailing
+# "using default ... setting" lines that must not become rows, and the `0 0`
+# limits that are Lustre's way of saying "no limit".
+
+LFS_HOME = """Disk quotas for usr youzhi (uid 38183):
+     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace
+          /home 21039052  358847931 391470470       -   31172       0       0       -
+uid 38183 is using default file quota setting
+"""
+
+LFS_EAGLE = """Disk quotas for usr youzhi (uid 38183):
+     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace
+     /lus/eagle 3776876544       0       0       -  100333       0       0       -
+uid 38183 is using default block quota setting
+uid 38183 is using default file quota setting
+"""
+
+
+def test_real_lustre_output_converts_exactly():
+    from rapidu.quota import _parse_lfs_rows
+
+    rows = _parse_lfs_rows(LFS_HOME, "user", "/home")
+    assert len(rows) == 2, rows
+    blocks = next(r for r in rows if r.kind == "blocks")
+    # `lfs` reports kbytes; 21039052 KiB and 358847931 KiB exactly
+    assert blocks.used == 21039052 * 1024
+    assert blocks.soft == 358847931 * 1024
+    assert blocks.hard == 391470470 * 1024
+    assert blocks.limit == 358847931 * 1024, "soft binds first"
+    files = next(r for r in rows if r.kind == "files")
+    assert files.used == 31172
+
+
+def test_lustre_zero_limits_are_no_limit_not_a_limit_of_zero():
+    """The convention the `limit` property was fixed for, on real hardware."""
+    from rapidu.quota import _parse_lfs_rows
+
+    for row in _parse_lfs_rows(LFS_EAGLE, "user", "/lus/eagle"):
+        # 0 is kept, because that is what `lfs` printed; the *derived* limit is
+        # None, because zero is not a limit. Folding 0 to None in the parser threw
+        # the distinction away and made these rows render as "n/a" -- unreadable --
+        # when they had been read perfectly.
+        assert row.soft == 0, row.kind
+        assert row.hard == 0, row.kind
+        assert row.limit is None, row.kind
+        assert row.usage_fraction is None, row.kind
+    files = next(r for r in _parse_lfs_rows(LFS_HOME, "user", "/home") if r.kind == "files")
+    assert (files.soft, files.hard) == (0, 0)
+    assert files.limit is None, "0 0 on the files row is no limit"
+
+
+def test_the_default_setting_lines_do_not_become_rows():
+    """Two informational trailers on eagle, three lines of table -- still 2 rows."""
+    from rapidu.quota import _parse_lfs_rows
+
+    assert len(_parse_lfs_rows(LFS_EAGLE, "user", "/lus/eagle")) == 2
+    assert len(_parse_lfs_rows(LFS_HOME, "user", "/home")) == 2
+
+
+def test_a_no_limit_lustre_row_renders_as_none_not_zero():
+    from rapidu.quota import _parse_lfs_rows
+
+    snap = QuotaSnapshot("lfs quota")
+    snap.available = True
+    snap.taken_at = snap.read_at - 60.0
+    snap.rows = _parse_lfs_rows(LFS_EAGLE, "user", "/lus/eagle")
+    for row in snap.rows:
+        row.mount = "/lus/eagle"
+    text = _flat(report.render_quota(snap, ["/lus/eagle"], style=PLAIN))
+    assert "/ none" in text, text
+    assert "/ 0 " not in text and "/ 0B" not in text, text
+
+
+# --- Lustre's degraded-OST path, against the real layout ----------------------
+#
+# `lfs quota` wraps figures it could not verify in brackets and prints a warning
+# line; both are ordinary on a site with a down OST, which is the same afternoon
+# someone reaches for this tool. None of it had been exercised against real Lustre
+# output until sophia-login-02 provided some.
+
+LFS_REAL = LFS_HOME  # verbatim from sophia, defined above
+
+# Wrapped across source lines only; the text is byte-identical to what `lfs`
+# prints, which matters because `_LFS_INACCURATE` matches part of it.
+LFS_WARNED = (
+    "Disk quotas for usr youzhi (uid 38183):\n"
+    "     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace\n"
+    "          /home 21039052 358847931 391470470       -   31172       0       0       -\n"
+    "Some errors happened when getting quota info. Some devices may be not working "
+    'or deactivated. The data in "[]" is inaccurate.\n'
+)
+
+LFS_BRACKETED = """Disk quotas for usr youzhi (uid 38183):
+     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace
+          /home [21039052] 358847931 391470470      -   31172       0       0       -
+"""
+
+
+def test_clean_lustre_output_is_not_flagged():
+    from rapidu.quota import _lfs_unverified
+
+    assert _lfs_unverified(LFS_REAL) is False
+
+
+def test_either_degraded_signal_is_enough():
+    from rapidu.quota import _lfs_unverified
+
+    assert _lfs_unverified(LFS_WARNED) is True, "the warning line"
+    assert _lfs_unverified(LFS_BRACKETED) is True, "a bracketed figure"
+
+
+def test_a_flagged_reading_still_yields_its_rows():
+    """Carried with a caveat beats no figure at all."""
+    from rapidu.quota import _parse_lfs_rows
+
+    for text in (LFS_REAL, LFS_WARNED, LFS_BRACKETED):
+        assert len(_parse_lfs_rows(text, "user", "/home")) == 2, text[:40]
+
+
+def test_the_decorations_lfs_uses_are_stripped_but_zero_is_not():
+    from rapidu.quota import _lfs_figure
+
+    assert _lfs_figure("[21039052]") == "21039052"
+    assert _lfs_figure("21039052*") == "21039052"
+    assert _lfs_figure("0") == "0", "0 is a figure, not a decoration"
+    assert _lfs_figure("-") == "-"
+
+
+def test_an_unverified_lustre_reading_cannot_report_reconciles():
+    """The intersection of two findings: a degraded reading whose numbers happen
+    to agree must not produce an all-clear.
+
+    Before the CLOSES fix this returned "reconciles (difference is within ...)"
+    with the blocker collected and discarded.
+    """
+    from rapidu.quota import QuotaSnapshot, _parse_lfs_rows
+
+    snap = QuotaSnapshot("lfs quota")
+    snap.available = True
+    snap.taken_at = snap.read_at - 60.0
+    snap.rows = _parse_lfs_rows(LFS_BRACKETED, "user", "/home")
+    for row in snap.rows:
+        row.mount = "/home"
+        row.fileset = grp.getgrgid(os.getgid()).gr_name
+        row.scope = "user"
+    snap.figure_note = "lfs could not reach every device, so bracketed figures are unverified"
+
+    res = WalkResult("/home")
+    res.files, res.dirs = 100, 10
+    res.size = res.apparent = 21039052 * 1024  # exactly the quota figure
+    res.by_uid = {os.getuid(): (res.size, 110)}
+    res.by_dev[0] = (res.size, 110)
+
+    rec = rc.reconcile(res, _settled_check(), snap, DeletedScan(), "blocks")
+    assert rec.within_tolerance, "the numbers do agree, which is the point"
+    assert rec.verdict == rc.INCONCLUSIVE, rec.verdict
+    assert any("could not reach every device" in b for b in rec.blockers), rec.blockers
+    assert "reconciles" not in rc.verdict_line(rec), rc.verdict_line(rec)
+
+
+def test_project_id_zero_means_no_project():
+    """Lustre's other zero-means-none convention, alongside `0 0` limits."""
+    import inspect
+
+    from rapidu import quota as q
+
+    source = inspect.getsource(q._lfs_project_id)
+    assert 'parts[0] != "0"' in source, "projid 0 must not be treated as a project"
+
+
+# --- RD-15: the headline figure and the JSON key that shares its name ---------
+#
+# Filed against 0.3.0, where the box read "9 files" for an inode count while
+# `--json` published `files=5 dirs=4 inodes=9` -- the first number a person reads
+# and the number a script reads differing under one word, by 19.7% on the
+# reporter's real home. Fixed by the RD-9 work that shipped in 0.3.1; this is the
+# invariant the reporter asked for, so it cannot come back.
+#
+# Stated generally rather than as "the headline says inodes": whatever noun the
+# headline uses, the figure beside it must equal the payload key of that name.
+
+
+def _headline_count_and_noun(res, style=None):
+    """The count and its noun from the headline line, e.g. (10, "inodes")."""
+    import re as _re
+
+    lines = report.render_compact(res, SettleCheck(), 10, False, style or PLAIN)
+    for line in lines:
+        match = _re.search(r"([\d,]+)\s+(inode|inodes|file|files|entry|entries)\b", line)
+        if match:
+            return int(match.group(1).replace(",", "")), match.group(2)
+    return None, None
+
+
+def test_headline_count_matches_the_json_key_it_is_named_after(tmp_path):
+    root = tmp_path / "t"
+    for name in ("a", "b", "c", "d"):
+        (root / name).mkdir(parents=True)
+    for i in range(5):
+        (root / "a" / ("f%d.bin" % i)).write_bytes(b"\x5a" * 4096)
+    res = walk(str(root), threads=2, depth=1)
+    doc = report.to_json(res, SettleCheck(), None, None, None)["walk"]
+
+    count, noun = _headline_count_and_noun(res)
+    assert noun is not None, "no countable figure found on the headline"
+    key = {"inode": "inodes", "inodes": "inodes", "file": "files", "files": "files"}.get(noun)
+    assert key is not None, "headline noun %r has no payload key" % noun
+    assert count == doc[key], (noun, count, doc[key], doc)
+
+
+def test_the_two_counts_are_genuinely_different_on_this_fixture(tmp_path):
+    """Otherwise the test above would pass on a tree where files == inodes."""
+    root = tmp_path / "t"
+    for name in ("a", "b", "c", "d"):
+        (root / name).mkdir(parents=True)
+    for i in range(5):
+        (root / "a" / ("f%d.bin" % i)).write_bytes(b"\x5a" * 4096)
+    doc = report.to_json(walk(str(root), threads=2, depth=1), SettleCheck(), None, None, None)
+    assert doc["walk"]["files"] != doc["walk"]["inodes"], doc["walk"]
+
+
+def test_the_count_only_headline_says_entries(tmp_path):
+    """`-c` counts names, not deduped inodes, so neither `files` nor `inodes` fits."""
+    root = tmp_path / "t"
+    (root / "a").mkdir(parents=True)
+    for i in range(5):
+        (root / "a" / ("f%d.bin" % i)).write_bytes(b"\x5a" * 4096)
+    res = walk(str(root), threads=2, depth=1, count_only=True)
+    _count, noun = _headline_count_and_noun(res)
+    assert noun in ("entry", "entries"), noun
+
+
+def test_a_single_inode_headline_is_singular(tmp_path):
+    """The reporter's `-x` case printed "1 files"; it is one inode."""
+    root = tmp_path / "t"
+    root.mkdir()
+    res = walk(str(root), threads=2, depth=1)
+    count, noun = _headline_count_and_noun(res)
+    assert (count, noun) == (1, "inode"), (count, noun)
+
+
+def test_no_site_formats_an_inode_count_as_files():
+    """The two `report.py` sites RD-15 names, kept gone."""
+    import glob
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for path in sorted(glob.glob(os.path.join(root, "src", "rapidu", "*.py"))):
+        with open(path, "rb") as handle:
+            source = handle.read().decode("utf-8")
+        assert '"{} files"' not in source, os.path.basename(path)
+
+
+# --- Round 63: the breakdown term named `files` was not counting files -------
+#
+# RD-15's method -- run the tool, run `find`, compare -- applied to the terms
+# the fix for it introduced. `walk` counts every non-directory entry in `files`,
+# so the term left over after symlinks are split out absorbed sockets, fifos and
+# devices: a tree of one file, one symlink, one fifo and one socket read
+# `3 files` where `find -type f` found one, and a real 27,415-inode home read one
+# more than `find` could account for -- an ssh ControlMaster socket. Under `-c`
+# the split is not measured at all: no stat, so no `st_mode`.
+
+
+def _special_tree(tmp_path):
+    """One regular file, one symlink, one fifo, two directories.
+
+    A fifo rather than a socket because binding one needs the whole path under
+    ~108 bytes and a test temporary directory is not; both take the same branch.
+    """
+    root = tmp_path / "t"
+    (root / "d").mkdir(parents=True)
+    (root / "d" / "regular").write_bytes(b"x")
+    os.symlink("d/regular", str(root / "d" / "link"))
+    os.mkfifo(str(root / "d" / "pipe"))
+    return root
+
+
+def _terms(res):
+    """The breakdown as {singular: count}, e.g. {"file": 1, "special": 1}."""
+    found = {}
+    for count, word in re.findall(
+        r"(\d[\d,]*)\s+(non-dirs?|files?|symlinks?|specials?|dirs?)\b",
+        report._inode_breakdown(res),
+    ):
+        found[word[:-1] if word.endswith("s") else word] = int(count.replace(",", ""))
+    return found
+
+
+def _truth(root):
+    """What the tree holds, by `lstat` -- the `find -type` answer, independently."""
+    import stat as _stat
+
+    seen = {"file": 0, "symlink": 0, "special": 0, "dir": 1}
+    for parent, dirs, files in os.walk(str(root)):
+        seen["dir"] += len(dirs)
+        for name in files + dirs:
+            if name in dirs:
+                continue
+            mode = os.lstat(os.path.join(parent, name)).st_mode
+            if _stat.S_ISREG(mode):
+                seen["file"] += 1
+            elif _stat.S_ISLNK(mode):
+                seen["symlink"] += 1
+            else:
+                seen["special"] += 1
+    return seen
+
+
+def test_a_fifo_is_not_counted_in_the_term_named_files(tmp_path):
+    """`3 files` for one file: the term absorbed the fifo and the socket."""
+    res = walk(str(_special_tree(tmp_path)), threads=2, depth=1)
+    assert _terms(res)["file"] == 1, report._inode_breakdown(res)
+
+
+def test_every_breakdown_term_matches_an_independent_count(tmp_path):
+    """Each term is checkable against the `find -type` that measures it."""
+    root = _special_tree(tmp_path)
+    res = walk(str(root), threads=2, depth=1)
+    assert _terms(res) == _truth(root), (report._inode_breakdown(res), _truth(root))
+
+
+def test_breakdown_parts_still_sum_to_the_inode_headline(tmp_path):
+    """A new term must not break the invariant that made the parts trustworthy."""
+    res = walk(str(_special_tree(tmp_path)), threads=2, depth=1)
+    terms = _terms(res)
+    assert sum(terms.values()) == res.inodes, (terms, res.inodes)
+    count, _noun = _headline_count_and_noun(res)
+    assert sum(terms.values()) == count, (terms, count)
+
+
+def test_the_specials_term_and_its_json_key_share_one_name(tmp_path):
+    """RD-15 was a term and a key disagreeing; do not reintroduce it."""
+    root = _special_tree(tmp_path)
+    res = walk(str(root), threads=2, depth=1)
+    doc = report.to_json(res, SettleCheck(), None, None, None, path=str(root))
+    assert "specials" in doc["walk"], sorted(doc["walk"])
+    assert _terms(res)["special"] == doc["walk"]["specials"], doc["walk"]
+    # And the other keys the breakdown names, so the parity holds for all of them.
+    assert _terms(res)["symlink"] == doc["walk"]["symlinks"], doc["walk"]
+    assert _terms(res)["dir"] == doc["walk"]["dirs"], doc["walk"]
+
+
+def test_no_specials_term_when_the_tree_has_none(tmp_path):
+    """Almost every tree. The term must not add noise to those reports."""
+    root = tmp_path / "plain"
+    root.mkdir()
+    (root / "f.bin").write_bytes(b"\x5a" * 512)
+    res = walk(str(root), threads=2, depth=1)
+    line = report._inode_breakdown(res)
+    assert "special" not in line, line
+    assert res.specials == 0, res.specials
+
+
+def test_count_only_does_not_name_a_split_it_never_measured(tmp_path):
+    """`-c` skips stat, so `d_type` separates directories and nothing else."""
+    res = walk(str(_special_tree(tmp_path)), threads=2, depth=1, count_only=True)
+    line = report._inode_breakdown(res)
+    terms = _terms(res)
+    assert "file" not in terms, line
+    assert "symlink" not in terms and "special" not in terms, line
+    assert terms == {"non-dir": 3, "dir": 2}, line
+    assert sum(terms.values()) == res.inodes, (terms, res.inodes)
+
+
+def test_the_walk_panel_prints_the_specials_term(tmp_path):
+    """The wiring, not just the helper: `-a` shows it where a reader looks."""
+    root = _special_tree(tmp_path)
+    res = walk(str(root), threads=2, depth=1)
+    text = _flat(report.render_walk(res, SettleCheck(), style=PLAIN))
+    assert "1 special" in text, text
+
+
+# --- Round 64: the fallback percentage could report a full filesystem as 95% --
+#
+# `statvfs` has three block figures, not two: `f_blocks` is the filesystem,
+# `f_bfree` is free, and `f_bavail` is free *to a non-root writer*. The fallback
+# built `used` from `f_bfree` and `avail` from `f_bavail` -- each correct, and
+# `df` does the same -- but divided by `f_blocks`. A default-formatted ext4 keeps
+# 5% back, so one with `f_bavail` at zero rendered
+#
+#     95.0 GiB of 100.0 GiB used (95.0%), 0 B free
+#
+# on a filesystem nobody but root can add a byte to: a false all-clear, and three
+# numbers on one line that do not add up. `df` prints 100% there, and `df` is what
+# anyone checking this figure runs. No mount on the development host reserves
+# anything -- `f_bfree == f_bavail` on all of them -- which is why the fixtures
+# here are synthetic and why the bug survived being run against real filesystems.
+
+
+class _FakeStatvfs(object):
+    """A `statvfs` result with a chosen reservation, in 4 KiB blocks."""
+
+    f_bsize = f_frsize = 4096
+
+    def __init__(self, total_gib, free_gib, avail_gib, files=6553600, ffree=100000, favail=None):
+        per_gib = (1 << 30) // self.f_frsize
+        self.f_blocks = total_gib * per_gib
+        self.f_bfree = free_gib * per_gib
+        self.f_bavail = avail_gib * per_gib
+        self.f_files, self.f_ffree = files, ffree
+        # Defaults to `f_ffree`, which is what every filesystem on the development
+        # host reports; pass it explicitly to model one that holds inodes back.
+        self.f_favail = ffree if favail is None else favail
+
+
+def _faked(monkeypatch, *args, **kwargs):
+    from rapidu import quota as quotamod
+
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(*args, **kwargs))
+    return quotamod.mount_report("/data")
+
+
+def test_a_filesystem_full_for_everyone_but_root_is_not_95_percent(monkeypatch):
+    """100 GiB, 5 GiB free and all of it reserved: nobody can write."""
+    r = _faked(monkeypatch, 100, 5, 0)
+    assert r.fraction == 1.0, r.fraction
+    assert r.reserved == 5 << 30, r.reserved
+
+
+def test_the_percentage_is_the_one_df_prints(monkeypatch):
+    """`df` computes `used / (used + available)`; agree with it exactly."""
+    for total, free, avail in ((100, 10, 5), (100, 5, 0), (64, 64, 60), (10, 1, 1)):
+        r = _faked(monkeypatch, total, free, avail)
+        df_style = r.used / float(r.used + r.avail) if r.used + r.avail else None
+        assert r.fraction == df_style, (total, free, avail, r.fraction, df_style)
+
+
+def test_nothing_moves_where_no_blocks_are_reserved(monkeypatch):
+    """gpfs, xfs, and the quota-through-statvfs case: `used + avail == total`."""
+    r = _faked(monkeypatch, 100, 30, 30)
+    assert r.reserved == 0
+    assert r.fraction == r.used / float(r.total), (r.fraction, r.used, r.total)
+
+
+def test_every_byte_is_accounted_for(monkeypatch):
+    """`used + avail + reserved == total`, so the line can be read as arithmetic."""
+    r = _faked(monkeypatch, 100, 10, 5)
+    assert r.used + r.avail + r.reserved == r.total, (
+        r.used,
+        r.avail,
+        r.reserved,
+        r.total,
+    )
+
+
+def test_the_line_names_the_reserved_slice(monkeypatch):
+    """Otherwise three numbers on one line silently fail to add up."""
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 5, 0))
+    text = _flat(report.render_quota(_unavailable(), ["/data"], style=PLAIN))
+    assert "100.0%" in text, text
+    assert "0 B free to you and 5.0 GiB reserved for root" in text, text
+
+
+def test_no_reserved_clause_where_nothing_is_reserved(monkeypatch):
+    """The common path keeps the shorter sentence."""
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 30, 30))
+    text = _flat(report.render_quota(_unavailable(), ["/data"], style=PLAIN))
+    assert "reserved for root" not in text, text
+    assert "30.0 GiB free" in text, text
+
+
+def test_the_document_publishes_reserved_bytes(monkeypatch):
+    """A measured zero is 0, not `null` -- nothing here went unmeasured."""
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 10, 5))
+    mount = report.to_json(None, None, _unavailable(), None, None, path="/data")["quota"]["mount"]
+    assert mount["reserved_bytes"] == 5 << 30, mount
+    assert mount["fraction"] == 90.0 / 95.0, mount
+    assert mount["total_bytes"] == 100 << 30, mount
+
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 30, 30))
+    plain = report.to_json(None, None, _unavailable(), None, None, path="/data")["quota"]["mount"]
+    assert plain["reserved_bytes"] == 0, plain
+
+
+def test_a_real_mount_agrees_with_its_own_statvfs():
+    """The synthetic fixtures above must describe the same code the host runs."""
+    import os as _os
+
+    from rapidu.quota import mount_report
+
+    st = _os.statvfs("/tmp")
+    r = mount_report("/tmp")
+    frsize = st.f_frsize or st.f_bsize
+    assert r.reserved == max(0, st.f_bfree - st.f_bavail) * frsize
+    assert r.fraction == r.used / float(r.used + r.avail)
+
+
+# --- Round 65: the panel put its percentage on the wrong resource ------------
+#
+# The same three-way `statvfs` split as round 64, one field over: `f_files`,
+# `f_ffree`, and `f_favail` for a non-root process. The byte line carried a
+# percentage and the inode line did not, so the fallback on a real GPFS mount
+# printed
+#
+#     the mount at /gpfs/midway2/perf reports 248.1 TiB of 280.2 TiB used (88.5%)
+#       and 176,187,043 of 188,743,680 inodes
+#
+# emphasising 88.5% while the figure nearer the wall -- 93.3%, and `df -i` agrees
+# -- was left as long division on nine-digit numbers. An inode quota is the one
+# that bites without warning, and telling people so is why this tool has `-i`.
+
+
+def test_the_inode_line_carries_a_percentage(monkeypatch):
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 30, 30, 1000, 100))
+    text = _flat(report.render_quota(_unavailable(), ["/data"], style=PLAIN))
+    assert "900 of 1,000 inodes (90.0%)" in text, text
+
+
+def test_the_inode_percentage_is_the_one_df_i_prints(monkeypatch):
+    """`df -i` computes `IUse%` as `iused / (iused + iavail)`."""
+    from rapidu import quota as quotamod
+
+    for files, ffree, favail in ((1000, 100, 100), (1000, 100, 0), (2048, 1024, 512)):
+        monkeypatch.setattr(
+            os, "statvfs", lambda _p, f=files, r=ffree, a=favail: _FakeStatvfs(100, 30, 30, f, r, a)
+        )
+        r = quotamod.mount_report("/data")
+        used = files - ffree
+        assert r.inodes_used == used, (files, ffree, r.inodes_used)
+        assert r.inodes_fraction == used / float(used + favail), (files, ffree, favail)
+
+
+def test_a_filesystem_out_of_inodes_for_users_is_not_reported_as_90_percent(monkeypatch):
+    """`f_favail` at 0 with `f_ffree` above it: no user can create a file."""
+    from rapidu import quota as quotamod
+
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 30, 30, 1000, 100, 0))
+    r = quotamod.mount_report("/data")
+    assert r.inodes_fraction == 1.0, r.inodes_fraction
+    assert r.inodes_reserved == 100, r.inodes_reserved
+
+
+def test_the_inode_line_names_reserved_inodes(monkeypatch):
+    """So the percentage can be reconciled against the two counts beside it."""
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 30, 30, 1000, 100, 0))
+    text = _flat(report.render_quota(_unavailable(), ["/data"], style=PLAIN))
+    assert "900 of 1,000 inodes (100.0%), 100 reserved for root" in text, text
+
+
+def test_no_reserved_clause_where_no_inodes_are_reserved(monkeypatch):
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 30, 30, 1000, 100))
+    text = _flat(report.render_quota(_unavailable(), ["/data"], style=PLAIN))
+    assert "reserved for root" not in text, text
+
+
+def test_a_filesystem_reporting_no_inodes_gets_no_inode_line(monkeypatch):
+    """`f_files == 0` means unsupported -- Constraint 10, unchanged by this round."""
+    from rapidu import quota as quotamod
+
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 30, 30, 0, 0))
+    r = quotamod.mount_report("/data")
+    assert r.inodes_total is None
+    assert r.inodes_used is None and r.inodes_fraction is None
+    text = _flat(report.render_quota(_unavailable(), ["/data"], style=PLAIN))
+    assert "inodes" not in text, text
+
+
+def test_the_document_publishes_the_inode_headroom(monkeypatch):
+    monkeypatch.setattr(os, "statvfs", lambda _p: _FakeStatvfs(100, 30, 30, 1000, 100, 40))
+    mount = report.to_json(None, None, _unavailable(), None, None, path="/data")["quota"]["mount"]
+    assert mount["inodes_used"] == 900, mount
+    assert mount["inodes_available"] == 40, mount
+    assert mount["inodes_reserved"] == 60, mount
+    assert mount["inodes_fraction"] == 900 / 940.0, mount
+
+
+def test_a_real_mount_inode_figures_agree_with_its_statvfs():
+    """The synthetic fixtures must describe the code the host actually runs."""
+    import os as _os
+
+    from rapidu.quota import mount_report
+
+    st = _os.statvfs("/tmp")
+    r = mount_report("/tmp")
+    assert r.inodes_used == st.f_files - st.f_ffree
+    assert r.inodes_avail == st.f_favail
+    assert r.inodes_reserved == max(0, st.f_ffree - st.f_favail)
+
+
+# --- Round 66: the full audit was quieter than the narrow one ----------------
+#
+# `cmd_deleted` ends with `if scan.files: rcode = EXIT_ATTENTION`. The walk's exit
+# block weighed the walk's completeness, a moved settle, GAP/INCONCLUSIVE and the
+# quota -- and not the scan. So on a real 103.8 MiB unlinked-but-open descriptor,
+# `-D` and `-a` printed the same panel and returned 1 and 0. The command
+# documented as the full audit, and the one anybody would put in cron, reported
+# success. That is the defect `_quota_needs_attention` was written for, one mode
+# over: reconciliation calling the gap CLOSES explains the bytes, it does not
+# release them.
+
+
+def _held(tmp_path, size=64 << 20):
+    """A `DeletedScan` holding one unlinked inode under `tmp_path`."""
+    from rapidu.deleted import DeletedFile, DeletedScan
+
+    scan = DeletedScan()
+    scan.available = True
+    scan.scanned_pids = 12
+    f = DeletedFile(1, 42, size, os.path.join(str(tmp_path), "held.bin"))
+    f.holders = [(4242, "python3")]
+    scan.files = [f]
+    return scan
+
+
+def _walked(tmp_path):
+    (tmp_path / "f.bin").write_bytes(b"\x5a" * 8192)
+    return ["--no-progress", "--no-box", "--color", "never", "--no-quota", str(tmp_path)]
+
+
+def test_the_full_audit_flags_an_unlinked_but_open_file(tmp_path, monkeypatch, capsys):
+    from rapidu import cli
+    from rapidu import deleted as deletedmod
+
+    monkeypatch.setattr(deletedmod, "scan", lambda *a, **k: _held(tmp_path))
+    code = cli.main(["-a"] + _walked(tmp_path))
+    assert "held by open file descriptors" in capsys.readouterr().out
+    assert code == cli.EXIT_ATTENTION, code
+
+
+def test_the_two_commands_agree_on_the_same_finding(tmp_path, monkeypatch):
+    """`-D` flagged it and `-a` did not; neither is allowed to be the quiet one."""
+    from rapidu import cli
+    from rapidu import deleted as deletedmod
+
+    monkeypatch.setattr(deletedmod, "scan", lambda *a, **k: _held(tmp_path))
+    narrow = cli.main(["-D", "--no-box", "--color", "never", str(tmp_path)])
+    full = cli.main(["-a"] + _walked(tmp_path))
+    assert narrow == full == cli.EXIT_ATTENTION, (narrow, full)
+
+
+def test_a_clean_tree_stays_quiet(tmp_path, monkeypatch):
+    """The flag must come from the finding, not from running the scan at all."""
+    from rapidu import cli
+    from rapidu import deleted as deletedmod
+    from rapidu.deleted import DeletedScan
+
+    empty = DeletedScan()
+    empty.available = True
+    empty.scanned_pids = 12
+    monkeypatch.setattr(deletedmod, "scan", lambda *a, **k: empty)
+    assert cli.main(["-a"] + _walked(tmp_path)) == cli.EXIT_OK
+
+
+def test_a_skipped_scan_flags_nothing(tmp_path, monkeypatch):
+    """`--no-deleted` measured nothing, so it may not claim anything either."""
+    from rapidu import cli
+    from rapidu import deleted as deletedmod
+
+    monkeypatch.setattr(deletedmod, "scan", lambda *a, **k: _held(tmp_path))
+    code = cli.main(["-a", "--no-deleted"] + _walked(tmp_path))
+    assert code == cli.EXIT_OK, code
+
+
+def test_a_deleted_file_outside_the_walked_path_does_not_flag_it(tmp_path, monkeypatch):
+    """`scan.under(path)` scopes the finding; the exit code follows that scope."""
+    from rapidu import cli
+    from rapidu import deleted as deletedmod
+
+    monkeypatch.setattr(deletedmod, "scan", lambda *a, **k: _held(tmp_path / "elsewhere"))
+    sub = tmp_path / "walked"
+    sub.mkdir()
+    assert cli.main(["-a"] + _walked(sub)) == cli.EXIT_OK
+
+
+def test_an_unreadable_process_count_alone_is_not_attention(tmp_path, monkeypatch):
+    """Every multi-user login node has these; flagging them would flag always."""
+    from rapidu import cli
+    from rapidu import deleted as deletedmod
+    from rapidu.deleted import DeletedScan
+
+    blind = DeletedScan()
+    blind.available = True
+    blind.scanned_pids = 60
+    blind.unreadable_pids = 541
+    monkeypatch.setattr(deletedmod, "scan", lambda *a, **k: blind)
+    assert blind.complete is False
+    assert cli.main(["-a"] + _walked(tmp_path)) == cli.EXIT_OK
+
+
+# --- Round 67: the exit code depended on the order of the arguments ----------
+#
+# Round 66's shape -- two invocations disagreeing about one finding -- swept
+# across the rest of `cli`. The walk loop assigned `rcode = EXIT_ERROR` for a path
+# that failed mid-walk and then let a *later* path assign EXIT_ATTENTION over it,
+# with `refused` (checked after the loop) counting only resolution failures. So
+# for the same two paths in the same two states:
+#
+#     rdu -a vanished full   -> 1        rdu -a full vanished   -> 2
+#
+# A path resolving and then disappearing is the live case on a shared filesystem:
+# a scratch purge, an autofs unmount, a job cleaning up underneath. EXIT_ERROR
+# outranks EXIT_ATTENTION -- `test_a_named_path_that_cannot_be_measured_is_an_error`
+# asserts it for `refused` -- so the failure is now counted like `refused` and
+# applied after the loop, where nothing in it can lower the result.
+
+
+# Three tests below need a walk that *cannot finish*, and the only portable way
+# to arrange one is a directory the owner may not read. Where the mode is not
+# enforced against the owner -- see `conftest.CHMOD_CAN_DENY` -- the fixture
+# builds a perfectly readable tree and the tests assert the opposite of what they
+# are looking at. Two neighbours that pair it with a vanished path still run:
+# their subject is the vanished path.
+needs_enforced_mode = pytest.mark.skipif(not CHMOD_CAN_DENY, reason=NEEDS_ENFORCED_MODE)
+
+
+def _incomplete(tmp_path):
+    """A walkable path whose walk cannot finish: one unreadable subdirectory."""
+    root = tmp_path / "att"
+    (root / "blocked").mkdir(parents=True)
+    (root / "f.bin").write_bytes(b"\x5a" * 512)
+    os.chmod(str(root / "blocked"), 0)
+    return root
+
+
+def _vanishing(monkeypatch, doomed):
+    """Make `_walk_with_progress` raise ENOENT for `doomed`, as a purge would."""
+    from rapidu import cli
+
+    real = cli._walk_with_progress
+
+    def flaky(path, args, style):
+        if path == str(doomed):
+            raise OSError(errno.ENOENT, "No such file or directory", path)
+        return real(path, args, style)
+
+    monkeypatch.setattr(cli, "_walk_with_progress", flaky)
+
+
+_AUDIT = ["-a", "--no-box", "--no-progress", "--no-quota", "--no-deleted", "--color", "never"]
+
+
+def test_a_failed_path_is_not_downgraded_by_a_later_warning(tmp_path, monkeypatch, capsys):
+    from rapidu import cli
+
+    gone, att = tmp_path / "gone", _incomplete(tmp_path)
+    _vanishing(monkeypatch, gone)
+    try:
+        code = cli.main(_AUDIT + [str(gone), str(att)])
+        capsys.readouterr()
+        assert code == cli.EXIT_ERROR, code
+    finally:
+        os.chmod(str(att / "blocked"), 0o755)
+
+
+def test_the_exit_code_does_not_depend_on_argument_order(tmp_path, monkeypatch, capsys):
+    from rapidu import cli
+
+    gone, att = tmp_path / "gone", _incomplete(tmp_path)
+    _vanishing(monkeypatch, gone)
+    try:
+        first = cli.main(_AUDIT + [str(gone), str(att)])
+        second = cli.main(_AUDIT + [str(att), str(gone)])
+        capsys.readouterr()
+        assert first == second == cli.EXIT_ERROR, (first, second)
+    finally:
+        os.chmod(str(att / "blocked"), 0o755)
+
+
+@needs_enforced_mode
+def test_a_warning_on_its_own_is_still_only_a_warning(tmp_path, capsys):
+    """The fix must not promote every incomplete walk to an error."""
+    from rapidu import cli
+
+    att = _incomplete(tmp_path)
+    try:
+        code = cli.main(_AUDIT + [str(att)])
+        capsys.readouterr()
+        assert code == cli.EXIT_ATTENTION, code
+    finally:
+        os.chmod(str(att / "blocked"), 0o755)
+
+
+def test_a_clean_path_beside_a_failed_one_is_still_an_error(tmp_path, monkeypatch, capsys):
+    from rapidu import cli
+
+    gone = tmp_path / "gone"
+    ok = tmp_path / "ok"
+    ok.mkdir()
+    (ok / "f.bin").write_bytes(b"\x5a" * 512)
+    _vanishing(monkeypatch, gone)
+    assert cli.main(_AUDIT + [str(ok), str(gone)]) == cli.EXIT_ERROR
+    capsys.readouterr()
+
+
+# The one asymmetry between `-Q` and `-a` that is deliberate. `cmd_quota` returns
+# EXIT_ATTENTION for an unreadable backend because reading the quota is the whole
+# of what it was asked to do; `-a` walked, ranked, scanned and said in the report
+# that there was nothing to reconcile against, so it returns EXIT_OK. Flagging it
+# there would flag on every firing on a cluster with no quota backend -- the same
+# reason 541 unreadable processes are not attention either -- and an exit code
+# that is constant carries no information. Pinned so it is not "fixed" by someone
+# reading round 67 and generalising it one step too far.
+
+
+def test_an_unreadable_quota_backend_flags_the_quota_command_only(tmp_path, monkeypatch, capsys):
+    from rapidu import cli
+    from rapidu import quota as quotamod
+
+    monkeypatch.setattr(quotamod, "read_best", lambda *a, **k: _unavailable())
+    (tmp_path / "f.bin").write_bytes(b"\x5a" * 512)
+    narrow = cli.main(["-Q", "--no-box", "--color", "never", str(tmp_path)])
+    full = cli.main(
+        ["-a", "--no-box", "--no-progress", "--no-deleted", "--color", "never", str(tmp_path)]
+    )
+    capsys.readouterr()
+    assert narrow == cli.EXIT_ATTENTION, narrow
+    assert full == cli.EXIT_OK, full
+
+
+# --- Round 68 / RD-16: an inconclusive settle check said nothing -------------
+#
+# The default `--settle-wait` is 0, so the re-stat happens at the same instant as
+# the walk and cannot observe growth however fast the tree is growing. The
+# machinery is right about that -- `SettleCheck.conclusive` is False and the
+# document publishes `settled: null` -- but the default view drew its warning from
+# a different rule: unlanded bytes exceeding the whole total. A tree whose blocks
+# land as fast as they are written trips neither, so one gaining 2 MiB/s rendered
+#
+#     56.0 MiB  .  56 inodes  .  0.00s
+#
+# with no qualifier, exactly as a static tree of the same shape does.
+#
+# Declined from the report: giving the default a small non-zero gap. `0.5s` would
+# not be a cheaper version of the check, it would be a *wrong* one -- GPFS moves
+# blocks over tens of seconds (the class docstring measures 5.58x upward over
+# ~60s), so a half-second gap finds no drift and `conclusive` becomes True with
+# `moved` False. That publishes `settled: true` for a tree about to change by a
+# factor: a false all-clear, bought at 0.5s added to every invocation. The gap
+# stays 0 and the tool says it could not tell.
+
+
+def _growing(recent=60, size=56 << 20):
+    """Blocks landed, so nothing is unlanded -- the tree is simply growing."""
+    r = WalkResult("/tmp/churn")
+    r.files, r.dirs = recent, 1
+    r.size = r.apparent = size
+    r.recent_files = recent
+    r.recent_apparent = r.recent_size = 8 << 20
+    r.settle_window = 120.0
+    return r
+
+
+def _ran(gap=0.0, drift=0, checked=60):
+    chk = SettleCheck()
+    chk.ran = True
+    chk.gap = gap
+    chk.drift = drift
+    chk.checked = checked
+    return chk
+
+
+def test_a_growing_tree_is_not_rendered_as_a_settled_measurement():
+    """RD-16's invariant: report drift, or say settling was not determined."""
+    res, chk = _growing(), _ran()
+    assert not report._headline_is_provisional(res, chk), "the old rule cannot fire here"
+    assert not chk.conclusive
+    text = _flat(report.render_compact(res, chk, 10, False, PLAIN))
+    assert "still growing" in text, text
+    assert text.count("!") >= 1, text
+
+
+def test_the_disclosure_names_the_gap_that_made_it_inconclusive():
+    text = _flat(report.render_compact(_growing(), _ran(gap=0.0), 10, False, PLAIN))
+    assert "the two readings were 0s apart" in text, text
+    assert "--settle-wait 60" in text, text
+
+
+def test_a_believable_null_outranks_the_disclosure():
+    """A gap long enough to see an effect that saw none is an answer, not a doubt."""
+    chk = _ran(gap=MIN_CONCLUSIVE_GAP_S + 1.0)
+    assert chk.conclusive and not chk.moved
+    text = _flat(report.render_compact(_growing(), chk, 10, False, PLAIN))
+    assert "still growing" not in text, text
+
+
+def test_measured_drift_outranks_the_disclosure():
+    """A figure beats a statement that no figure could be taken."""
+    text = _flat(report.render_compact(_growing(), _ran(gap=6.0, drift=12 << 20), 10, False, PLAIN))
+    assert "still growing" not in text, text
+    assert "more allocated" in text, text
+
+
+def test_an_immaterial_handful_of_fresh_files_stays_silent():
+    """The furniture guard: four new files cannot move a headline, so say nothing."""
+    res = _growing(recent=4, size=56 << 20)
+    assert not report._settling_is_material(res)
+    text = _flat(report.render_compact(res, _ran(), 10, False, PLAIN))
+    assert "still growing" not in text, text
+
+
+def test_a_settled_tree_with_nothing_recent_stays_silent():
+    res = _growing(recent=0)
+    res.recent_apparent = res.recent_size = 0
+    text = _flat(report.render_compact(res, _ran(checked=0), 10, False, PLAIN))
+    assert "still growing" not in text, text
+
+
+def test_the_document_already_said_so_and_still_does():
+    """`settled: null` and `conclusive: false` were right; do not regress them."""
+    doc = report.to_json(_growing(), _ran(), None, None, None)["settling"]
+    assert doc["settled"] is None, doc
+    assert doc["conclusive"] is False, doc
+    assert doc["recheck_gap_seconds"] == 0.0, doc
+
+
+# One padded file read "so it occupy 29.0 MiB of padding".
+
+
+def test_one_padded_file_gets_a_verb_that_agrees():
+    r = WalkResult("/tmp/pad")
+    r.files, r.dirs = 1, 1
+    r.size = 29 << 20
+    r.apparent = 1 << 10
+    r.padded_files = 1
+    r.padded_apparent = 1 << 10
+    # 64 KiB allocated for 1 KiB of data: one whole unit, 63 KiB of it padding.
+    # It used to be `(29 << 20) + (1 << 10)`, i.e. 29 MiB of padding on a single
+    # file whose unit is 64 KiB -- which cannot be a partly filled unit, and now
+    # takes the branch that says so, where there is no verb to agree. The tree
+    # gap stays 29 MiB, so the panel is still material; only this file's own
+    # share of it is now arithmetically possible.
+    r.padded_alloc = 64 << 10
+    r.alloc_bits = 64 << 10
+    text = _flat(report.render_walk(r, SettleCheck(), style=PLAIN))
+    assert "it occupies" in text, text
+    assert "it occupy " not in text, text
+
+
+def test_many_padded_files_keep_the_plural_verb():
+    r = WalkResult("/tmp/pad")
+    r.files, r.dirs = 3000, 1
+    r.size = 29 << 20
+    r.apparent = 3 << 20
+    r.padded_files = 3000
+    r.padded_apparent = 3 << 20
+    r.padded_alloc = (26 << 20) + (3 << 20)
+    r.alloc_bits = 64 << 10
+    text = _flat(report.render_walk(r, SettleCheck(), style=PLAIN))
+    assert "they occupy" in text, text
+    assert "they occupies" not in text, text
+
+
+# A flag split across a line break is advice nobody can use ---------------------
+#
+# Found while asserting the note above: `textwrap.wrap` breaks on hyphens by
+# default, so at the wrong width the remedy rendered as `(--settle-` / `wait 60 to
+# measure)`. Copying that out gives a flag that does not exist. Same family as
+# `_shell_command` refusing to print a command it cannot quote -- the tool does not
+# offer remedies it has mangled. `ui._wrap_ansi`, which does the rest of the
+# wrapping, already breaks on whitespace only.
+
+
+def _no_split_flags(lines):
+    """No rendered line may end mid-token, and every flag must survive whole.
+
+    A trailing ``--`` is the prose dash and a line of dashes is a rule; what is
+    forbidden is a hyphen still attached to a word, which is what hyphen-breaking
+    produces and what makes `--settle-` unusable.
+    """
+    for line in lines:
+        bare = line.rstrip()
+        if not bare.endswith("-") or set(bare) <= set("-\u2500 "):
+            continue
+        run = len(bare) - len(bare.rstrip("-"))
+        assert bare[-run - 1] == " ", line
+    joined = " ".join(lines)
+    for broken in ("--settle- ", "--no- ", "--settle-wait- "):
+        assert broken not in joined, joined
+
+
+def test_the_remedy_flag_survives_wrapping_at_any_width():
+    res, chk = _growing(), _ran()
+    for width in range(46, 120, 7):
+        style = ui.resolve_style("never", True)
+        style.width = width
+        lines = report.render_compact(res, chk, 10, False, style)
+        _no_split_flags(lines)
+        # The flag *name* whole; its argument may land on the next line, which is
+        # ordinary prose wrapping and not a mangled token.
+        assert "--settle-wait" in " ".join(lines), (width, lines)
+
+
+def test_the_provisional_note_flag_survives_wrapping_too():
+    """The other `textwrap` caller, which had the same default."""
+    for width in range(46, 120, 7):
+        style = ui.resolve_style("never", True)
+        style.width = width
+        lines = report.render_compact(_unsettled(), SettleCheck(), 10, False, style)
+        _no_split_flags(lines)
+        assert "--settle-wait" in " ".join(lines), (width, lines)
+
+
+# --- Round 69: a special value the tool claimed to document and did not ------
+#
+# Sweeping every mode combination and every numeric flag's zero. Three negatives
+# worth recording so they are not re-derived: the verb-agreement class from round
+# 68 is clean (the only other candidates are the imperative "use -n 0" and the
+# noun "the cost to watch"); twelve mode combinations all render and produce a
+# valid schema-5 document; and under a real bind mount -- one directory inode at
+# two paths, built in a private mount namespace -- the walk matches `du` to the
+# byte in both dimensions (4,200,142 apparent and 4,210,688 allocated), because
+# both dedupe only `nlink > 1` and a bind mount does not raise nlink.
+#
+# The one finding: `-n 0` means "every entry", the tool says so at the foot of a
+# truncated table, and `to_json`'s comment calls it "the flag documented as `0
+# means every entry`" -- but `--help` did not mention it, so the documentation
+# lived in a message you see only once the table is already cut. `--depth 0`,
+# `--threads 0` and `--quota-timeout 0` are all rejected with a reason, and
+# `--max-dirs-per-sec` documents its own zero, so this was the odd one out.
+
+
+def _help_text():
+    import io as _io
+
+    from rapidu import cli
+
+    buf = _io.StringIO()
+    cli.build_parser().print_help(buf)
+    return " ".join(buf.getvalue().split())
+
+
+def test_the_top_flag_documents_that_zero_means_every_entry():
+    text = _help_text()
+    assert "--top" in text, text
+    idx = text.index("--top")
+    window = text[idx : idx + 160]
+    assert "0 lists every entry" in window, window
+
+
+def test_flags_whose_zero_is_special_say_so_in_help():
+    """The two that accept 0 as a mode rather than a quantity."""
+    text = _help_text()
+    for flag, phrase in (("--top", "0 lists every entry"), ("--max-dirs-per-sec", "0 disables")):
+        idx = text.index(flag)
+        assert phrase in text[idx : idx + 160], (flag, text[idx : idx + 160])
+
+
+def test_flags_that_reject_zero_explain_why(capsys):
+    """Rejection is the other honest answer; it must carry a reason."""
+    import pytest
+
+    from rapidu import cli
+
+    for flag in ("--depth", "--threads", "--quota-timeout"):
+        with pytest.raises(SystemExit):
+            cli.main([flag, "0", "--no-box", "--color", "never", "/tmp"])
+        message = capsys.readouterr().err
+        assert flag.lstrip("-") in message, (flag, message)
+        assert len(message.strip().splitlines()[-1]) > 30, (flag, message)
+
+
+def test_zero_top_really_does_list_every_entry(tmp_path):
+    """The help now promises this, so hold it to the promise."""
+    root = tmp_path / "many"
+    root.mkdir()
+    for i in range(14):
+        (root / ("f%02d.bin" % i)).write_bytes(b"\x5a" * (512 * (i + 1)))
+    res = walk(str(root), threads=2, depth=1)
+    rows = report.render_entries(res, 0, False, PLAIN)
+    listed = [r for r in rows if ".bin" in r]
+    assert len(listed) == 14, len(listed)
+    assert not any("more" in r for r in rows), rows
+
+
+# --- Round 70: /proc/mounts was half-decoded, and only in one column ---------
+#
+# `mangle_path` in `fs/seq_file.c` escapes four characters -- space `\040`, tab
+# `\011`, newline `\012`, backslash `\134` -- and both parsers here decoded two,
+# under a comment that said "spaces and tabs" as though that were the rule. Worse,
+# only column two was decoded at all. Column one is the device name: it keys
+# `read_mount_table` and `_devices_of_type` hands it to `mmlsquota`/`lfs`, so an
+# NFS export like `server:/my share`, published as `my\040share`, was looked up
+# under a name no backend could recognise -- on a tool whose whole point is
+# working on somebody else's cluster.
+#
+# One helper now, used by both, with backslash decoded last: a mount point whose
+# real name holds the literal text `\040` arrives as `\134040`, and decoding
+# backslash first would turn it into a space that was never in the name.
+
+
+def _mounts_file(tmp_path, *lines):
+    path = tmp_path / "mounts"
+    path.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+    return str(path)
+
+
+def test_all_four_kernel_escapes_are_decoded():
+    from rapidu.quota import _unescape_mount_field as unescape
+
+    assert unescape(r"/mnt/my\040share") == "/mnt/my share"
+    assert unescape(r"/mnt/a\011b") == "/mnt/a\tb"
+    assert unescape(r"/mnt/a\012b") == "/mnt/a\nb"
+    assert unescape(r"/mnt/back\134slash") == "/mnt/back\\slash"
+
+
+def test_a_literal_escape_in_a_name_is_not_decoded_twice():
+    """`\\134040` is the text `\\040`, not a space. Order, not cosmetics."""
+    from rapidu.quota import _unescape_mount_field as unescape
+
+    assert unescape(r"/mnt/lit\134040eral") == r"/mnt/lit\040eral"
+
+
+def test_a_device_name_with_a_space_keeps_its_real_name(tmp_path):
+    """`_devices_of_type` hands this string to a quota backend."""
+    from rapidu.quota import _devices_of_type, read_mount_table
+
+    path = _mounts_file(
+        tmp_path,
+        r"server:/my\040share /mnt/share nfs rw 0 0",
+        r"gpfs0 /scratch gpfs rw 0 0",
+    )
+    table = read_mount_table(path)
+    assert "server:/my share" in table, sorted(table)
+    assert table["server:/my share"] == ["/mnt/share"], table
+    assert _devices_of_type(("nfs",), path) == ["server:/my share"]
+
+
+def test_a_mount_point_with_a_space_is_matched(tmp_path):
+    from rapidu.quota import _enclosing_mount, _mount_points
+
+    path = _mounts_file(tmp_path, r"gpfs0 /data/my\040project gpfs rw 0 0")
+    assert _mount_points(path) == ["/data/my project"]
+    assert _enclosing_mount("/data/my project/sub", ("gpfs",), path) == "/data/my project"
+    # And the escape text itself must no longer match, because it is not a path.
+    assert _enclosing_mount(r"/data/my\040project/sub", ("gpfs",), path) == ""
+
+
+def test_ordinary_mount_lines_are_untouched(tmp_path):
+    """The regression guard: every real line on the development host is plain."""
+    from rapidu.quota import _mount_entries
+
+    path = _mounts_file(
+        tmp_path,
+        "midway3_cap /home gpfs rw,relatime 0 0",
+        "/dev/sda1 /tmp xfs rw 0 0",
+        "tmpfs /dev/shm tmpfs rw 0 0",
+    )
+    assert _mount_entries(path) == [
+        ("midway3_cap", "/home", "gpfs"),
+        ("/dev/sda1", "/tmp", "xfs"),
+        ("tmpfs", "/dev/shm", "tmpfs"),
+    ]
+
+
+def test_the_real_mount_table_survives_the_change():
+    """Whatever this host publishes, no point may carry an escape verbatim."""
+    from rapidu.quota import _mount_entries
+
+    entries = _mount_entries()
+    assert entries, "no mounts parsed at all"
+    for _device, point, _fstype in entries:
+        assert "\\0" not in point, point
+
+
+# The three failure exits of `_run`, which every backend reaches through.
+
+
+def test_a_missing_command_reports_127(monkeypatch):
+    from rapidu import quota as quotamod
+
+    def missing(*_a, **_k):
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(quotamod.subprocess, "Popen", missing)
+    code, out, err = quotamod._run(["nosuchtool"], 1.0)
+    assert (code, out) == (127, "")
+    assert "not found" in err, err
+
+
+def test_a_hung_command_reports_124_and_is_killed(monkeypatch):
+    from rapidu import quota as quotamod
+
+    killed = []
+
+    class Hung:
+        def communicate(self, timeout=None):
+            if not killed:
+                raise quotamod.subprocess.TimeoutExpired("cmd", timeout or 0)
+            return ("", "")
+
+        def kill(self):
+            killed.append(True)
+
+    monkeypatch.setattr(quotamod.subprocess, "Popen", lambda *a, **k: Hung())
+    code, _out, err = quotamod._run(["sleep"], 3.0)
+    assert code == 124, code
+    assert killed, "a timed-out child was left running"
+    assert "timed out after 3s" in err, err
+
+
+def test_any_other_os_error_is_reported_not_raised(monkeypatch):
+    from rapidu import quota as quotamod
+
+    def denied(*_a, **_k):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(quotamod.subprocess, "Popen", denied)
+    code, out, err = quotamod._run(["mmlsquota"], 1.0)
+    assert (code, out) == (1, "")
+    assert "Permission denied" in err, err
+
+
+# --- Round 71: the stock-`quota` parser was correct and untested --------------
+#
+# Coverage said the `quota -s` reader had a dozen unentered branches, including
+# the wrapped-filesystem-name path -- `quota(1)` breaks the line when the device
+# exceeds its column, which is every NFS and CIFS mount, i.e. the sites that have
+# no vendor backend and reach this parser exclusively. Every real-world variant
+# turns out to parse correctly; what follows pins that, because an untested
+# correct parser is one edit away from an untested broken one.
+#
+# No defect found here. The shapes it rejects -- a row with no file columns, a
+# blank line before any row -- do not occur in `quota` output, and rejecting them
+# is right: the column meanings come from position, so a short row cannot be read
+# without guessing which half it is.
+
+_QHDR = (
+    "Disk quotas for user youzhi (uid 30821):\n"
+    "     Filesystem   space   quota   limit   grace   files   quota   limit   grace\n"
+)
+KB = 1024
+MB = 1024 * 1024
+
+
+def _stock(text):
+    from rapidu.quota import _parse_stock_quota
+
+    return _parse_stock_quota(text)
+
+
+def test_a_wrapped_filesystem_name_is_joined_to_its_figures():
+    """Every NFS device long enough to wrap reached this and nothing tested it."""
+    rows = _stock(
+        _QHDR + "nfsserver.example.com:/exports/home/youzhi\n"
+        "                  14000M  20480M  24576M           123456  200000  250000\n"
+    )
+    assert [r.kind for r in rows] == ["blocks", "files"], rows
+    assert rows[0].used == 14000 * MB, rows[0].used
+    assert rows[0].soft == 20480 * MB and rows[0].hard == 24576 * MB
+    assert (rows[1].used, rows[1].soft, rows[1].hard) == (123456, 200000, 250000)
+
+
+def test_plain_quota_in_kilobytes_agrees_with_dash_s_in_megabytes():
+    """`blocks` means KB and `space` means suffixed; one byte figure either way."""
+    plain = _stock(
+        "Disk quotas for user youzhi (uid 30821):\n"
+        "     Filesystem  blocks   quota   limit   grace   files   quota   limit   grace\n"
+        "      /dev/sda1 1048576 5120000 6144000           12345   50000   60000\n"
+    )
+    suffixed = _stock(
+        _QHDR + "      /dev/sda1   1024M   5000M   6000M            12345   50000   60000\n"
+    )
+    assert plain[0].used == suffixed[0].used == 1024 * MB
+    assert plain[0].soft == suffixed[0].soft == 5000 * MB
+
+
+def test_a_grace_on_the_file_limit_only_is_attributed_to_the_file_row():
+    """Seven fields, and the non-numeric token at index 6 rather than 3."""
+    rows = _stock(
+        _QHDR + "      /dev/sda1   1024M   5000M   6000M           55000*   50000   60000  7days\n"
+    )
+    blocks, files = rows
+    assert not blocks.grace, blocks.grace
+    assert files.grace == "7days", files.grace
+    assert files.used == 55000, files.used
+
+
+def test_a_grace_on_the_block_limit_only_is_attributed_to_the_block_row():
+    rows = _stock(
+        _QHDR + "      /dev/sda1  5200M*   5000M   6000M   6days    12345   50000   60000\n"
+    )
+    blocks, files = rows
+    assert blocks.grace == "6days", blocks.grace
+    assert blocks.used == 5200 * MB, blocks.used
+    assert not files.grace, files.grace
+
+
+def test_both_graces_are_read_and_not_confused():
+    rows = _stock(
+        _QHDR + "      /dev/sda1  5200M*   5000M   6000M   6days   55000*  50000   60000  7days\n"
+    )
+    assert [r.grace for r in rows] == ["6days", "7days"], [r.grace for r in rows]
+
+
+def test_a_blank_line_ends_the_user_table_before_the_group_table():
+    """`quota -s -u -g`: the scope must not leak across the gap."""
+    rows = _stock(
+        _QHDR + "      /dev/sda1   1024M   5000M   6000M            12345   50000   60000\n"
+        "\n"
+        "Disk quotas for group lab (gid 500):\n"
+        "     Filesystem   space   quota   limit   grace   files   quota   limit   grace\n"
+        "      /dev/sda1   9000M  10000M  12000M            90000  100000  120000\n"
+    )
+    assert [(r.kind, r.scope) for r in rows] == [
+        ("blocks", "user"),
+        ("files", "user"),
+        ("blocks", "group"),
+        ("files", "group"),
+    ], [(r.kind, r.scope) for r in rows]
+    assert rows[2].used == 9000 * MB
+
+
+def test_several_filesystems_each_produce_their_own_pair():
+    rows = _stock(
+        _QHDR + "      /dev/sda1   1024M   5000M   6000M            12345   50000   60000\n"
+        "      /dev/sdb1   2048M  10000M  12000M            23456  100000  120000\n"
+    )
+    assert len(rows) == 4, rows
+    assert rows[2].used == 2048 * MB and rows[3].used == 23456
+
+
+def test_a_row_too_short_to_place_its_columns_is_refused_not_guessed():
+    """`1024M 5000M 6000M` could be either half; position is the only key."""
+    assert _stock(_QHDR + "      /dev/sda1   1024M   5000M   6000M\n") == []
+    assert _stock(_QHDR + "      /dev/sda1   1024M   5000M   6000M       -       -       -\n") == []
+
+
+# --- Round 72: three properties nothing asserted -----------------------------
+#
+# No defect found. The walk is threaded with a locked merge, so a race there
+# would show up as intermittently wrong totals -- the worst kind, because the
+# number is plausible and the run is not repeatable. Measured: 28 walks over
+# seven thread counts produce one identical result, and 24 exactly-tied entries
+# order identically over 25 runs, broken by name rather than by arrival. The
+# README sells `--no-box` as diff input, which is a promise of exactly that.
+#
+# And 580 adversarial inputs across all four quota parsers raise nothing and
+# produce no negative, non-integer or mislabelled figure. A vendor on somebody
+# else's cluster can print whatever it likes; the tool has to degrade, not crash.
+
+
+def _fixture_tree(tmp_path, dirs=12, files=8):
+    for i in range(dirs):
+        d = tmp_path / ("d%02d" % i) / ("sub%d" % (i % 3))
+        d.mkdir(parents=True)
+        for j in range(files):
+            (d / ("f%02d.bin" % j)).write_bytes(b"\x5a" * (512 * ((i * j) % 7 + 1)))
+        os.symlink("f00.bin", str(d / "link"))
+    return str(tmp_path)
+
+
+def test_the_walk_reports_the_same_figures_at_every_thread_count(tmp_path):
+    root = _fixture_tree(tmp_path)
+    results = set()
+    for threads in (1, 2, 4, 8):
+        for _rep in range(2):
+            r = walk(root, threads=threads, depth=1)
+            results.add(
+                (
+                    r.size,
+                    r.apparent,
+                    r.files,
+                    r.dirs,
+                    r.symlinks,
+                    r.specials,
+                    r.inodes,
+                    r.hardlink_extra_refs,
+                    r.padded_files,
+                    r.padding,
+                    r.unstatable,
+                )
+            )
+    assert len(results) == 1, results
+
+
+def test_exactly_tied_entries_are_ordered_by_name_not_by_arrival(tmp_path):
+    """Ties are where a concurrent walk would leak its scheduling into output."""
+    for i in range(16):
+        d = tmp_path / ("dir%02d" % i)
+        d.mkdir()
+        for j in range(4):
+            (d / ("f%d.bin" % j)).write_bytes(b"\x5a" * 4096)
+    style = ui.resolve_style("never", True)
+    style.width = 100
+    renderings = set()
+    for threads in (1, 2, 4, 8):
+        for _rep in range(2):
+            r = walk(str(tmp_path), threads=threads, depth=1)
+            renderings.add("\n".join(report.render_entries(r, 0, False, style)))
+    assert len(renderings) == 1, len(renderings)
+    names = [ln.split()[-1] for ln in renderings.pop().splitlines() if "dir" in ln]
+    assert names == sorted(names), names
+
+
+def _adversarial(count=60):
+    """Deterministic: a fixed seed, so a failure is reproducible from the name."""
+    import random as _random
+
+    fixed = [
+        "",
+        "\n",
+        "\0",
+        " " * 500,
+        "Filesystem",
+        "Disk quotas for user x (uid 0):\n",
+        "no limited resources used\n",
+        "a" * 5000,
+        "\t".join(["x"] * 200),
+        "fs 1 2 3 4 5 6 7 8 9 10 11 12\n",
+        "fs -1 -2 -3 -4 -5 -6\n",
+        "fs 99999999999999999999999999 1 1 1 1 1\n",
+        "fs 1.5.5 2 3 4 5 6\n",
+        "fs NaN inf -inf 0x10 1e999 1\n",
+        "fs 1M 2G 3T 4P 5E 6Z\n",
+        "﻿/dev/sda1 1 2 3 4 5 6\n",
+        "éèê fs 1 2 3 4 5 6\n",
+        "你好 fs 1 2 3 4 5 6\n",
+        "fs 1 2 3 4 5 6\r\n",
+        "mmlsquota:1:0:no::::\n",
+        "x:y:z\n" * 50,
+    ]
+    rng = _random.Random(11)
+    while len(fixed) < count:
+        n = rng.randint(0, 60)
+        fixed.append("".join(rng.choice(" \t\n0123456789abcXY*-:/.%|") for _ in range(n)))
+    return fixed
+
+
+def test_no_quota_parser_raises_on_anything_a_backend_could_print():
+    from rapidu import quota as quotamod
+
+    calls = (
+        ("_parse_stock_quota", lambda fn, t: fn(t)),
+        ("_parse_lfs_rows", lambda fn, t: fn(t, "user", "/scratch")),
+        ("_parse_mmlsquota", lambda fn, t: fn(t, {}, ["/scratch"])),
+        ("_parse_quota_row", lambda fn, t: fn(t.splitlines()[0] if t.splitlines() else t)),
+    )
+    for name, call in calls:
+        fn = getattr(quotamod, name)
+        for text in _adversarial():
+            try:
+                call(fn, text)
+            except Exception as exc:  # noqa: BLE001 -- the assertion is "never"
+                # Chained, so the failure report carries where it actually broke
+                # rather than just the input that broke it.
+                raise AssertionError("%s raised %r on %r" % (name, exc, text[:60])) from exc
+
+
+def test_no_quota_parser_invents_an_impossible_figure():
+    """Degrading means `None`, never a negative byte count or a third `kind`."""
+    from rapidu import quota as quotamod
+
+    calls = (
+        ("_parse_stock_quota", lambda fn, t: fn(t)),
+        ("_parse_lfs_rows", lambda fn, t: fn(t, "user", "/scratch")),
+        ("_parse_mmlsquota", lambda fn, t: fn(t, {}, ["/scratch"])),
+    )
+    for name, call in calls:
+        fn = getattr(quotamod, name)
+        for text in _adversarial():
+            for row in call(fn, text) or []:
+                assert row.kind in ("blocks", "files"), (name, row.kind, text[:40])
+                for attr in ("used", "soft", "hard"):
+                    value = getattr(row, attr)
+                    assert value is None or (isinstance(value, int) and value >= 0), (
+                        name,
+                        attr,
+                        value,
+                        text[:40],
+                    )
+
+
+# --- Round 73: the one place the du-equivalence claim needed a footnote ------
+#
+# Verified first, on a tree with three links to one inode, a link crossing
+# between two subtrees, and a link whose twin lives outside the walk: `du` and
+# the walk agree to the byte on every path, in both dimensions.
+#
+# The exception is `du -s a b`, which dedupes inodes across its *arguments*. That
+# makes its per-argument figures order-dependent -- the same directory reads `23`
+# when named second and `100023` when named first -- so only their sum means
+# anything. Each `rdu` report is self-contained, which is the behaviour round 67
+# was about, and the README now says so rather than leaving "same total as du" to
+# cover a case where it does not hold.
+
+
+def _hardlinked(tmp_path):
+    """`a` and `b`, sharing one inode across the boundary between them."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    (a / "deep").mkdir(parents=True)
+    b.mkdir()
+    (a / "orig.bin").write_bytes(b"\x5a" * 300000)
+    os.link(str(a / "orig.bin"), str(a / "link1.bin"))
+    os.link(str(a / "orig.bin"), str(a / "deep" / "link2.bin"))
+    (b / "other.bin").write_bytes(b"\x5a" * 100000)
+    os.link(str(b / "other.bin"), str(a / "crosslink.bin"))
+    return a, b
+
+
+def _deduped_apparent(root):
+    """`sum(st_size)` over unique `(st_dev, st_ino)` -- the dedup rule, by hand."""
+    seen = set()
+    total = 0
+    for parent, dirs, files in os.walk(str(root)):
+        for name in [parent] + [os.path.join(parent, n) for n in dirs + files]:
+            st = os.lstat(name)
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += st.st_size
+    return total
+
+
+def test_a_shared_inode_is_counted_once_within_one_walk(tmp_path):
+    a, _b = _hardlinked(tmp_path)
+    res = walk(str(a), threads=2, depth=1)
+    # orig.bin (3 names) and crosslink.bin (1 of 2 names, the other under b).
+    assert res.hardlink_extra_refs == 2, res.hardlink_extra_refs
+    # An oracle computed independently, not derived from the answer.
+    assert res.apparent == _deduped_apparent(a), (res.apparent, _deduped_apparent(a))
+    # And it is genuinely lower than counting every name, or the test proves nothing.
+    every_name = (
+        sum(os.lstat(os.path.join(p, n)).st_size for p, ds, fs in os.walk(str(a)) for n in ds + fs)
+        + os.lstat(str(a)).st_size
+    )
+    assert every_name > res.apparent, (every_name, res.apparent)
+
+
+def test_each_path_is_measured_independently_of_the_others(tmp_path):
+    """`du` would report one of these as 23 bytes depending on the order."""
+    a, b = _hardlinked(tmp_path)
+    first = walk(str(a), threads=2, depth=1)
+    second = walk(str(b), threads=2, depth=1)
+    reversed_second = walk(str(b), threads=2, depth=1)
+    reversed_first = walk(str(a), threads=2, depth=1)
+    assert (first.apparent, first.inodes) == (reversed_first.apparent, reversed_first.inodes)
+    assert (second.apparent, second.inodes) == (
+        reversed_second.apparent,
+        reversed_second.inodes,
+    )
+    # And `b` carries its whole file, not the remainder after `a` took it.
+    assert second.apparent >= 100000, second.apparent
+
+
+def test_the_readme_states_the_multi_path_difference():
+    """The claim it qualifies is two lines above it; keep them together."""
+    text = _readme_text()
+    assert "Same total as `du`, to the byte" in text
+    assert "dedupes inodes *across* its arguments" in text, "the footnote is missing"
+
+
+# --- Round 74: the suite inherited the terminal it was run in ----------------
+#
+# `LC_ALL`, `TZ` and `PYTHONHASHSEED` all turned out not to matter -- 934 pass
+# under `C`, `en_US.UTF-8`, `UTC`, `Pacific/Kiritimati`, `Pacific/Niue` and two
+# fixed hash seeds. `COLUMNS` did: ten tests across three modules failed at 40,
+# because roughly sixty `ui.resolve_style(...)` calls -- several at module import
+# time -- read the width from the environment. Nothing was broken; they were
+# written at a different width, so a developer's terminal, a CI runner with no
+# tty and a split pane were three different suites. `tests/conftest.py` pins it.
+#
+# No package defect. `ui.terminal_width` floors at 60 and caps at 160 with its
+# reason stated in the code, so `COLUMNS=40` renders at 60 by design, and the
+# README's "the frame always closes" is about content against the frame -- which
+# holds -- not the frame against the terminal.
+
+
+def test_the_suite_runs_at_a_pinned_width():
+    """If `conftest.py` goes, this says so before ten other tests do."""
+    assert os.environ.get("COLUMNS") == "100", os.environ.get("COLUMNS")
+    assert ui.resolve_style("never", True).width == 100
+
+
+def test_the_terminal_width_floor_and_cap_are_deliberate():
+    """60 and 160, and the reason each exists, pinned against a tidy-up."""
+    import shutil as _shutil
+
+    saved = os.environ.get("COLUMNS")
+    try:
+        for requested, expected in ((10, 60), (40, 60), (60, 60), (100, 100), (500, 160)):
+            os.environ["COLUMNS"] = str(requested)
+            # `get_terminal_size` reads COLUMNS first, which is the path the whole
+            # suite depends on, so exercise that rather than a monkeypatched stub.
+            assert _shutil.get_terminal_size((100, 24)).columns == requested
+            assert ui.terminal_width() == expected, (requested, ui.terminal_width())
+    finally:
+        if saved is None:
+            del os.environ["COLUMNS"]
+        else:
+            os.environ["COLUMNS"] = saved
+
+
+def test_a_narrow_terminal_still_renders_a_closed_frame():
+    """The README's invariant: content wraps inside the frame, never past it."""
+    res = WalkResult("/tmp/narrow")
+    res.files, res.dirs = 3, 1
+    res.size = res.apparent = 300000
+    style = ui.resolve_style("never", True)
+    style.width = 60
+    lines = report.render_compact(res, SettleCheck(), 10, False, style)
+    framed = ui.box(lines, style)
+    widths = {ui.visible_width(line) for line in framed}
+    assert len(widths) == 1, sorted(widths)
+    for line in framed:
+        assert line[0] in "+|╭╰│", line
+        assert line[-1] in "+|╮╯│", line
+
+
+# --- Round 75: the broken-pipe handler had no test ---------------------------
+#
+# `cli` has a careful `BrokenPipeError` handler -- it closes stdout so the
+# interpreter's shutdown flush cannot re-raise and print a second traceback over
+# the first. It works: 391 KiB of output into `head -1` exits 0 with an empty
+# stderr. Nothing tested it, and the README recommends piping (`--no-box` "is what
+# you want when piping into grep or a diff"), so a refactor of the print path
+# could put `Exception ignored in: <_io.TextIOWrapper name='<stdout>'>` back in
+# front of users with the suite still green.
+#
+# The environment sweep around it found nothing else: `USER=root` still resolves
+# the real owner because `pwd.getpwuid(os.getuid())` is tried first and the
+# variable is only a compute-node fallback; `NO_COLOR`, `TERM=dumb`, an empty
+# `TERM`, a garbage `COLORTERM`, a `MODULEPATH` of nonexistent paths, and a
+# completely stripped `env -i` all exit 0.
+
+_PIPE_BUFFER = 65536
+
+
+def _long_named_tree(tmp_path, count=400):
+    """Output past the pipe buffer from few files: the names do the work."""
+    stem = "n" * 150
+    for i in range(count):
+        (tmp_path / ("%s%04d.bin" % (stem, i))).write_bytes(b"x" * 512)
+    return str(tmp_path)
+
+
+def _run_and_close_early(args, root):
+    """Read one line, close the pipe, and see what the writer does about it."""
+    import subprocess
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "rapidu"] + args + [root],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+    )
+    try:
+        proc.stdout.readline()
+        proc.stdout.close()
+        err = proc.stderr.read().decode("utf-8", "replace")
+    finally:
+        proc.stderr.close()
+    return proc.wait(), err
+
+
+_PIPE_ARGS = ["-n", "0", "--no-box", "--no-progress", "--no-quota", "--no-deleted"]
+
+
+def test_closing_the_pipe_early_is_not_an_error(tmp_path):
+    """`rdu -n 0 . | head -1` must say nothing and exit 0."""
+    import subprocess
+
+    root = _long_named_tree(tmp_path)
+    whole = subprocess.check_output(
+        [sys.executable, "-m", "rapidu"] + _PIPE_ARGS + ["--color", "never", root],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+    )
+    # Without this the writer never meets EPIPE and the test proves nothing.
+    assert len(whole) > _PIPE_BUFFER, len(whole)
+
+    code, err = _run_and_close_early(_PIPE_ARGS + ["--color", "never"], root)
+    assert err == "", err
+    assert code == 0, (code, err)
+
+
+def test_a_closed_pipe_prints_no_second_traceback(tmp_path):
+    """The handler closes stdout precisely so shutdown cannot re-report it."""
+    root = _long_named_tree(tmp_path)
+    _code, err = _run_and_close_early(_PIPE_ARGS + ["--color", "never"], root)
+    for marker in ("Traceback", "BrokenPipeError", "Exception ignored"):
+        assert marker not in err, (marker, err)
+
+
+def test_the_json_writer_survives_a_closed_pipe_too(tmp_path):
+    """One large blob rather than many lines, so it fails at a different write."""
+    root = _long_named_tree(tmp_path)
+    code, err = _run_and_close_early(["--json", "-n", "0", "--no-quota", "--no-deleted"], root)
+    assert err == "", err
+    assert code == 0, (code, err)
+
+
+def test_the_real_owner_wins_over_a_wrong_user_variable(monkeypatch):
+    """`USER` is environment; the uid is fact, and they can disagree."""
+    from rapidu.quota import _current_user
+
+    real = _current_user()
+    for bogus in ("root", "nosuchuser12345", ""):
+        monkeypatch.setenv("USER", bogus)
+        assert _current_user() == real, (bogus, _current_user())
+
+
+# --- Round 76: four of seven branches of the headline were never rendered ----
+#
+# `verdict_line` is the one sentence a reader acts on -- "reconciles" or
+# "UNEXPLAINED GAP" -- and coverage put `NOT_COMPARED`, `SUBTREE` with no share,
+# `INCONCLUSIVE` without agreement, and `GAP` itself outside the tested set. The
+# verdict *logic* is exhaustively reasoned in the module and, on inspection,
+# right; it is the rendering of it that nothing exercised. Given that two false
+# all-clears in this codebase were exactly this string saying the wrong thing,
+# the whole truth table is pinned below rather than the branches coverage named.
+
+
+def _rec(kind="blocks", **fields):
+    rec = rc.Reconciliation(kind)
+    for name, value in fields.items():
+        setattr(rec, name, value)
+    return rec
+
+
+def test_the_headline_for_every_verdict():
+    """One row per branch of `verdict_line`, including the four untested ones."""
+    row = QuotaRow("lab", "blocks", "group", 800 << 30, 900 << 30, 1000 << 30, mount="/scratch")
+
+    cases = [
+        (_rec(verdict=rc.NOT_COMPARED), "not compared"),
+        (_rec(verdict=rc.SUBTREE), "subtree of a larger quota'd tree"),
+        (
+            _rec(verdict=rc.SUBTREE, row=row, walk_value=80 << 30, quota_value=800 << 30),
+            "this subtree is 10.0% of the lab quota figure",
+        ),
+        (
+            _rec(verdict=rc.CLOSES, tolerance=2 << 30),
+            "reconciles (difference is within 2.0 GiB)",
+        ),
+        (
+            _rec(verdict=rc.INCONCLUSIVE, blockers=["11,267 directories could not be read"]),
+            "INCONCLUSIVE -- 11,267 directories could not be read",
+        ),
+        (
+            _rec(
+                verdict=rc.INCONCLUSIVE,
+                blockers=["the walk crossed three filesystems"],
+                gap=0,
+                tolerance=2 << 30,
+            ),
+            "INCONCLUSIVE -- the figures agree, but not soundly: "
+            "the walk crossed three filesystems",
+        ),
+        (_rec(verdict=rc.INCONCLUSIVE), "INCONCLUSIVE -- unknown"),
+        (_rec(verdict=rc.GAP), "UNEXPLAINED GAP"),
+    ]
+    for rec, expected in cases:
+        assert rc.verdict_line(rec) == expected, (rec.verdict, rc.verdict_line(rec), expected)
+
+
+def test_only_one_verdict_reads_as_an_all_clear():
+    """Every other headline must be legible as *not* an all-clear."""
+    all_clear = rc.verdict_line(_rec(verdict=rc.CLOSES, tolerance=1 << 30))
+    assert "reconciles" in all_clear
+
+    for rec in (
+        _rec(verdict=rc.NOT_COMPARED),
+        _rec(verdict=rc.SUBTREE),
+        _rec(verdict=rc.GAP),
+        _rec(verdict=rc.INCONCLUSIVE, blockers=["a floor, not a total"]),
+        _rec(verdict=rc.INCONCLUSIVE, blockers=["a floor, not a total"], gap=0, tolerance=1),
+    ):
+        line = rc.verdict_line(rec)
+        assert "reconciles" not in line, (rec.verdict, line)
+
+
+def test_an_agreement_under_a_blocker_never_states_it_unqualified():
+    """The exact shape of the two false all-clears this codebase has had."""
+    rec = _rec(
+        verdict=rc.INCONCLUSIVE,
+        blockers=["11,267 directories could not be read, so the walk total is a floor"],
+        # `within_tolerance` reads `gap`, not the two figures it came from.
+        gap=0,
+        tolerance=2 << 30,
+    )
+    line = rc.verdict_line(rec)
+    assert line.startswith("INCONCLUSIVE"), line
+    assert "not soundly" in line, line
+    # The blocker travels with the claim rather than being left further down.
+    assert "could not be read" in line, line
+
+
+def test_the_files_verdict_states_its_tolerance_as_a_count():
+    """`blocks` tolerance is bytes and `files` tolerance is inodes."""
+    as_bytes = rc.verdict_line(_rec(kind="blocks", verdict=rc.CLOSES, tolerance=2 << 30))
+    as_count = rc.verdict_line(_rec(kind="files", verdict=rc.CLOSES, tolerance=2048))
+    assert "2.0 GiB" in as_bytes, as_bytes
+    assert "2,048" in as_count, as_count
+    assert "GiB" not in as_count, as_count
+
+
+# --- Round 77: two lines of one report disagreeing about one measurement -----
+#
+# Differential testing against `du` on the messy trees a shared cluster actually
+# has. Both agree to the byte: a partly unreadable tree (150,116 apparent /
+# 155,648 allocated on both sides, and rapidu additionally labels its total a
+# FLOOR where `du` says so only on stderr, which is lost the moment you redirect),
+# and a sparse tree (15,740,984 / 12,288).
+#
+# The sparse tree exposed a contradiction. `apparent - allocated` is produced by
+# blocks that have not landed *and* by holes, and the report asserted the first
+# while the panel two lines below asserted the second:
+#
+#     ! 3 files written in the last 2m 0s, holding 15.0 MiB not yet allocated
+#       ... so the figure above is provisional
+#       15.0 MiB of data stored in 12.0 KiB -- <0.01x. These files are sparse ...
+#
+# Both cannot be true, and the second is right: a hole is not pending allocation.
+# From a single reading the two are genuinely indistinguishable -- same `st_blocks`,
+# same `st_size` -- so the fix is to stop asserting a cause and name the reading
+# that separates them, which `--settle-wait` demonstrably does.
+
+
+def _sparse_tree(tmp_path):
+    """A pure hole, a hole followed by data, and a solid file."""
+    with open(str(tmp_path / "hole.bin"), "wb") as handle:
+        handle.truncate(10 << 20)
+    with open(str(tmp_path / "mixed.bin"), "wb") as handle:
+        handle.seek(5 << 20)
+        handle.write(b"x" * 4096)
+    (tmp_path / "solid.bin").write_bytes(b"x" * 8192)
+    return str(tmp_path)
+
+
+def _du(root, apparent):
+    """`du`'s own figure. Exit 1 is not a failure here.
+
+    `du` returns 1 when any path was unreadable, and still prints the partial
+    total -- which is exactly the tree the unreadable-subtree test compares
+    against, so the status is read and discarded rather than raised on.
+    """
+    import subprocess
+
+    flag = "-sb" if apparent else "-s"
+    args = ["du", flag] + ([] if apparent else ["--block-size=1"]) + [root]
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, _err = proc.communicate()
+    assert out.strip(), "du printed no total at all for %s" % root
+    return int(out.split()[0])
+
+
+def test_du_agrees_to_the_byte_on_a_sparse_tree(tmp_path):
+    """Asserting the agreement, not the byte counts, which are per-filesystem."""
+    root = _sparse_tree(tmp_path)
+    res = walk(root, threads=2, depth=1)
+    assert res.apparent == _du(root, apparent=True), (res.apparent, _du(root, True))
+    assert res.size == _du(root, apparent=False), (res.size, _du(root, False))
+
+
+@needs_enforced_mode
+def test_du_agrees_to_the_byte_on_a_partly_unreadable_tree(tmp_path):
+    """`du` prints its refusal on stderr; the walk puts it in the report."""
+    (tmp_path / "open").mkdir()
+    (tmp_path / "open" / "a.bin").write_bytes(b"x" * 100000)
+    blocked = tmp_path / "blocked"
+    (blocked / "inner").mkdir(parents=True)
+    (blocked / "c.bin").write_bytes(b"x" * 200000)
+    os.chmod(str(blocked), 0)
+    try:
+        root = str(tmp_path)
+        res = walk(root, threads=2, depth=1)
+        assert res.apparent == _du(root, apparent=True), res.apparent
+        assert res.size == _du(root, apparent=False), res.size
+        assert not res.complete
+        assert "FLOOR" in _flat(report.render_compact(res, SettleCheck(), 10, False, PLAIN))
+    finally:
+        os.chmod(str(blocked), 0o755)
+
+
+def test_the_report_does_not_assert_a_cause_it_cannot_know(tmp_path):
+    """One reading cannot tell a hole from a block that has not landed."""
+    res = walk(_sparse_tree(tmp_path), threads=2, depth=1)
+    text = _flat(report.render_compact(res, SettleCheck(), 10, False, PLAIN))
+    assert "not yet allocated" not in text, text
+
+
+def test_the_two_explanations_of_one_gap_do_not_contradict(tmp_path):
+    """Both lines describe `apparent - allocated`; they must agree about it."""
+    res = walk(_sparse_tree(tmp_path), threads=2, depth=1)
+    text = _flat(report.render_compact(res, SettleCheck(), 10, False, PLAIN))
+    if "provisional" not in text:
+        return  # nothing claimed, nothing to contradict
+    assert "unallocated" in text, text
+    # If the sparse reading is offered at all, the other line must not assert that
+    # the same bytes are merely late.
+    if "are sparse" in text:
+        assert "look identical from one reading" in text, text
+        assert "--settle-wait 60" in text, text
+
+
+def test_a_second_reading_separates_sparseness_from_settling(tmp_path):
+    """The claim the note now makes, held to on both sides."""
+    res = walk(_sparse_tree(tmp_path), threads=2, depth=1)
+    conclusive = SettleCheck()
+    conclusive.ran = True
+    conclusive.gap = MIN_CONCLUSIVE_GAP_S + 1.0
+    assert conclusive.conclusive and not conclusive.moved
+    settled = _flat(report.render_compact(res, conclusive, 10, False, PLAIN))
+    assert "provisional" not in settled, settled
+
+    moved = SettleCheck()
+    moved.ran = True
+    moved.gap = MIN_CONCLUSIVE_GAP_S + 1.0
+    moved.drift = 24 << 20
+    growing = _flat(report.render_compact(res, moved, 10, False, PLAIN))
+    assert "more allocated" in growing, growing
+    assert "provisional" not in growing, growing

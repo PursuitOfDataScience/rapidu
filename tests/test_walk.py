@@ -12,6 +12,7 @@ import threading
 import time
 
 import pytest
+from conftest import CHMOD_CAN_DENY, NEEDS_ENFORCED_MODE
 
 from rapidu import walk as walkmod
 from rapidu.walk import MAX_THREADS, TokenBucket, walk
@@ -167,6 +168,7 @@ def test_one_file_system_flag(tree):
     assert (with_flag.files, with_flag.dirs) == (without.files, without.dirs)
 
 
+@pytest.mark.skipif(not CHMOD_CAN_DENY, reason=NEEDS_ENFORCED_MODE)
 def test_unreadable_dir_marks_result_incomplete(tmp_path):
     """An unreadable directory makes the total a floor, and must say so."""
     root = str(tmp_path / "u")
@@ -282,8 +284,16 @@ def test_hardlinks_spanning_subtrees_are_charged_once(tmp_path):
     r = walk(root, threads=2, depth=1)
     assert r.size == _du(root)
     assert r.hardlink_extra_refs == 1
-    charged = [e for e in r.top_dirs(10) if e.size > (512 << 10)]
-    assert len(charged) == 1, "the payload must be charged to exactly one subtree"
+    # Against the payload's own allocation, not against half its *apparent* size.
+    # `> (512 << 10)` reads as a margin under 1 MiB and is really an assumption
+    # that allocated tracks apparent: on an NFS export of OneFS this 1 MiB file
+    # reports 106,496 bytes of blocks, so neither subtree cleared the threshold
+    # and the count was 0 -- the test failed for the one reason it was not
+    # looking for. `alloc` is measured after `_settle`, so it is the same figure
+    # the walk charged.
+    alloc = os.lstat(target).st_blocks * 512
+    charged = [e for e in r.top_dirs(10) if e.size >= alloc]
+    assert len(charged) == 1, ("the payload must be charged to exactly one subtree", alloc, r.size)
 
 
 def test_plain_files_are_listed_too(tmp_path):
@@ -546,3 +556,141 @@ def test_a_deep_file_cannot_vouch_for_a_same_named_top_directory(tmp_path):
     r.partial = True
     r.finished_tops = set()
     assert r.top_dirs(50, finished_only=True) == []
+
+
+# --------------------------------------------------------------------------
+# How many threads, and why that is a question about the filesystem
+# --------------------------------------------------------------------------
+#
+# Threads hide latency. Where there is none they are pure overhead, and the bill
+# is not small: one 151k-inode tree on page-cached local xfs took 0.69s and 0.69s
+# of CPU serially against 2.34s and 3.60s at sixteen threads -- 3.4x the wall
+# time and 5.2x the CPU to do the same work. On GPFS the same sixteen threads
+# save a fifth of the wall time. So the number has to come from the storage, and
+# `choose_threads` is where that happens.
+#
+# Every test below is about the *asymmetry*: the choice may only go down, and
+# only when two independent signals agree, so that each way of being wrong lands
+# on the previous behaviour rather than on a 9x regression.
+
+
+def _fixed(monkeypatch, fstype, latency):
+    monkeypatch.setattr(walkmod, "_fstype_of", lambda _p, **_k: fstype)
+    monkeypatch.setattr(walkmod, "_probe_latency_us", lambda _p, **_k: latency)
+
+
+def test_an_explicit_thread_count_is_a_decision_not_a_hint(monkeypatch):
+    """`-t` wins over anything measured, in both directions."""
+    _fixed(monkeypatch, "tmpfs", 1.0)
+    assert walkmod.choose_threads("/anywhere", 8) == 8
+    assert walkmod.choose_threads("/anywhere", 1) == 1
+    _fixed(monkeypatch, "gpfs", 400.0)
+    assert walkmod.choose_threads("/anywhere", 2) == 2
+
+
+def test_an_explicit_count_is_still_clamped(monkeypatch):
+    _fixed(monkeypatch, "gpfs", 400.0)
+    assert walkmod.choose_threads("/anywhere", 999) == walkmod.MAX_THREADS
+    assert walkmod.choose_threads("/anywhere", 0) == 1
+
+
+def test_local_and_cheap_walks_serially(monkeypatch):
+    """Both signals agree, so there is no latency to hide and nothing to gain."""
+    _fixed(monkeypatch, "xfs", 2.0)
+    assert walkmod.choose_threads("/tmp/x") == walkmod.LOCAL_THREADS
+    _fixed(monkeypatch, "tmpfs", 1.7)
+    assert walkmod.choose_threads("/dev/shm/x") == walkmod.LOCAL_THREADS
+
+
+def test_a_cold_local_disk_keeps_its_threads(monkeypatch):
+    """A local seek is 100us on NVMe and milliseconds on a platter.
+
+    That is latency, and threads hide it exactly as they do on GPFS -- so the
+    filesystem type alone must not be allowed to decide this.
+    """
+    _fixed(monkeypatch, "xfs", 120.0)
+    assert walkmod.choose_threads("/tmp/cold") == walkmod.DEFAULT_THREADS
+    _fixed(monkeypatch, "ext4", 5000.0)
+    assert walkmod.choose_threads("/mnt/platter") == walkmod.DEFAULT_THREADS
+
+
+def test_a_warm_parallel_filesystem_keeps_its_threads(monkeypatch):
+    """The trap the type check exists to close.
+
+    A *cached* GPFS home probed at 7.2us against local xfs at 2.0us -- 3.5x
+    apart, on a filesystem where dropping to one thread costs 9x. Latency alone
+    would have taken that bait, so the type is consulted first and settles it.
+    """
+    _fixed(monkeypatch, "gpfs", 2.6)
+    assert walkmod.choose_threads("/home/u") == walkmod.DEFAULT_THREADS
+    _fixed(monkeypatch, "nfs", 3.0)
+    assert walkmod.choose_threads("/home/u") == walkmod.DEFAULT_THREADS
+    _fixed(monkeypatch, "lustre", 1.0)
+    assert walkmod.choose_threads("/scratch") == walkmod.DEFAULT_THREADS
+
+
+def test_an_unrecognised_filesystem_changes_nothing(monkeypatch):
+    """The list is short on purpose; absence means "behave as before"."""
+    for fstype in ("", "somethingnew", "overlay", "fuse.sshfs"):
+        _fixed(monkeypatch, fstype, 1.0)
+        assert walkmod.choose_threads("/x") == walkmod.DEFAULT_THREADS, fstype
+
+
+def test_no_evidence_is_not_evidence_of_speed(monkeypatch):
+    """An empty or unreadable directory yields no median, which decides nothing."""
+    _fixed(monkeypatch, "xfs", None)
+    assert walkmod.choose_threads("/tmp/empty") == walkmod.DEFAULT_THREADS
+
+
+def test_the_probe_reports_nothing_for_an_empty_directory(tmp_path):
+    assert walkmod._probe_latency_us(str(tmp_path)) is None
+
+
+def test_the_probe_reports_nothing_for_a_missing_directory(tmp_path):
+    assert walkmod._probe_latency_us(str(tmp_path / "nope")) is None
+
+
+def test_the_probe_measures_something_positive(tmp_path):
+    for i in range(5):
+        (tmp_path / ("f%d" % i)).write_bytes(b"x")
+    got = walkmod._probe_latency_us(str(tmp_path))
+    assert got is not None and got > 0.0
+
+
+def test_the_enclosing_mount_is_the_longest_match(tmp_path):
+    """Nested mounts are ordinary: an autofs `/home` over one NFS mount per user.
+
+    The answer for `/home/me/x` is `me`'s own filesystem, not the map above it.
+    """
+    table = tmp_path / "mounts"
+    table.write_text(
+        "proc /proc proc rw 0 0\n"
+        "auto.home /home autofs rw 0 0\n"
+        "server:/export/me /home/me nfs rw 0 0\n"
+        "/dev/sda1 / xfs rw 0 0\n"
+    )
+    assert walkmod._fstype_of("/home/me/deep/x", str(table)) == "nfs"
+    assert walkmod._fstype_of("/home/other", str(table)) == "autofs"
+    assert walkmod._fstype_of("/var/tmp", str(table)) == "xfs"
+
+
+def test_a_name_that_merely_shares_a_prefix_is_not_the_mount(tmp_path):
+    """`/homework` is not inside `/home`; only a separator says otherwise."""
+    table = tmp_path / "mounts"
+    table.write_text("server:/e /home nfs rw 0 0\n/dev/sda1 / xfs rw 0 0\n")
+    assert walkmod._fstype_of("/homework/x", str(table)) == "xfs"
+    assert walkmod._fstype_of("/home/x", str(table)) == "nfs"
+
+
+def test_a_missing_mount_table_decides_nothing(tmp_path):
+    assert walkmod._fstype_of("/anywhere", str(tmp_path / "nope")) == ""
+
+
+def test_the_walk_uses_the_count_it_chose(tmp_path, monkeypatch):
+    """`WalkResult.threads` has to be what actually ran, adaptive or not."""
+    (tmp_path / "f").write_bytes(b"x" * 64)
+    _fixed(monkeypatch, "tmpfs", 1.0)
+    assert walk(str(tmp_path)).threads == walkmod.LOCAL_THREADS
+    _fixed(monkeypatch, "gpfs", 400.0)
+    assert walk(str(tmp_path)).threads == walkmod.DEFAULT_THREADS
+    assert walk(str(tmp_path), threads=3).threads == 3

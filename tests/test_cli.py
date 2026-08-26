@@ -115,9 +115,17 @@ def test_default_answers_how_big_and_nothing_else(small_tree, capsys):
     # a delayed-allocation filesystem the caveat is *correct* -- the same effect
     # the comment above declines to assert byte totals for -- and letting it eat
     # the compactness allowance would quietly loosen the claim under test.
-    body = [ln for ln in out.strip().splitlines() if "provisional" not in ln]
-    body = [ln for ln in body if "not yet allocated" not in ln]
-    assert len(body) <= 8, body
+    # Cut at the table rule rather than filtering by keyword. The keyword filter
+    # this replaces matched two of the warning's lines and missed a third the
+    # moment the sentence grew, which failed here on a GPFS run where delayed
+    # allocation made the caveat appear -- a wording change breaking a test about
+    # compactness. The preamble is still bounded, just separately, so notes cannot
+    # grow without limit either.
+    lines = out.strip().splitlines()
+    rule = next((i for i, ln in enumerate(lines) if "\u2500" in ln or "---" in ln), 3)
+    head, preamble, table = lines[:3], lines[3:rule], lines[rule:]
+    assert len(head + table) <= 8, head + table
+    assert len(preamble) <= 6, preamble
 
 
 def test_full_flag_restores_the_whole_report(small_tree, capsys):

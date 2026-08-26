@@ -31,6 +31,60 @@ from .fmt import (
 from .quota import QuotaSnapshot
 from .walk import SettleCheck, WalkResult
 
+# The width the report lays its *elastic* content out to, which is not the width
+# of the terminal.
+#
+# Prose can wrap anywhere. A table row, a path, a bar cannot -- they have a
+# natural width and breaking them damages them. So the report's width has to be
+# decided by the inelastic content and the elastic content has to conform, or one
+# wrapped sentence sets the width of everything else.
+#
+# It did. `ui.box` hugs the widest line it is given, prose wrapped to the
+# terminal and the table laid itself out to its own natural width, so the same
+# command in the same 125-column terminal drew an 84-column frame for a clean
+# tree and a 125-column one the moment an allocation warning fired -- with the
+# table stranded in a 41-column gutter beside it. Measured on this host at
+# COLUMNS=125: table 80, prose 121. Two invocations a second apart looked like
+# two different tools.
+#
+# 78 is not a new number. It is what this rule was already capped at, and the
+# ranked table's rule is that plus its two-column indent; naming it once is what
+# stops the three from drifting apart again. The frame stays free to grow past it
+# for a long path, which is inelastic content and the answer being asked for.
+_RULE_COLUMNS = 78
+_LAYOUT_COLUMNS = _RULE_COLUMNS + 2
+
+
+def _layout_width(style: "ui.Style") -> int:
+    """Columns available to elastic content: the layout, bounded by the terminal.
+
+    Bounded rather than fixed -- on a 60-column terminal the layout *is* 60 and
+    prose still has to fit inside it. The cap only bites upwards.
+    """
+    return min(style.width, _LAYOUT_COLUMNS)
+
+
+def _warn_wrapped(note: str, style: "ui.Style") -> "List[str]":
+    """A ``!`` warning wrapped to the layout, with its continuations aligned.
+
+    Hanging indent: the first line carries the ``! `` that makes a warning
+    findable and the rest align under it. Letting :func:`ui.box` wrap it instead
+    put the continuation at column zero, level with the report's own margin,
+    where it read as a second unrelated statement.
+
+    Written out twice already and needed a third time for the allocation
+    headline, which was appended unwrapped -- 91 columns of prose that set the
+    width of the whole frame on its own. See :data:`_LAYOUT_COLUMNS`.
+    """
+    import textwrap
+
+    chunks = textwrap.wrap(note, max(40, _layout_width(style) - 4), break_on_hyphens=False)
+    if not chunks:
+        return []
+    out = [ui.warn(chunks[0], style)]
+    out.extend(style.paint("  " + extra, "yellow") for extra in chunks[1:])
+    return out
+
 
 def _section_rule(style: "ui.Style") -> str:
     """A section divider in the same glyph and grey as the table's own rule.
@@ -40,7 +94,7 @@ def _section_rule(style: "ui.Style") -> str:
     and one ASCII one.
     """
     glyph = "\u2500" if style.unicode else "-"
-    return style.paint(glyph * max(20, min(78, style.width - 1)), style.track)
+    return style.paint(glyph * max(20, min(_RULE_COLUMNS, style.width - 1)), style.track)
 
 
 def _uname(uid: int) -> str:
@@ -212,15 +266,38 @@ def _inode_breakdown(res: WalkResult) -> str:
     Symlinks get their own term when there are any, so the parts still add up to
     the total and nothing has to be inferred. Each is pluralised, which the old
     line also did not do: one directory printed ``1 dirs``.
+
+    ``specials`` -- sockets, fifos, devices -- got a term for the same reason.
+    ``walk`` counts them in ``files`` like any other non-directory entry, so the
+    term named ``files`` quietly absorbed them: a tree of one file, one symlink,
+    one fifo and one socket printed ``3 files`` where ``find -type f`` found one,
+    and a real 27,415-inode home printed one more than ``find`` could account
+    for, the culprit being a single ssh ControlMaster socket. Every term is now
+    checkable against the ``find -type`` that measures it.
+
+    Under ``-c`` there is no ``stat`` and so no ``st_mode``: the walk separates
+    directories from the rest off ``d_type`` and knows nothing else about them.
+    That mode gets one honest term, ``non-dirs``, rather than a three-way split
+    it never measured.
     """
     nondir = res.files - res.hardlink_extra_refs
-    # `symlinks` counts names and `nondir` inodes, so a hard-linked symlink could
-    # in principle push the term past the whole; clamp so the parts never exceed
-    # the sum they are explaining.
+    if res.count_only:
+        # `-c` never stats, so the walk knows only directory from non-directory,
+        # off `d_type`. Which non-directories are files, symlinks or sockets it
+        # did not measure -- so a term reading "files" would name a split that
+        # never happened, and did: a tree of one file, one symlink, one fifo and
+        # one socket reported "4 files".
+        return " + ".join([plural(nondir, "non-dir"), plural(res.dirs, "dir")])
+    # `symlinks` and `specials` count names and `nondir` inodes, so a hard-linked
+    # one could in principle push a term past the whole; clamp so the parts never
+    # exceed the sum they are explaining.
     syms = min(res.symlinks, max(nondir, 0))
-    parts = [plural(nondir - syms, "file")]
+    spec = min(res.specials, max(nondir - syms, 0))
+    parts = [plural(nondir - syms - spec, "file")]
     if syms:
         parts.append(plural(syms, "symlink"))
+    if spec:
+        parts.append(plural(spec, "special"))
     parts.append(plural(res.dirs, "dir"))
     return " + ".join(parts)
 
@@ -283,14 +360,23 @@ def _mount_fallback(paths: List[str], style: ui.Style) -> List[str]:
             continue
         seen.add(key)
         where = ui.printable(report.mount or path)
+        # Where blocks are held back for root, `used + avail` falls short of
+        # `total` and three numbers on one line stop adding up, which reads as an
+        # arithmetic error in the tool. Name the remainder instead of leaving it
+        # to be noticed.
+        tail = "{} free".format(human_bytes(report.avail))
+        if report.reserved:
+            tail = "{} free to you and {} reserved for root".format(
+                human_bytes(report.avail), human_bytes(report.reserved)
+            )
         out.extend(
             _wrapped(
-                "the mount at {} reports {} of {} used ({}), {} free".format(
+                "the mount at {} reports {} of {} used ({}), {}".format(
                     where,
                     human_bytes(report.used),
                     human_bytes(report.total),
                     pct(report.fraction, 1.0),
-                    human_bytes(report.avail),
+                    tail,
                 ),
                 style,
                 "  ",
@@ -298,11 +384,21 @@ def _mount_fallback(paths: List[str], style: ui.Style) -> List[str]:
             )
         )
         if report.inodes_total:
-            used = report.inodes_total - (report.inodes_free or 0)
+            # The byte line above carries a percentage and this one did not, so a
+            # mount 93.3% out of inodes sat under a headline reading 88.5% and the
+            # reader had to divide nine-digit numbers to find which resource was
+            # nearer the wall. An inode quota is the one that bites without
+            # warning; it gets the same treatment as the bytes.
+            inode_tail = ""
+            if report.inodes_reserved:
+                inode_tail = ", {} reserved for root".format(human_count(report.inodes_reserved))
             out.extend(
                 _wrapped(
-                    "and {} of {} inodes".format(
-                        human_count(used), human_count(report.inodes_total)
+                    "and {} of {} inodes ({}){}".format(
+                        human_count(report.inodes_used),
+                        human_count(report.inodes_total),
+                        pct(report.inodes_fraction, 1.0),
+                        inode_tail,
                     ),
                     style,
                     "    ",
@@ -794,9 +890,45 @@ def reclaimable_groups(
 
     # A nested match sits inside its parent's total already, so reporting both
     # counts the same bytes twice.
+    #
+    # Asked of each path's own ancestors rather than of every other match. The
+    # `any(... for other in paths)` this replaces was O(n^2) in the number of
+    # matches, and n is not small: a tree of Python packages matched 6,001
+    # `__pycache__` directories, so the check ran 36 million `startswith` calls
+    # and took **7.9 seconds** -- a fifth of the entire runtime of `rdu -a` on
+    # that tree, spent in a summary of sixty rows. The ancestor walk does the
+    # same work in 0.07s, and on that tree both keep the identical 5,959 paths.
+    #
+    # It is the same question, not an approximation of it: `other + os.sep` being
+    # a prefix of `path` is exactly "`other` is a proper ancestor directory of
+    # `path`", and walking `dirname` upwards enumerates those and nothing else.
+    # Ancestors are bounded by path depth where the old form was bounded by the
+    # number of matches, which is why one scales and the other does not.
     paths = {m[0] for m in matched}
     for path, size, inodes, pattern in matched:
-        if any(other != path and path.startswith(other + os.sep) for other in paths):
+        nested = False
+        current = path
+        while True:
+            parent = os.path.dirname(current)
+            # `dirname` is its own fixed point at "/" and at "", which is what
+            # ends this loop -- there is no sentinel to compare against.
+            if parent == current:
+                break
+            current = parent
+            # `"/"` and `""` are excluded because the form this replaces could
+            # never match them: it asked `path.startswith(other + os.sep)`, and
+            # for a root `other` that is `"//"`, which no path begins with. So a
+            # `"/"` in the set was every absolute path's ancestor here and none
+            # of their ancestor there -- a differential run over 4,000 random
+            # path sets found the two disagreeing on 211 of them, always this.
+            # `_reclaimable_match` cannot return a bare root today (it needs a
+            # separator before the pattern, so `"/"` normalises to `""` and
+            # matches nothing), which is why this was invisible; a guard that
+            # costs one comparison is cheaper than depending on that.
+            if current in paths and current not in ("/", ""):
+                nested = True
+                break
+        if nested:
             continue
         groups.setdefault(pattern, []).append((size, inodes, path))
 
@@ -872,9 +1004,15 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
         else:
             label = "{}x {}".format(len(hits), pattern)
         out.append(
-            "  {:>10}  {:>10} inodes  {}".format(
+            # `noun`, not a hard-coded `inodes`: the total line below already
+            # agrees via `plural` and these rows did not, so a single-inode
+            # match printed `1 inodes` directly above `... reclaimable in
+            # total`. The label sits in a fixed-width field so the path column
+            # does not shift by the one character between the two forms.
+            "  {:>10}  {:>10} {:<8}{}".format(
                 style.paint("n/a" if counts else human_bytes(size), "bold"),
                 human_count(inodes),
+                noun(inodes, "inode"),
                 label,
             )
         )
@@ -1043,8 +1181,14 @@ def render_age(res: WalkResult, style: ui.Style) -> List[str]:
         # from the bucket itself so the two cannot drift apart; `find` counts whole
         # 24-hour periods, so the edge of the range can differ by a day, and the
         # sentence claims a listing rather than a matching count.
+        # `-xdev` exactly when the walk was bounded by `-x`. Without it the
+        # command crosses a mount boundary the walk stopped at, so it lists files
+        # this section never counted -- a command that answers a different question
+        # from the finding it is printed under.
+        bounded = " -xdev" if res.one_file_system else ""
         command = _shell_command(
-            "find {path} ! -type d -mtime +%d" % walkmod.AGE_BUCKET_DAYS[-1], res.root
+            "find {path}%s ! -type d -mtime +%d" % (bounded, walkmod.AGE_BUCKET_DAYS[-1]),
+            res.root,
         )
         out.append(
             style.paint(
@@ -1918,7 +2062,6 @@ def _hard_warnings(
         # empty". Every other bound this walk applies is published; so is this one.
         # The paths are named because they are what makes the number actionable --
         # they are the mounts to walk separately.
-        import textwrap
 
         note = (
             "{} {} on other filesystems skipped (-x): this total covers one "
@@ -1926,14 +2069,7 @@ def _hard_warnings(
                 human_count(res.crossed), "entry" if res.crossed == 1 else "entries"
             )
         )
-        # Hanging indent: the first line carries the "! " that makes a warning
-        # findable, and the rest align under it. Letting the frame wrap this
-        # instead put the continuation at column zero, where it read as a second,
-        # unrelated statement.
-        chunks = textwrap.wrap(note, max(40, style.width - 4))
-        out.append(ui.warn(chunks[0], style))
-        for extra in chunks[1:]:
-            out.append(style.paint("  " + extra, "yellow"))
+        out.extend(_warn_wrapped(note, style))
         # `... and 1 more` costs the same line as the path itself and leaves the
         # count unverifiable: on a /scratch with four mounts it showed three paths
         # and hid the fourth, and the correct 4 was read as a double-counted 3.
@@ -2050,7 +2186,16 @@ def render_walk(
                 plural(res.hardlink_extra_refs, "extra name"),
             )
         )
-    if scan is not None and scan.available and not scan.files:
+    if scan is not None and scan.available and scan.silly_renamed:
+        # Named on the facts line for the same reason the walk's own figures are:
+        # this is the line a reader of `rdu -a` scans, and on an NFS site it was
+        # the line that said the space was not there.
+        facts.append(
+            "{} held by deleted-but-open files on NFS (see below)".format(
+                human_bytes(scan.silly_renamed_size)
+            )
+        )
+    elif scan is not None and scan.available and not scan.files:
         # "none visible", not "none": this scan sees neither other users'
         # processes nor any compute node. See `render_deleted`.
         facts.append(
@@ -2085,8 +2230,11 @@ def render_walk(
             res.by_uid.items(), key=lambda kv: kv[1][0], reverse=True
         )[:_OWNER_SHOW]:
             out.append(
-                "      {:<16}{:>12}  {:>12} inodes".format(
-                    _uname(uid), human_bytes(size), human_count(inodes)
+                # See the reclaim rows: the count is right-aligned in its column
+                # and the noun agrees outside it, which is what `noun` is for. A
+                # home shared with one root-owned file printed `1 inodes` here.
+                "      {:<16}{:>12}  {:>12} {}".format(
+                    _uname(uid), human_bytes(size), human_count(inodes), noun(inodes, "inode")
                 )
             )
         out.extend(_and_more(len(res.by_uid), _OWNER_SHOW, "owners", style))
@@ -2101,8 +2249,8 @@ def render_walk(
             res.by_gid.items(), key=lambda kv: kv[1][0], reverse=True
         )[:_OWNER_SHOW]:
             out.append(
-                "      {:<16}{:>12}  {:>12} inodes".format(
-                    _gname(gid), human_bytes(size), human_count(inodes)
+                "      {:<16}{:>12}  {:>12} {}".format(
+                    _gname(gid), human_bytes(size), human_count(inodes), noun(inodes, "inode")
                 )
             )
         out.extend(_and_more(len(res.by_gid), _OWNER_SHOW, "groups", style))
@@ -2208,8 +2356,12 @@ def render_settle(
         # without saying by how much, so a reader had no way to tell a tree that
         # might move by a kilobyte from one that will move by a factor -- and it
         # is the same measurement the default view now gates on.
+        # "not yet allocated" asserted a cause. The measurement is that the bytes
+        # are *unallocated*; whether they are still coming or were never going to
+        # is what the sparse/compressed panel above answers, and this line used to
+        # contradict it in the same report.
         held = (
-            ", holding {} not yet allocated".format(human_bytes(_unlanded_bytes(res)))
+            ", holding {} unallocated".format(human_bytes(_unlanded_bytes(res)))
             if _headline_is_provisional(res, settle)
             else ""
         )
@@ -2387,7 +2539,7 @@ def _packed(items: List[str], style: "ui.Style", indent: str, sep: str = "  ") -
     to remove. Packing at item boundaries keeps every fact whole and still fits
     the width.
     """
-    width = max(40, style.width - len(indent) - 1)
+    width = max(40, _layout_width(style) - len(indent) - 1)
     lines = []  # type: List[str]
     current = ""
     for item in items:
@@ -2413,8 +2565,9 @@ def _wrapped(text: str, style: ui.Style, indent: str, tone: str = "dim") -> List
     """
     import textwrap
 
-    width = max(40, style.width - len(indent) - 1)
-    return [style.paint(indent + line, tone) for line in textwrap.wrap(text, width)]
+    width = max(40, _layout_width(style) - len(indent) - 1)
+    wrapped = textwrap.wrap(text, width, break_on_hyphens=False)
+    return [style.paint(indent + line, tone) for line in wrapped]
 
 
 def render_allocation(res: WalkResult, style: ui.Style, indent: str = "  ") -> List[str]:
@@ -2452,7 +2605,7 @@ def render_allocation(res: WalkResult, style: ui.Style, indent: str = "  ") -> L
         head = "{} allocated for {} of data {} {}".format(
             human_bytes(res.size), human_bytes(res.apparent), ui.dash(style), ratio_x(ratio)
         )
-        out.append(ui.warn(head + ". Your quota is charged the first number.", style))
+        out.extend(_warn_wrapped(head + ". Your quota is charged the first number.", style))
         if res.padded_files and res.padding > 0:
             mean = res.padded_apparent // res.padded_files
             # The unit clause is dropped when the unit could not be measured, and
@@ -2465,22 +2618,58 @@ def render_allocation(res: WalkResult, style: ui.Style, indent: str = "  ") -> L
             # so `unit` was `None`, and 21.4 MiB of padding across 50,000 files
             # went unmentioned on the most packable tree there is.
             against = " against a {} allocation unit".format(human_bytes(unit)) if unit else ""
-            out.extend(
-                _wrapped(
-                    "{} {} {}{}, so {} occupy {} of"
-                    " padding. Packing them (tar, squashfs, a single archive)"
-                    " returns it.".format(
-                        plural(res.padded_files, "file"),
-                        "averages" if res.padded_files == 1 else "average",
-                        human_bytes(mean),
-                        against,
-                        "it" if res.padded_files == 1 else "they",
-                        human_bytes(res.padding),
-                    ),
-                    style,
-                    indent + "  ",
+            # A gap larger than partly filled units can produce is not padding,
+            # whatever it is, and the remedy printed for it must not be
+            # "packing returns it". See `WalkResult.unit_padding_ceiling`: on an
+            # NFS-exported OneFS home the gap was 4.5x the ceiling, and the
+            # overhead there is charged per byte stored, so a tarball of the same
+            # data carries it too. Both operands are the tool's own measurements,
+            # so the split needs no site knowledge and no threshold -- above the
+            # ceiling the arithmetic refutes the mechanism, below it nothing
+            # changes and the GPFS advice this panel was written for still prints.
+            ceiling = res.unit_padding_ceiling
+            if ceiling is not None and res.padding > ceiling:
+                out.extend(
+                    _wrapped(
+                        "{} {} {}. Partly filled {} units account for at most {}"
+                        " of the {} gap; the remaining {} scales with the data"
+                        " rather than with the file count -- replication, erasure"
+                        " coding or per-block checksums -- and packing will not"
+                        " return it.".format(
+                            plural(res.padded_files, "file"),
+                            "averages" if res.padded_files == 1 else "average",
+                            human_bytes(mean),
+                            human_bytes(unit),
+                            human_bytes(ceiling),
+                            human_bytes(res.padding),
+                            human_bytes(res.padding - ceiling),
+                        ),
+                        style,
+                        indent + "  ",
+                    )
                 )
-            )
+            else:
+                out.extend(
+                    _wrapped(
+                        "{} {} {}{}, so {} {} of"
+                        " padding. Packing them (tar, squashfs, a single archive)"
+                        " returns it.".format(
+                            plural(res.padded_files, "file"),
+                            "averages" if res.padded_files == 1 else "average",
+                            human_bytes(mean),
+                            against,
+                            # The subject and its verb agree together or not at
+                            # all. `averages` and `it` were conditional here and
+                            # `occupy` was not, so one padded file read "1 file
+                            # averages 22.1 MiB ..., so it occupy 29.0 MiB of
+                            # padding".
+                            "it occupies" if res.padded_files == 1 else "they occupy",
+                            human_bytes(res.padding),
+                        ),
+                        style,
+                        indent + "  ",
+                    )
+                )
     else:
         out.extend(
             _wrapped(
@@ -2586,26 +2775,46 @@ def _provisional_note(res: WalkResult, settle: SettleCheck, style: ui.Style) -> 
 
     Silent when the re-stat already found drift, because :func:`_hard_warnings`
     reports that -- with a figure, which is strictly better than this estimate.
-    """
-    if settle.moved or not _headline_is_provisional(res, settle):
-        return []
-    import textwrap
 
-    note = (
-        "{} in the last {}, holding {} not yet allocated -- more than this whole"
-        " total, so the figure above is provisional (--settle-wait 60 to"
-        " measure)".format(
-            _settle_subject(res),
-            human_duration(res.settle_window),
-            human_bytes(_unlanded_bytes(res)),
+    **The second branch is about growth, not about landing.** The rule above is a
+    ratio between bytes that have not been allocated yet and the total; a tree
+    whose blocks land as fast as they are written trips neither it nor
+    ``settle.moved``, because the default re-stat gap is 0s and a re-stat taken at
+    the same instant as the walk cannot see growth at all. So a tree gaining
+    2 MiB/s rendered ``56.0 MiB`` with no qualifier -- byte-identical to a static
+    tree of the same shape, which is the one thing a reader would use to tell them
+    apart. The check ran, did the work, and could not conclude; that is what gets
+    said. ``_settling_is_material`` gates it, so the run where a handful of fresh
+    files cannot move the headline stays silent and the line does not become
+    furniture.
+    """
+    if settle.moved:
+        return []
+
+    if _headline_is_provisional(res, settle):
+        note = (
+            "{} in the last {}, holding {} unallocated -- more than this whole"
+            " total, so the figure above is provisional. Blocks still to land and"
+            " a sparse file look identical from one reading; --settle-wait 60"
+            " tells them apart".format(
+                _settle_subject(res),
+                human_duration(res.settle_window),
+                human_bytes(_unlanded_bytes(res)),
+            )
         )
-    )
-    # Hanging indent, as the `-x` note does it: the first line carries the "! "
-    # that makes a warning findable and the rest align under it.
-    chunks = textwrap.wrap(note, max(40, style.width - 4))
-    out = [ui.warn(chunks[0], style)]
-    out.extend(style.paint("  " + extra, "yellow") for extra in chunks[1:])
-    return out
+    elif settle.ran and not settle.conclusive and _settling_is_material(res):
+        note = (
+            "{} in the last {}, and the two readings were {} apart -- too close"
+            " together to tell whether this tree is still growing, so the total"
+            " above may be a moving figure (--settle-wait 60 to measure)".format(
+                _settle_subject(res),
+                human_duration(res.settle_window),
+                human_duration(settle.gap),
+            )
+        )
+    else:
+        return []
+    return _warn_wrapped(note, style)
 
 
 def _settling_is_material(res: WalkResult) -> bool:
@@ -2618,6 +2827,68 @@ def _settling_is_material(res: WalkResult) -> bool:
     if not moving:
         return False
     return moving >= max(50, res.inodes // 100) or res.recent_apparent >= (256 << 20)
+
+
+def _render_silly_renamed(scan: DeletedScan, top: int, style: ui.Style) -> List[str]:
+    """The NFS form of this section's subject, when the scan found any.
+
+    Reported here rather than in its own section because it is the same event --
+    deleted, still open, still charged -- and a reader looking for held space
+    should find both answers in one place. Reported *separately* within it
+    because the two differ in the one respect this section's headline claims:
+    these are visible to ``du``, under a name that explains nothing. Without it
+    the panel said "none found" on every NFS site no matter how much was held,
+    which is true and useless.
+
+    The remedy is different too, and worth stating: the entry disappears on its
+    own when the last descriptor closes, so there is nothing to delete and
+    deleting it by hand does not free the blocks any sooner.
+    """
+    if not scan.silly_renamed:
+        return []
+    out = [
+        "",
+        "  {} {}".format(
+            style.paint(human_bytes(scan.silly_renamed_size), "bold_red"),
+            style.paint(
+                "held by deleted-but-open files on an NFS mount ({})".format(
+                    plural(len(scan.silly_renamed), "inode")
+                ),
+                "bold",
+            ),
+        ),
+    ]
+    out.extend(
+        _wrapped(
+            "NFS renames a file to .nfsXXXX instead of unlinking it, so this space "
+            "is charged to your quota and du can see it -- under a name that says "
+            "nothing. It is released when the last descriptor closes; deleting the "
+            ".nfsXXXX entry does not free it any sooner.",
+            style,
+            "  ",
+        )
+    )
+    out.append("")
+    limit = _limit(top)
+    for f in scan.silly_renamed[:limit]:
+        holders = ", ".join(
+            "{} {}".format(p, ui.printable(c.split()[0]) if c else "?")
+            for p, c in f.holders[:_HOLDER_SHOW]
+        )
+        if len(f.holders) > _HOLDER_SHOW:
+            holders += " (+{} more holding it)".format(len(f.holders) - _HOLDER_SHOW)
+        out.append(
+            "      {}  {}".format(
+                style.paint("{:>10}".format(human_bytes(f.size)), "bold_yellow"),
+                style.paint("pid {}".format(holders), "cyan"),
+            )
+        )
+        out.append("                  {}".format(ui.printable(f.path)))
+    if len(scan.silly_renamed) > limit:
+        out.append(
+            style.paint("      ... and {} more".format(len(scan.silly_renamed) - limit), "dim")
+        )
+    return out
 
 
 def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] = None) -> List[str]:
@@ -2655,12 +2926,23 @@ def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] =
                 "dim",
             )
         )
+        if scan.silly_renamed:
+            # Otherwise "none found" sits directly above a figure, and the reader
+            # has to work out that the two sentences are about different things.
+            out.append(
+                style.paint(
+                    "  -- but see below: on NFS a deleted-but-open file keeps an "
+                    "entry, so it is never 'unlinked'.",
+                    "dim",
+                )
+            )
     else:
         out.append(
             "  {} {}".format(
                 style.paint(human_bytes(scan.total_size), "bold_red"),
                 style.paint(
-                    "held by open file descriptors in {} inodes".format(len(scan.files)), "bold"
+                    "held by open file descriptors in {}".format(plural(len(scan.files), "inode")),
+                    "bold",
                 ),
             )
         )
@@ -2688,6 +2970,7 @@ def render_deleted(scan: DeletedScan, top: int = 10, style: Optional[ui.Style] =
             out.append("                  {}".format(ui.printable(f.path)))
         if len(scan.files) > limit:
             out.append(style.paint("      ... and {} more".format(len(scan.files) - limit), "dim"))
+    out.extend(_render_silly_renamed(scan, top, style))
     scope = [
         "",
         "  scope: {}, {} processes inspected".format(
@@ -2844,18 +3127,21 @@ def _mount_json(
     report = quotamod.mount_report(root)
     if report is None:
         return None
-    used_inodes = None
-    if report.inodes_total:
-        used_inodes = report.inodes_total - (report.inodes_free or 0)
     return {
         "path": root,
         "mount": report.mount or None,
         "total_bytes": report.total,
         "used_bytes": report.used,
         "available_bytes": report.avail,
+        # A measured zero on almost every filesystem, so it is 0 and not `null`:
+        # nothing here went unmeasured.
+        "reserved_bytes": report.reserved,
         "fraction": report.fraction,
         "inodes_total": report.inodes_total,
-        "inodes_used": used_inodes,
+        "inodes_used": report.inodes_used,
+        "inodes_available": report.inodes_avail,
+        "inodes_reserved": report.inodes_reserved,
+        "inodes_fraction": report.inodes_fraction,
         # Stated in the document too, so a consumer cannot read `used/total` as a
         # quota when it may be the whole filesystem.
         "is_a_quota": None,
@@ -2896,7 +3182,25 @@ def to_json(
     # could not tell an empty tree from a walk that took no sizes, and a `-c`
     # consumer summing `size_bytes` now meets a `null` where it used to read 0, so
     # the counter moves.
-    doc = {"tool": "rapidu", "schema": 4}  # type: Dict[str, Any]
+    #
+    # Schema 5: `rows[].soft` and `rows[].hard` carry what the backend printed,
+    # including a literal `0`. Three of the four quota parsers folded 0 to `None`,
+    # so a Lustre row whose limits are `0 0` -- how `lfs` spells "no limit", seen on
+    # an ALCF login node -- published `null` and rendered as `n/a`, which claims the
+    # figure could not be read when it had been read perfectly. A consumer that
+    # tested `soft is None` for "no limit" now sees 0 there, so the counter moves by
+    # the same rule that took it to 4: the key means what it always meant, but its
+    # value domain changed and a reader has to adapt. Use `rows[].limit` for "the
+    # figure usage is measured against" -- `null` for both 0 and unreadable, which
+    # is the question most consumers are actually asking.
+    #
+    # Schema 5 also redefines `mount.fraction` as `used / (used + available)`,
+    # which is `df`'s `Use%`, where it was `used / total_bytes`. Blocks reserved
+    # for root are in neither term: a default-formatted ext4 with `f_bavail` at
+    # zero published 0.95 for a filesystem no non-root writer can add a byte to.
+    # `total_bytes` is unchanged and still `df`'s `Size`, so a consumer wanting
+    # the old ratio can still divide.
+    doc = {"tool": "rapidu", "schema": 5}  # type: Dict[str, Any]
     # `-n 0` means every entry here too. It used to reach the slices raw, so the
     # flag documented as "0 means every entry" published empty rankings and an
     # empty file list -- the JSON consumer got *less* than at the default.
@@ -2957,6 +3261,12 @@ def to_json(
                 "ratio": res.alloc_ratio,
                 "unit_bytes": res.alloc_unit,
                 "padding_bytes": _unmeasured(res, res.padding),
+                # Published rather than left to the consumer to multiply out,
+                # for the reason the grouping helpers exist: the human report
+                # decides whether to offer the packing advice by comparing these
+                # two, and a `--json` reader deciding it differently is the two
+                # views drifting apart.
+                "unit_padding_ceiling_bytes": res.unit_padding_ceiling,
                 "padded_files": _unmeasured(res, res.padded_files),
                 "under_allocated_files": _unmeasured(res, res.under_files),
                 "inline_files": _unmeasured(res, res.inline_files),
@@ -2968,6 +3278,7 @@ def to_json(
             "dirs": res.dirs,
             "inodes": res.inodes,
             "symlinks": res.symlinks,
+            "specials": res.specials,
             "hardlinked_inodes": res.hardlinked_inodes,
             "hardlink_extra_refs": res.hardlink_extra_refs,
             "elapsed_seconds": round(res.elapsed, 3),
@@ -2987,6 +3298,9 @@ def to_json(
             # `filesystems` counts what was visited, which is not the same
             # question: with -x it is always 1, and said nothing about what was
             # refused. These two say what the walk left out and where it is.
+            # The flag itself, not only its effect: a bounded walk with nothing to
+            # skip reports 0 crossings, so a consumer cannot infer it from those.
+            "one_file_system": res.one_file_system,
             "skipped_other_filesystem": res.crossed,
             "skipped_other_filesystem_paths": res.crossed_paths[:64],
             "interrupted": res.partial,
@@ -3146,6 +3460,14 @@ def to_json(
             "reason": scan.reason or None,
             "total_bytes": scan.total_size,
             "inodes": len(scan.files),
+            # The NFS form of the same event, kept in its own pair of fields for
+            # the reason `deleted._SILLY_RENAME_RE` gives: `total_bytes` is
+            # documented as space no walk can see, and these bytes are visible.
+            # A consumer adding them together would be summing two different
+            # claims; one that wants "space held by a deleted file" can add them
+            # itself, knowing which is which.
+            "nfs_silly_renamed_bytes": scan.silly_renamed_size,
+            "nfs_silly_renamed_inodes": len(scan.silly_renamed),
             "scanned_pids": scan.scanned_pids,
             "unreadable_pids": scan.unreadable_pids,
             "complete": scan.complete,
@@ -3163,6 +3485,15 @@ def to_json(
                     "holders": [c for _, c in f.holders],
                 }
                 for f in scan.files[:limit]
+            ],
+            "nfs_silly_renamed": [
+                {
+                    "path": f.path,
+                    "bytes": f.size,
+                    "pids": f.pids,
+                    "holders": [c for _, c in f.holders],
+                }
+                for f in scan.silly_renamed[:limit]
             ],
         }
 

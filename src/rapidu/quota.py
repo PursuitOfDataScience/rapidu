@@ -405,7 +405,19 @@ class MountReport:
     is worse than printing a number with its provenance attached.
     """
 
-    def __init__(self, path, mount, total, used, avail, inodes_total, inodes_free):
+    def __init__(
+        self,
+        path,
+        mount,
+        total,
+        used,
+        avail,
+        inodes_total,
+        inodes_free,
+        reserved=0,
+        inodes_avail=None,
+        inodes_reserved=0,
+    ):
         self.path = path
         self.mount = mount
         self.total = total
@@ -413,13 +425,67 @@ class MountReport:
         self.avail = avail
         self.inodes_total = inodes_total
         self.inodes_free = inodes_free
+        # `f_bfree - f_bavail`: blocks a non-root writer cannot have. Kept so the
+        # figures can be printed in a line that adds up -- they are in neither
+        # `used` nor `avail`, and a reader subtracting two of the three numbers
+        # from the third otherwise finds bytes missing with nothing to blame.
+        self.reserved = reserved
+        # `f_favail`, the inode half of the same three-way split: file serial
+        # numbers a non-root process may still use. `None` where the filesystem
+        # reports no inode counts at all.
+        self.inodes_avail = inodes_avail
+        self.inodes_reserved = inodes_reserved
 
     @property
     def fraction(self):
         # type: () -> Optional[float]
-        if not self.total:
+        """How full the filesystem is for whoever is asking.
+
+        ``used + avail``, not ``total``: reserved blocks are in neither, so
+        dividing by the whole filesystem reports somebody who cannot write
+        another byte as comfortably short of full. A default-formatted ext4 holds
+        5% back, and one with ``f_bavail`` at zero read ``95.0 GiB of 100.0 GiB
+        used (95.0%), 0 B free`` -- a false all-clear on a filesystem that is
+        full for everyone who is not root. It is also what ``df`` puts in
+        ``Use%``, and ``df`` is what anyone checking this figure will run.
+
+        Where nothing is reserved -- gpfs, xfs, and the quota-through-``statvfs``
+        case this class exists for -- ``used + avail == total`` and the number is
+        unchanged.
+        """
+        reachable = self.used + self.avail
+        if reachable <= 0:
             return None
-        return self.used / float(self.total)
+        return self.used / float(reachable)
+
+    @property
+    def inodes_used(self):
+        # type: () -> Optional[int]
+        if not self.inodes_total:
+            return None
+        return self.inodes_total - (self.inodes_free or 0)
+
+    @property
+    def inodes_fraction(self):
+        # type: () -> Optional[float]
+        """How close the filesystem is to refusing to create another file.
+
+        The same ratio as :attr:`fraction`, over ``f_favail`` -- which is how
+        ``df -i`` computes ``IUse%`` too. It exists because the byte line carried
+        a percentage and this one did not, so a fallback on a real GPFS mount read
+        ``88.5%`` for bytes beside ``176,187,043 of 188,743,680 inodes``: 93.3%,
+        the figure nearer the wall, left as long division on nine-digit numbers.
+        An inode quota is the one that bites without warning, which is why this
+        tool has a ``-i`` mode at all.
+        """
+        used = self.inodes_used
+        if used is None:
+            return None
+        avail = self.inodes_avail
+        reachable = used + (avail if avail is not None else 0)
+        if reachable <= 0:
+            return None
+        return used / float(reachable)
 
 
 def mount_report(path: str) -> "Optional[MountReport]":
@@ -448,14 +514,28 @@ def mount_report(path: str) -> "Optional[MountReport]":
     # under a quota; `f_bfree` can be larger where blocks are reserved for root.
     avail = st.f_bavail * frsize
     used = total - st.f_bfree * frsize
+    reserved = max(0, st.f_bfree - st.f_bavail) * frsize
     inodes_total = st.f_files or None
     inodes_free = st.f_ffree if inodes_total else None
+    inodes_avail = st.f_favail if inodes_total else None
+    inodes_reserved = max(0, st.f_ffree - st.f_favail) if inodes_total else 0
     mount = ""
     try:
         mount = _mount_for(path)
     except Exception:
         mount = ""
-    return MountReport(path, mount, total, max(0, used), avail, inodes_total, inodes_free)
+    return MountReport(
+        path,
+        mount,
+        total,
+        max(0, used),
+        avail,
+        inodes_total,
+        inodes_free,
+        reserved,
+        inodes_avail,
+        inodes_reserved,
+    )
 
 
 def _mount_for(path: str) -> str:
@@ -616,6 +696,26 @@ def read_mount_table(path: str = "/proc/mounts") -> Dict[str, List[str]]:
     return table
 
 
+def _unescape_mount_field(text: str) -> str:
+    """Undo the kernel's octal escaping of one ``/proc/mounts`` field.
+
+    ``mangle_path`` in ``fs/seq_file.c`` escapes four characters, not two:
+    space ``\\040``, tab ``\\011``, newline ``\\012`` and backslash
+    ``\\134``. Handling only the first two left a mount point containing either
+    of the others carrying the escape text verbatim, so it matched no real path
+    and the caller degraded to "unmapped".
+
+    **Backslash is decoded last, and the order is not cosmetic.** A mount point
+    whose real name contains the literal text ``\\040`` is published as
+    ``\\134040``; decoding backslash first turns that into ``\\040`` and the
+    next pass turns it into a space, inventing a character that was never in the
+    name. Decoding it last cannot, because nothing runs after it.
+    """
+    for escape, char in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n")):
+        text = text.replace(escape, char)
+    return text.replace("\\134", "\\")
+
+
 def _mount_entries(path: str = "/proc/mounts") -> List[Tuple[str, str, str]]:
     """``(device, mount point, filesystem type)`` for every mount, in kernel order.
 
@@ -631,13 +731,18 @@ def _mount_entries(path: str = "/proc/mounts") -> List[Tuple[str, str, str]]:
                 fields = line.split()
                 if len(fields) < 2:
                     continue
-                # Mount points are octal-escaped for spaces and tabs.
-                point = fields[1].replace("\\040", " ").replace("\\011", "\t")
+                # Both columns are octal-escaped, and both are read back as
+                # paths: the device name keys `read_mount_table` and is handed to
+                # `mmlsquota`/`lfs` by `_devices_of_type`, so an NFS export like
+                # `server:/my share` -- published as `my\\040share` -- was looked
+                # up under a name no backend could recognise.
+                device = _unescape_mount_field(fields[0])
+                point = _unescape_mount_field(fields[1])
                 # A two-column line has no type to report. Real /proc/mounts and
                 # /etc/mtab always have six, but the device-to-mounts reading was
                 # never fussy about it and does not need to become so: an unknown
                 # type simply matches no `_devices_of_type` filter.
-                entries.append((fields[0], point, fields[2] if len(fields) > 2 else ""))
+                entries.append((device, point, fields[2] if len(fields) > 2 else ""))
     except (OSError, UnicodeDecodeError):
         return []
     return entries
@@ -734,7 +839,7 @@ def _enclosing_mount(target: str, fstypes: Tuple[str, ...], path: str = "/proc/m
                 fields = line.split()
                 if len(fields) < 3 or fields[2] not in fstypes:
                     continue
-                point = fields[1].replace("\\040", " ").replace("\\011", "\t")
+                point = _unescape_mount_field(fields[1])
                 stem = point.rstrip("/") or "/"
                 covers = target == stem or target.startswith(stem.rstrip("/") + "/")
                 if covers and len(stem) > len(best):
@@ -956,8 +1061,17 @@ _QUOTA_SCOPE_RE = re.compile(r"disk\s+quotas\s+for\s+(user|group|project)\b", re
 # happen -- the same wrong-cause mistake as reporting a broken wrapper as "not on
 # PATH". For a tool whose question is "why is my quota full", "you have no quota"
 # is a useful reply.
+# The two ways quota-tools says "this account has no quota", both observed rather
+# than guessed: `none` on the Midway clusters, and `no limited resources used` on
+# an ALCF Lustre login node running quota 4.x. Only the second was missing, and
+# missing it turned a command that had worked perfectly into "could not parse
+# `quota -s` output" -- a report of a broken backend where the honest answer was
+# "you have no quota here". Still anchored to the `Disk quotas for ...:` prefix,
+# so neither phrase can match arbitrary text further down the output.
 _QUOTA_NONE_RE = re.compile(
-    r"disk\s+quotas\s+for\s+\w+\s+[^\n:]*:\s*none\s*$", re.IGNORECASE | re.MULTILINE
+    r"disk\s+quotas\s+for\s+\w+\s+[^\n:]*:\s*"
+    r"(?:none|no\s+limited\s+resources\s+used)\s*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -1079,9 +1193,13 @@ def _parse_stock_quota(out: str) -> List[QuotaRow]:
             ):
                 if used is None:
                     continue
-                row = QuotaRow(
-                    fs, kind, scope, used, soft or None, hard or None, grace, mount, guessed
-                )
+                # `0` is kept, not folded to `None`. Most backends spell "no limit"
+                # as zero, and `QuotaRow.limit` already treats it as none -- while the
+                # renderer needs the two apart, because "the backend said no limit" and
+                # "the limit could not be read" are different claims. Folding here made
+                # real Lustre rows whose limits are `0 0` print as `n/a`, which says the
+                # figure was unreadable when it was read perfectly.
+                row = QuotaRow(fs, kind, scope, used, soft, hard, grace, mount, guessed)
                 row.mounts = list(mounts)
                 rows.append(row)
     return rows
@@ -1153,15 +1271,47 @@ def _device_order(devices: List[str], table: Dict[str, List[str]], path: str) ->
     return sorted(devices, key=rank)
 
 
+# GPFS's closing diagnostic is a *pointer* to the lines above it, not a cause.
+# It is also the only one of them that matches a marker, so it was what got
+# reported -- see :func:`_mmlsquota_trouble`.
+_MMLSQUOTA_POINTER = "examine previous error messages"
+
+
 def _mmlsquota_trouble(text: str) -> str:
-    """The diagnostic line in ``text`` that says this is not data, if there is one."""
-    for line in (text or "").splitlines():
-        if len(line.split(":")) >= _MMLSQUOTA_RECORD_FIELDS:
-            continue
+    """The diagnostic in ``text`` that says this is not data, if there is one.
+
+    Prefers the line that names the *cause*. A GPFS failure is three lines and
+    the last one is a redirection::
+
+        Failed to connect to file system daemon: No such process
+        mmlsquota: GPFS is down on this node.
+        mmlsquota: Command failed. Examine previous error messages to determine cause.
+
+    Only the third matches ``_MMLSQUOTA_FAILURES`` ("command failed"), so
+    returning the first match reported *that* as the reason -- telling the reader
+    to examine messages this function had just discarded, and dropping the one
+    fact that changes what they do next. Measured on a login node whose GPFS
+    client is not running: the panel read "mmlsquota: Command failed. Examine
+    previous error messages to determine cause", where the answer was "GPFS is
+    down on this node" and the remedy is a different filesystem rather than a
+    quota request.
+
+    So when the match is that pointer, the earlier non-record lines are the
+    answer -- which is doing what it says rather than printing it. The pointer is
+    kept only when it is all there is, because a vetoing line still has to veto.
+    """
+    prose = [
+        line.strip()
+        for line in (text or "").splitlines()
+        if line.strip() and len(line.split(":")) < _MMLSQUOTA_RECORD_FIELDS
+    ]
+    for index, line in enumerate(prose):
         low = line.lower()
-        for marker in _MMLSQUOTA_FAILURES:
-            if marker in low:
-                return line.strip()
+        if not any(marker in low for marker in _MMLSQUOTA_FAILURES):
+            continue
+        if _MMLSQUOTA_POINTER in low:
+            return " ".join(prose[:index]) or line
+        return line
     return ""
 
 
@@ -1208,7 +1358,8 @@ def _parse_mmlsquota(out: str, table: Dict[str, List[str]], points: List[str]) -
             ("blocks", block_used, block_soft, block_hard, block_grace),
             ("files", file_used, file_soft, file_hard, file_grace),
         ):
-            row = QuotaRow(name, kind, scope, used, soft or None, hard or None, grace, mount)
+            # See the note in the mmlsquota parser: 0 is what the backend said.
+            row = QuotaRow(name, kind, scope, used, soft, hard, grace, mount)
             row.mounts = list(mounts)
             rows.append(row)
     return rows
@@ -1422,8 +1573,10 @@ def _parse_lfs_rows(out: str, scope: str, path: str) -> List[QuotaRow]:
                     "blocks",
                     scope,
                     int(_lfs_figure(parts[1])) * 1024,
-                    int(_lfs_figure(parts[2])) * 1024 or None,
-                    int(_lfs_figure(parts[3])) * 1024 or None,
+                    # `lfs` writes `0 0` for "no limit"; kept as 0 so the
+                    # renderer can say so rather than saying "n/a".
+                    int(_lfs_figure(parts[2])) * 1024,
+                    int(_lfs_figure(parts[3])) * 1024,
                     _clean_grace(parts[4]),
                     mount or None,
                 )
@@ -1434,8 +1587,8 @@ def _parse_lfs_rows(out: str, scope: str, path: str) -> List[QuotaRow]:
                     "files",
                     scope,
                     int(_lfs_figure(parts[5])),
-                    int(_lfs_figure(parts[6])) or None,
-                    int(_lfs_figure(parts[7])) or None,
+                    int(_lfs_figure(parts[6])),
+                    int(_lfs_figure(parts[7])),
                     _clean_grace(parts[8]),
                     mount or None,
                 )

@@ -19,6 +19,7 @@ import sys
 import threading
 
 import pytest
+from conftest import NEEDS_REAL_UNLINK, UNLINK_HIDES_ENTRY
 
 from rapidu import cli, report, ui
 from rapidu import deleted as deletedmod
@@ -610,10 +611,26 @@ def test_count_only_honours_one_file_system(tmp_path):
 
 
 def test_count_only_without_the_flag_still_crosses(tmp_path):
-    """The fix must not turn the flag on by accident."""
+    """The fix must not turn the flag on by accident.
+
+    `/dev` is live: ptys come and go, and two walks a moment apart counted 12,097
+    and 12,012 -- an 85-entry difference that is the directory changing, not the
+    walk disagreeing. The property under test is that neither walk stopped at a
+    device boundary, so that is what is asserted: the counts agree to within the
+    churn, and the crossing walk is strictly larger than the `-x` one. A `-c` walk
+    that had silently gained `--one-file-system` would lose all of `/dev/pts` and
+    `/dev/shm`, which no churn tolerance could hide.
+    """
     plain = walk("/dev", threads=4, depth=1, count_only=True)
     full = walk("/dev", threads=4, depth=1)
-    assert plain.inodes == full.inodes
+    assert abs(plain.inodes - full.inodes) <= max(64, full.inodes // 100), (
+        plain.inodes,
+        full.inodes,
+    )
+    ofs = walk("/dev", threads=4, depth=1, one_file_system=True)
+    if ofs.inodes == full.inodes:
+        pytest.skip("/dev has no foreign mounts on this host")
+    assert plain.inodes > ofs.inodes, "-c stopped at the device boundary"
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +948,7 @@ def test_the_namespace_probe_is_honest_on_this_host():
             assert deletedmod._in_pid_namespace() is False
 
 
+@pytest.mark.skipif(not UNLINK_HIDES_ENTRY, reason=NEEDS_REAL_UNLINK)
 def test_the_deleted_scan_still_finds_a_real_unlinked_file(tmp_path):
     """The bounded rewrite must not break the mechanism it bounds."""
     path = str(tmp_path / "held.bin")

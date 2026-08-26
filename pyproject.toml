@@ -107,6 +107,12 @@ select = ["E", "F", "W", "I", "B", "C4", "SIM"]
 # The deleted-fd tests must hold descriptors open across statements -- that is
 # precisely the condition under test -- so a context manager is not available.
 "tests/test_deleted.py" = ["SIM115"]
+# And the probe that decides whether those tests can run at all holds one across
+# an `unlink` for the same reason.
+"tests/conftest.py" = ["SIM115"]
+# Same again for the NFS half: a `.nfsXXXX` entry is only a deletion while a
+# descriptor is still open on it, so the fd has to outlive the statement.
+"tests/test_portability_booth.py" = ["SIM115"]
 # Same for the demo renderer: its unlinked-but-open scene only exists while the
 # descriptor is still held, which a `with` block would close.
 "assets/render_demo.py" = ["SIM115"]

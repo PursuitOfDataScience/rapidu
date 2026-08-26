@@ -24,12 +24,43 @@ built into the mechanism and are reported rather than papered over:
 
 import errno
 import os
+import re
 import stat
 import threading
 from typing import Dict, List, Optional, Tuple  # noqa: F401  (used in `# type:` comments)
 
 _DELETED_SUFFIX = " (deleted)"
 _PROC = "/proc"
+
+# NFS does not unlink an open file: the client renames the entry out of the way
+# and removes it when the last descriptor closes. `nfs_sillyrename` in
+# fs/nfs/unlink.c builds the name as ".nfs" + the file id + a counter, both hex,
+# so `.nfs00000002945e149d00002b83` is what a deleted-but-open file looks like on
+# an NFS home -- measured on one.
+#
+# This matters because it is the *same event* as the rest of this module: someone
+# deleted a file, a process still holds it open, and the blocks are still charged.
+# The scan was blind to it by construction -- there is no " (deleted)" suffix and
+# `st_nlink` is 1, so the two gates that make the local finding trustworthy both
+# reject it -- which meant the section reported "none found" on every NFS site,
+# always, no matter how much space was held. That is a true sentence and a
+# useless one.
+#
+# Kept apart from `files` rather than folded in, because the two are not
+# interchangeable: an unlinked inode is invisible to `du` and this one is not.
+# The header this section prints promises invisibility, so merging them would
+# make that claim false.
+#
+# **And `reconcile` would double-count.** It adds this scan's bytes to the walk's
+# to explain a quota, through `owned_by`/`owned_by_gid`, which read `files`. A
+# `.nfsXXXX` entry is an ordinary directory entry that the walk has already
+# charged, so folding these in would add them twice and invent a gap -- in the
+# section whose job is to close one.
+#
+# The width is not pinned to 24: the field sizes come from kernel types that have
+# changed before, and a prefix plus all-hex is already specific enough that no
+# ordinary filename reaches it.
+_SILLY_RENAME_RE = re.compile(r"^\.nfs[0-9a-fA-F]{8,}$")
 
 
 # `st_uid` of an inode whose owner was never read. Not 0: that is root, and a
@@ -92,10 +123,19 @@ class DeletedScan:
         # True when the sweep was abandoned mid-flight, almost certainly because
         # a stat() blocked on a hung mount. See `scan`.
         self.timed_out = False
+        # The NFS form of the same event: deleted, still open, still charged --
+        # but with a `.nfsXXXX` entry standing in for the name. See
+        # `_SILLY_RENAME_RE` for why these are counted separately from `files`.
+        self.silly_renamed = []  # type: List[DeletedFile]
 
     @property
     def total_size(self) -> int:
         return sum(f.size for f in self.files)
+
+    @property
+    def silly_renamed_size(self) -> int:
+        """Allocated bytes held by deleted-but-open files on an NFS mount."""
+        return sum(f.size for f in self.silly_renamed)
 
     def owned_by(self, uid: int) -> "List[DeletedFile]":
         """The inodes charged to ``uid``, plus any whose owner was never read.
@@ -130,6 +170,9 @@ class DeletedScan:
         out.namespaced = self.namespaced
         out.timed_out = self.timed_out
         out.files = [f for f in self.files if f.path == pref or f.path.startswith(pref + "/")]
+        out.silly_renamed = [
+            f for f in self.silly_renamed if f.path == pref or f.path.startswith(pref + "/")
+        ]
         return out
 
 
@@ -252,7 +295,48 @@ def scan(prefix: Optional[str] = None, timeout: float = DEFAULT_SCAN_TIMEOUT_S) 
     res.scanned_pids = work.scanned_pids
     res.unreadable_pids = work.unreadable_pids
     res.files = sorted(found[:], key=lambda f: f.size, reverse=True)
+    res.silly_renamed = sorted(work.silly_renamed[:], key=lambda f: f.size, reverse=True)
     return res
+
+
+def _record_silly_rename(
+    target: str,
+    link: str,
+    pref: Optional[str],
+    by_inode: "Dict[Tuple[int, int], DeletedFile]",
+    res: DeletedScan,
+    pid: int,
+) -> None:
+    """Record one NFS deleted-but-open file, if that is what ``target`` is.
+
+    Same shape as the unlinked case above it, with the two gates that cannot
+    apply here replaced by the one that can. There is no " (deleted)" suffix to
+    check and ``st_nlink`` is 1, so the proof is the name itself
+    (:data:`_SILLY_RENAME_RE`) plus the fact that a process holds it open -- which
+    is the whole of what "deleted but still charged" means on NFS.
+
+    ``st_nlink == 1`` is required rather than merely observed: a silly-rename
+    entry is the only link to its inode, so a file that a user has *hard-linked*
+    to a `.nfsXXXX` name -- or an ordinary file that happens to match, which the
+    all-hex pattern makes unlikely but not impossible -- is not one of these and
+    must not be reported as deleted. The same reasoning as the ``nlink == 0``
+    gate: a name is a hint, and this section does not make findings out of hints.
+    """
+    if pref is not None and target != pref and not target.startswith(pref + "/"):
+        return
+    try:
+        st = os.stat(link)
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return
+    key = (st.st_dev, st.st_ino)
+    rec = by_inode.get(key)
+    if rec is None:
+        rec = DeletedFile(st.st_dev, st.st_ino, st.st_blocks * 512, target, st.st_uid, st.st_gid)
+        by_inode[key] = rec
+        res.silly_renamed.append(rec)
+    rec.add_holder(pid, _read_comm(pid))
 
 
 def _sweep(
@@ -260,6 +344,11 @@ def _sweep(
 ) -> None:
     """The body of :func:`scan`, run in a thread so it can be abandoned."""
     by_inode = {}  # type: Dict[Tuple[int, int], DeletedFile]
+    # The NFS half goes onto the worker's own scan object rather than through a
+    # fifth parameter: `_sweep`'s four-argument signature is depended on, and
+    # `list.append` is atomic under the GIL either way, so an abandoned sweep's
+    # partial findings are readable exactly as `found` already is.
+    silly_by_inode = {}  # type: Dict[Tuple[int, int], DeletedFile]
     pref = os.path.abspath(prefix).rstrip("/") if prefix else None
 
     for entry in os.listdir(_PROC):
@@ -284,6 +373,13 @@ def _sweep(
             except OSError:
                 continue
             if not target.endswith(_DELETED_SUFFIX):
+                # Not unlinked here -- but on NFS it cannot be, so check the one
+                # other thing a deleted-but-open file can look like before moving
+                # on. The name is already in hand from the `readlink` above, so
+                # the test is a string match and costs no syscall; only a match
+                # goes on to stat.
+                if target.startswith("/") and _SILLY_RENAME_RE.match(target.rsplit("/", 1)[-1]):
+                    _record_silly_rename(target, link, pref, silly_by_inode, res, pid)
                 continue
             path = target[: -len(_DELETED_SUFFIX)]
             if not path.startswith("/"):

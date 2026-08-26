@@ -8,12 +8,21 @@ is that it is invisible to anything that reads directory entries.
 
 import os
 
+import pytest
+from conftest import NEEDS_REAL_UNLINK, UNLINK_HIDES_ENTRY
+
 from rapidu import deleted as D
 from rapidu.walk import walk
+
+# The scan's whole subject is a file with no directory entry. Where the
+# filesystem keeps one -- NFS silly-rename, see `conftest` -- these fixtures
+# cannot be built, and the two tests below that need no unlink still run.
+needs_real_unlink = pytest.mark.skipif(not UNLINK_HIDES_ENTRY, reason=NEEDS_REAL_UNLINK)
 
 SIZE = 8 << 20  # 8 MiB: big enough to be unambiguous, small enough to be quick
 
 
+@needs_real_unlink
 def test_finds_space_the_walk_cannot_see(tmp_path):
     root = str(tmp_path)
     path = os.path.join(root, "ckpt.bin")
@@ -30,10 +39,26 @@ def test_finds_space_the_walk_cannot_see(tmp_path):
 
         walked = walk(root, threads=2)
         scan = D.scan(root)
+        # Read again *after* the scan, and accept anything between the two.
+        #
+        # `scan` reads `st_blocks` too, so this compares like with like -- but at
+        # a different moment, and on GPFS that is the whole difference. Taking
+        # ground truth from the fd removed the flake in one direction (blocks not
+        # yet allocated) and left it in the other: this 8 MiB file measured
+        # 16,711,680 bytes from the fd and 8,388,608 from the scan a moment
+        # later, because GPFS over-allocates and then trims. `test_walk._settle`
+        # exists for exactly this and cannot be used here, since the file has no
+        # name left to settle on.
+        #
+        # On a filesystem that is not moving the two readings are equal and this
+        # is the old exact assertion; where they differ, the bracket is the
+        # strongest true statement available.
+        after = os.fstat(fh.fileno()).st_blocks * 512
+        low, high = min(allocated, after), max(allocated, after)
 
-        assert walked.size < allocated, "the walk should not be able to see it"
+        assert walked.size < low, "the walk should not be able to see it"
         assert len(scan.files) == 1
-        assert scan.total_size == allocated
+        assert low <= scan.total_size <= high, (scan.total_size, allocated, after)
 
         found = scan.files[0]
         assert found.path == path
@@ -42,6 +67,7 @@ def test_finds_space_the_walk_cannot_see(tmp_path):
         fh.close()
 
 
+@needs_real_unlink
 def test_space_is_released_when_the_fd_closes(tmp_path):
     root = str(tmp_path)
     path = os.path.join(root, "tmp.bin")
@@ -55,6 +81,7 @@ def test_space_is_released_when_the_fd_closes(tmp_path):
     assert D.scan(root).files == []
 
 
+@needs_real_unlink
 def test_prefix_filter(tmp_path):
     root = str(tmp_path)
     inside = os.path.join(root, "inside")
@@ -70,20 +97,37 @@ def test_prefix_filter(tmp_path):
         fh.close()
 
 
+@needs_real_unlink
 def test_same_inode_from_two_fds_counted_once(tmp_path):
-    """Two descriptors on one inode allocate the blocks once."""
+    """Two descriptors on one inode allocate the blocks once.
+
+    Against the inode's *allocation*, read from the fd, not against ``SIZE``.
+    ``total_size < SIZE * 2`` reads like a safe margin and is really an
+    assumption that no filesystem allocates twice what it is given: xfs
+    speculative preallocation gives this 8 MiB file exactly 16 MiB of blocks, so
+    on the ``/tmp`` of a compute node the check read ``16777216 < 16777216`` and
+    failed while the code was right -- and had it been off by one the other way
+    it would have *passed* with the blocks counted twice, which is the bug it
+    exists to catch. The same reading on OneFS gives a 1 B file 24 KiB.
+
+    Bracketed for the reason given in the first test: `st_blocks` moves.
+    """
     root = str(tmp_path)
     path = os.path.join(root, "shared.bin")
     a = open(path, "wb")
     try:
         a.write(b"\0" * SIZE)
         a.flush()
+        os.fsync(a.fileno())
         b = open(path, "rb")
         try:
             os.unlink(path)
+            before = os.fstat(a.fileno()).st_blocks * 512
             scan = D.scan(root)
+            after = os.fstat(a.fileno()).st_blocks * 512
             assert len(scan.files) == 1
-            assert scan.total_size < SIZE * 2
+            low, high = min(before, after), max(before, after)
+            assert low <= scan.total_size <= high, (scan.total_size, before, after)
         finally:
             b.close()
     finally:
@@ -142,8 +186,12 @@ def test_a_file_named_deleted_is_not_reported_as_deleted(tmp_path):
         scan = D.scan(root)
         assert scan.files == [], "a linked file must never be reported as unlinked"
 
-        # ...and unlinking the very same file must still be found.
-        os.unlink(path)
-        assert len(D.scan(root).files) == 1
+        # ...and unlinking the very same file must still be found. Guarded
+        # rather than skipping the whole test: the half above -- a *linked* file
+        # whose name ends in " (deleted)" must not be reported -- is the half
+        # that catches a fabricated finding, and it holds on every filesystem.
+        if UNLINK_HIDES_ENTRY:
+            os.unlink(path)
+            assert len(D.scan(root).files) == 1
     finally:
         fh.close()

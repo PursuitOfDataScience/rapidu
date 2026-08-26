@@ -29,10 +29,129 @@ import time
 from collections import deque
 from typing import Any, Dict, List, Optional, Set, Tuple  # noqa: F401  (`# type:` use)
 
-# Past this the walk measurably slows down AND the metadata load stops being
-# polite. Requests above it are clamped, loudly.
-MAX_THREADS = 16
-DEFAULT_THREADS = 8
+# Walk concurrency. Both numbers are measured, and the honest summary of the
+# measurement is that concurrency is worth a great deal on a parallel filesystem
+# and is indistinguishable from noise on a high-latency NFS export.
+#
+# GPFS, one 1.19M-inode tree, three interleaved repetitions on a 6-core login
+# node (wall seconds, and the median):
+#
+#     threads=8    46.86  47.10  45.99   -> 46.86
+#     threads=16   36.91  36.62  35.15   -> 36.62      -22% against 8
+#     threads=24   33.69  33.70  32.53   -> 33.69       -8% against 16
+#
+# Monotonic, and tight enough (<5% within each group) to believe. Beyond the cap
+# it turns: 32 and 48 measured 33.1s and 35.0s on the same tree.
+#
+# The 2.14M-inode tree that one sits inside agrees about the default and not
+# about the cap (two interleaved repetitions):
+#
+#     threads=8    79.60  80.60   -> 80.10
+#     threads=16   64.01  63.72   -> 63.87      -20% against 8
+#     threads=24   63.15  64.11   -> 63.63       -0.4% against 16, i.e. nothing
+#
+# So 8 -> 16 is the finding: a fifth of the wall time, on both trees, every
+# repetition. 16 -> 24 is worth 8% on one tree and nothing on the other, which is
+# exactly why it is the cap and not the default -- it is available to anyone who
+# measures their own tree and finds it helps, and promised to nobody.
+#
+# NFS (Isilon export, 31,731 inodes) is a different story, and the first reading
+# of it was wrong. One pair of runs looked like a 22% win for 16 threads; three
+# interleaved pairs found nothing --
+#
+#     threads=8    108.9  123.0  112.1   -> 112.1
+#     threads=16   112.6  111.7  122.7   -> 112.6
+#
+# -- 0.5% apart inside a 10% spread. That server is shared, so its run-to-run
+# variance is larger than anything thread count does to it.
+#
+# **Single runs on a shared node do not settle this.** Both wrong readings above
+# came from one pair of runs, and a lone `threads=24` measurement of a larger
+# tree came back 13% *slower* than 16 while the interleaved series above had it
+# 8% faster. Anything that changes these two numbers again wants repetitions,
+# interleaved, with the load average written down.
+#
+# So: 16 is the default, worth 22% where thread count is worth anything and
+# costing nothing measurable where it is not -- 8 was leaving that on the table.
+# 24 is the cap rather than the default because what it adds is real on one tree,
+# zero on another and absent on NFS, and because twenty-four threads of `fstatat`
+# from one interactive command is already as much as is polite to ask of a shared
+# node's metanode.
+#
+# This replaces a flat "past 16 the walk measurably slows down (32 threads was
+# 31% worse than 16)". Neither half survives measurement: 32 threads is 10%
+# *faster* than 16 on GPFS, and on NFS the difference is not resolvable at all. A
+# number that is a property of the storage cannot be stated as a property of the
+# tool.
+#
+# None of this is about the accounting. The walk is within 6% of the syscall
+# floor -- a threaded walker that does nothing but `scandir` + `fstatat` and count
+# runs the same tree in 35.2s against rapidu's 37.4s at 16 threads, with one
+# `scandir` per directory and exactly one `fstatat` per entry and no redundancy.
+# There is no bookkeeping left to remove, which is why concurrency is the only
+# lever on wall time and why these two numbers are worth measuring rather than
+# guessing.
+MAX_THREADS = 24
+DEFAULT_THREADS = 16
+
+# Concurrency for a filesystem whose stats cost nothing to begin with.
+#
+# Threads exist here to hide latency. Where there is none to hide they are pure
+# overhead -- GIL hand-offs and queue traffic buying nothing -- and the cost is
+# not small. One 151k-inode tree on page-cached local xfs:
+#
+#     threads      1       2       4       8      16
+#     wall      0.69s   0.96s   2.57s   2.15s   2.34s
+#     cpu       0.69s   1.56s   3.83s   3.21s   3.60s
+#
+# So a threaded walk of local storage is 3.4x the wall time *and* 5.2x the CPU of
+# a serial one. That is the opposite of the trade on GPFS, where 16 threads buy
+# 21% of the wall time for 30% more CPU. One fixed number cannot serve both: the
+# useful range spans 1 to 24.
+LOCAL_THREADS = 1
+
+# Filesystem types whose stat is a memory or local-block access. Deliberately a
+# short, confident list: everything absent from it -- including every network and
+# parallel filesystem, and anything unrecognised -- keeps `DEFAULT_THREADS`, so a
+# type nobody here has heard of behaves exactly as it did before.
+_LOCAL_FSTYPES = frozenset(
+    (
+        "tmpfs",
+        "ramfs",
+        "devtmpfs",
+        "rootfs",
+        "ext2",
+        "ext3",
+        "ext4",
+        "xfs",
+        "btrfs",
+        "f2fs",
+        "zfs",
+        "jfs",
+        "vfat",
+        "exfat",
+        "squashfs",
+        "erofs",
+        "bcachefs",
+    )
+)
+
+# Above this, the entries sampled below took long enough that there is latency
+# worth hiding and the thread pool earns its keep.
+#
+# Both signals are required and neither is sufficient. Median `lstat`, measured:
+# tmpfs 1.7us, page-cached local xfs 2.0us -- and a *cached* GPFS home 7.2us,
+# only 3.5x above local. So latency alone would read a warm parallel filesystem
+# as local and cost the 9x that threads are worth there. Filesystem type alone
+# would read a *cold* local disk as fast when a cold seek is 100us on NVMe and
+# milliseconds on a platter, where threads help as much as they do on GPFS.
+# Twenty is in the gap between warm local and any cold device, which is the only
+# distinction this number has to make once the type check has run.
+_LOCAL_LATENCY_US = 20.0
+
+# How many entries the probe stats. Enough for a median to mean something,
+# few enough to be free against a walk that is about to stat millions.
+_PROBE_SAMPLE = 24
 
 # A file modified this recently may not have its blocks allocated yet on GPFS.
 DEFAULT_SETTLE_WINDOW_S = 120.0
@@ -323,6 +442,16 @@ class WalkResult:
         self.files = 0
         self.dirs = 0
         self.symlinks = 0
+        # Non-directory entries that are neither regular files nor symlinks:
+        # sockets, fifos, block and character devices. They are counted in
+        # `files` like any other non-directory entry -- which is what an inode
+        # quota charges -- but naming them lets the breakdown that explains
+        # `inodes` keep the term "files" meaning files. Without it a home
+        # directory holding one ssh ControlMaster socket printed one more
+        # "file" than `find -type f` could find, with nothing accounting for
+        # the difference. Zero unless the tree has any, so the term is absent
+        # from almost every report. `-c` cannot fill this in: it never stats.
+        self.specials = 0
         self.hardlinked_inodes = 0  # distinct inodes seen with st_nlink > 1
         self.hardlink_extra_refs = 0  # directory entries suppressed by dedup
         # uid/dev -> (bytes, inodes). Inodes, not directory entries: directories
@@ -399,6 +528,12 @@ class WalkResult:
         # failure. It is the total's meaning that changes, not its validity.
         self.crossed = 0
         self.crossed_paths = []  # type: List[str]
+        # Whether `-x` was in force, which `crossed` does not answer: a bounded
+        # walk that had nothing to skip reports 0 there, the same as an unbounded
+        # one. Anything that reproduces this walk -- notably the `find` command
+        # `BY AGE` prints -- has to know, or it enumerates a different population
+        # from the one the report counted.
+        self.one_file_system = False
         # Files whose *data* changed inside the settle window: `st_mtime`, which
         # is the signal this window was defined for ("a file modified this
         # recently may not have its blocks allocated yet").
@@ -463,6 +598,42 @@ class WalkResult:
     def padding(self) -> int:
         """Bytes charged for partly filled allocation units."""
         return self.padded_alloc - self.padded_apparent
+
+    @property
+    def unit_padding_ceiling(self) -> Optional[int]:
+        """The most of :attr:`padding` that partly filled units could account for.
+
+        A file allocated in whole units of ``u`` is charged ``ceil(size/u)*u``,
+        so its own padding is at most ``u - 1``; across ``padded_files`` files
+        the whole class is bounded by ``padded_files * (u - 1)``. ``None`` where
+        no unit could be measured, which is the same condition under which the
+        report already drops the unit from its sentence.
+
+        It exists because ``padding`` *above* this bound cannot be a partly
+        filled unit, and the two causes have different remedies. Unit padding is
+        returned by packing the files; a per-byte overhead -- replication,
+        erasure coding, per-block checksums -- is charged on the archive too, and
+        packing returns none of it.
+
+        Measured on an NFS-exported OneFS home: 29,132 padded files, an 8 KiB
+        measured unit, and 1021.3 MiB of padding against a 227.6 MiB ceiling --
+        4.5x what the stated cause can produce. The report said "so they occupy
+        1.0 GiB of padding. Packing them ... returns it", which was a mechanism
+        its own two other figures refuted. On this filesystem files up to 128 KiB
+        all report 24 KiB allocated and a 4 MiB file reports 1.26x its length, so
+        the gap scales with the bytes stored and survives any repacking.
+
+        The GPFS trees the packing advice was written for are unaffected. A
+        1.2M-inode one measures 711,302 padded files against a 16 KiB subblock,
+        4.7 GiB of padding under a 10.9 GiB ceiling; the shape the panel actually
+        prints for -- half a million 2 KiB files each paying for a whole subblock
+        -- sits at 6.7 GiB under 7.6 GiB, because that padding really is the
+        remainder and packing really does return it.
+        """
+        unit = self.alloc_unit
+        if not unit or not self.padded_files:
+            return None
+        return self.padded_files * (unit - 1)
 
     @property
     def alloc_ratio(self) -> Optional[float]:
@@ -554,9 +725,116 @@ class WalkResult:
         return top in self.finished_tops
 
 
+def _fstype_of(path: str, table: str = "/proc/mounts") -> str:
+    """The filesystem type of the mount that holds ``path``, or ``""``.
+
+    Longest matching mount point wins, which is the only reading that works
+    where mounts nest -- an autofs `/home` with one NFS mount per user under it
+    is an ordinary layout, and the answer there is the user's own mount, not the
+    map above it.
+
+    Read here rather than borrowed from :mod:`rapidu.quota`, which has a richer
+    version of the same loop: this module is a leaf, and importing the quota
+    layer to answer one question would pull `subprocess` and `socket` into every
+    `-c` walk that never asks a quota anything. The duplication is twelve lines
+    and the alternative is a dependency edge.
+    """
+    target = os.path.abspath(path).rstrip(os.sep) or os.sep
+    best, best_type = "", ""
+    try:
+        with open(table, "rb") as handle:
+            for raw in handle:
+                fields = raw.decode("utf-8", "replace").split()
+                if len(fields) < 3:
+                    continue
+                # The kernel octal-escapes mount points; a space or a tab in one
+                # is unusual and entirely legal.
+                point = (
+                    fields[1]
+                    .replace("\\040", " ")
+                    .replace("\\011", "\t")
+                    .replace("\\012", "\n")
+                    .replace("\\134", "\\")
+                )
+                stem = point.rstrip(os.sep) or os.sep
+                covers = target == stem or target.startswith(
+                    stem if stem.endswith(os.sep) else stem + os.sep
+                )
+                if covers and len(stem) >= len(best):
+                    best, best_type = stem, fields[2]
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return best_type
+
+
+def _probe_latency_us(root: str, sample: int = _PROBE_SAMPLE) -> Optional[float]:
+    """Median ``lstat`` cost in microseconds over a few entries of ``root``.
+
+    ``None`` when there is nothing to measure -- an empty or unreadable
+    directory -- which the caller treats as "no evidence" rather than as fast.
+
+    The entries are re-stat'd by the walk moments later, so on any filesystem
+    that caches metadata this probe is paid back rather than added.
+    """
+    try:
+        with os.scandir(root) as it:
+            paths = []
+            for entry in it:
+                paths.append(entry.path)
+                if len(paths) >= sample:
+                    break
+    except OSError:
+        return None
+    # `perf_counter`, not `perf_counter_ns`: the nanosecond variant arrived in
+    # 3.7 and this package's floor is 3.6, which the suite checks by running the
+    # whole tool under the system interpreter. `perf_counter` is sub-microsecond
+    # on Linux, and the threshold it feeds is twenty.
+    timings = []
+    for path in paths:
+        started = time.perf_counter()
+        try:
+            os.lstat(path)
+        except OSError:
+            continue
+        timings.append((time.perf_counter() - started) * 1e6)
+    if not timings:
+        return None
+    timings.sort()
+    middle = len(timings) // 2
+    if len(timings) % 2:
+        return timings[middle]
+    return (timings[middle - 1] + timings[middle]) / 2.0
+
+
+def choose_threads(root: str, requested: Optional[int] = None) -> int:
+    """How many workers to walk ``root`` with.
+
+    ``requested`` is honoured whenever it is given -- an explicit ``-t`` is a
+    decision, not a hint -- clamped to :data:`MAX_THREADS` as always. Only the
+    unset case is chosen here.
+
+    **The choice only ever goes down, and only on two agreeing signals.** A
+    filesystem type from :data:`_LOCAL_FSTYPES` says stats are local; a median
+    probe under :data:`_LOCAL_LATENCY_US` says they are *actually* cheap right
+    now rather than merely capable of being. Both, and the walk runs serially
+    for a third of the wall time and a fifth of the CPU. Either missing --
+    unrecognised type, cold device, empty directory, unreadable `/proc/mounts` --
+    and it is :data:`DEFAULT_THREADS`, exactly as before. Every way this can be
+    wrong is the previous behaviour.
+    """
+    if requested is not None:
+        return max(1, min(int(requested), MAX_THREADS))
+    if _fstype_of(root) not in _LOCAL_FSTYPES:
+        return DEFAULT_THREADS
+    latency = _probe_latency_us(root)
+    if latency is None or latency > _LOCAL_LATENCY_US:
+        return DEFAULT_THREADS
+    return LOCAL_THREADS
+
+
 def walk(
     root: str,
-    threads: int = DEFAULT_THREADS,
+    threads: Optional[int] = None,
     depth: int = 2,
     max_dirs_per_sec: float = 0.0,
     settle_window: float = DEFAULT_SETTLE_WINDOW_S,
@@ -567,7 +845,9 @@ def walk(
 ) -> WalkResult:
     """Walk ``root`` and return a :class:`WalkResult`.
 
-    ``threads`` is clamped to :data:`MAX_THREADS`. ``depth`` controls only how
+    ``threads`` is clamped to :data:`MAX_THREADS`; ``None`` asks
+    :func:`choose_threads` to pick, which is the default because the right number
+    is a property of the filesystem and spans 1 to 24. ``depth`` controls only how
     coarsely per-directory aggregates are *reported*; the walk itself is always
     complete. ``max_dirs_per_sec`` of 0 disables rate limiting.
 
@@ -624,13 +904,15 @@ def walk(
     the "too many inodes" case this tool is reached for.
     """
     root = os.path.abspath(root)
-    nthreads = max(1, min(int(threads), MAX_THREADS))
+    # `None` means "choose": see `choose_threads`. An explicit count is honoured.
+    nthreads = choose_threads(root, threads)
     bucket = TokenBucket(max_dirs_per_sec) if max_dirs_per_sec > 0 else None
     stop_ev = stop if stop is not None else threading.Event()
 
     res = WalkResult(root)
     res.threads = nthreads
     res.count_only = count_only
+    res.one_file_system = one_file_system
     res.settle_window = settle_window
 
     try:
@@ -704,6 +986,7 @@ def walk(
 
     def worker(slot_id: int = 0) -> None:
         l_size = l_app = l_files = l_dirs = l_sym = l_unstat = 0
+        l_spec = 0
         l_vanished = 0
         l_vanished_entries = 0
         l_unstat_paths = []  # type: List[str]
@@ -759,6 +1042,7 @@ def walk(
         watch_names = WATCHED_DIR_NAMES
         watch_get = l_watch.get
         S_IFMT, S_IFDIR, S_IFLNK = 0o170000, 0o040000, 0o120000
+        S_IFREG = 0o100000
         ofs = one_file_system
         cap = _RECENT_SAMPLE_CAP
 
@@ -1026,8 +1310,14 @@ def walk(
                                 l_crossed_paths.append(dsep + entry.name)
                             continue
 
-                        if ftype == S_IFLNK:
-                            l_sym += 1
+                        # One comparison on the common path: a regular file is
+                        # neither, and it is almost every entry in almost every
+                        # tree.
+                        if ftype != S_IFREG:
+                            if ftype == S_IFLNK:
+                                l_sym += 1
+                            else:
+                                l_spec += 1
 
                         l_files += 1
 
@@ -1235,6 +1525,7 @@ def walk(
             res.files += l_files
             res.dirs += l_dirs
             res.symlinks += l_sym
+            res.specials += l_spec
             res.unstatable += l_unstat
             res.vanished_entries += l_vanished_entries
             if len(res.unstatable_paths) < _UNSTAT_SAMPLE_CAP:

@@ -379,7 +379,11 @@ def test_the_interrupted_headline_says_one_file(tmp_path, capsys, monkeypatch):
     cli.main([root, "--no-progress", "--no-box", "--color", "never"])
     out = capsys.readouterr().out
     assert "PARTIAL" in out
-    assert "1 inode scanned before the interrupt" in out
+    # Flattened: the facts line is packed to the terminal width, so how much of
+    # it fits depends on the length of `root` -- which is `tmp_path`, which is
+    # `TMPDIR`. A deep temp directory would break this sentence across a line and
+    # fail an assertion about pluralisation.
+    assert "1 inode scanned before the interrupt" in " ".join(out.split())
 
 
 def test_nothing_finished_names_no_table(tmp_path, capsys, monkeypatch):

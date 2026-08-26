@@ -120,11 +120,15 @@ def build_parser() -> argparse.ArgumentParser:
         "-t",
         "--threads",
         type=_positive_int,
-        default=walkmod.DEFAULT_THREADS,
+        default=None,
         metavar="N",
-        help="walk concurrency, clamped to {} (default: %(default)s). "
-        "Past the cap the walk measurably slows down and the "
-        "metadata load stops being polite.".format(walkmod.MAX_THREADS),
+        help="walk concurrency, clamped to {}. Chosen from the filesystem when "
+        "not given, because the right number is a property of the storage and "
+        "nothing else: {} where stats are local and already cheap, {} otherwise. "
+        "Threads are there to hide latency, so on page-cached local storage they "
+        "cost 3.4x the wall time and 5.2x the CPU, while on GPFS they save a fifth "
+        "of the wall time for 30%% more CPU. Give a number to decide it "
+        "yourself.".format(walkmod.MAX_THREADS, walkmod.LOCAL_THREADS, walkmod.DEFAULT_THREADS),
     )
     p.add_argument(
         "-d",
@@ -141,7 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         metavar="N",
-        help="how many directories to list per ranking (default: %(default)s)",
+        help="how many directories to list per ranking; 0 lists every entry (default: %(default)s)",
     )
     p.add_argument(
         "--max-dirs-per-sec",
@@ -432,12 +436,17 @@ def _positive_int(raw: str) -> int:
     return value
 
 
-def _warn_threads(requested: int) -> None:
+def _warn_threads(requested: Optional[int]) -> None:
+    # `None` is "you choose", which is not a request and has nothing to warn
+    # about. Without this the comparison below raises a TypeError on 3.x, which
+    # is the whole of what makes the adaptive default reachable from the CLI.
+    if requested is None:
+        return
     if requested > walkmod.MAX_THREADS:
         sys.stderr.write(
-            "rapidu: --threads {} clamped to {}: past the cap the walk is "
-            "slower (measured: 32 threads was 31% worse than 16) and the "
-            "metadata load stops being polite.\n".format(requested, walkmod.MAX_THREADS)
+            "rapidu: --threads {} clamped to {}: past the cap the walk is slower "
+            "(measured on GPFS: 48 threads was 6% worse than 24) and the metadata "
+            "load stops being polite.\n".format(requested, walkmod.MAX_THREADS)
         )
     elif requested < 1:
         # Unreachable from the command line -- `_positive_int` rejects it there --
@@ -595,12 +604,14 @@ def _walk_with_progress(
     order that keeps changing and is wrong until the last moment. Progress is
     the honest thing to stream; conclusions are not.
     """
-    nthreads = max(1, min(int(args.threads), walkmod.MAX_THREADS))
+    # Resolved once, here: the `Progress` object is sized by it and the walk must
+    # be given the same number, so choosing twice could disagree.
+    nthreads = walkmod.choose_threads(path, args.threads)
     spinner = ui.Spinner(style)
     if args.no_progress or not spinner.enabled:
         return walkmod.walk(
             path,
-            threads=args.threads,
+            threads=nthreads,
             depth=args.depth,
             max_dirs_per_sec=args.max_dirs_per_sec,
             settle_window=args.settle_window,
@@ -633,7 +644,7 @@ def _walk_with_progress(
     try:
         return walkmod.walk(
             path,
-            threads=args.threads,
+            threads=nthreads,
             depth=args.depth,
             max_dirs_per_sec=args.max_dirs_per_sec,
             settle_window=args.settle_window,
@@ -695,6 +706,9 @@ def cmd_walk(args: argparse.Namespace) -> int:
 
     docs = []
     rcode = EXIT_OK
+    # Counted rather than assigned straight into `rcode`, for the reason given at
+    # the `OSError` handler below.
+    unmeasured = 0
     for path in paths:
         snap = quota_for(path)
         try:
@@ -702,7 +716,14 @@ def cmd_walk(args: argparse.Namespace) -> int:
         except OSError as exc:
             # An OSError's string carries the path that failed.
             sys.stderr.write("rapidu: {}\n".format(ui.printable(str(exc))))
-            rcode = EXIT_ERROR
+            # Not `rcode = EXIT_ERROR`. A later path reaching any of the
+            # EXIT_ATTENTION lines below overwrote it, so the exit code depended
+            # on the order of the arguments: `rdu -a vanished full` returned 1 and
+            # `rdu -a full vanished` returned 2 for the same two paths in the same
+            # two states. EXIT_ERROR outranks EXIT_ATTENTION -- the suite asserts
+            # that for `refused` already -- so it is counted like `refused` and
+            # applied after the loop, where nothing can lower it.
+            unmeasured += 1
             continue
 
         settle = (
@@ -770,12 +791,23 @@ def cmd_walk(args: argparse.Namespace) -> int:
             rcode = EXIT_ATTENTION
         if snap is not None and _quota_needs_attention(snap, [path]):
             rcode = EXIT_ATTENTION
+        # `cmd_deleted` returns EXIT_ATTENTION for exactly this and the walk did
+        # not, so the fuller invocation was the quieter one: 103.8 MiB held by an
+        # unlinked-but-open descriptor printed the same panel under `-D` and `-a`
+        # and exited 1 and 0 respectively. Same class as `_quota_needs_attention`
+        # above -- the command documented as the full audit, and the one a cron job
+        # would run, reported success in a state that wants a human. Reconciliation
+        # calling it CLOSES does not make the bytes go away; it only explains them.
+        if path_scan.files:
+            rcode = EXIT_ATTENTION
 
     if args.as_json and docs:
         print(json.dumps(docs[0] if len(docs) == 1 else docs, indent=2))
-    if refused:
+    if refused or unmeasured:
         # See `_resolve_paths`: a named path that could not be measured is not a
-        # successful run, however well the others went.
+        # successful run, however well the others went. A path that resolved and
+        # then failed mid-walk -- purged, unmounted, or cleaned up under us -- is
+        # the same thing one step later.
         return EXIT_ERROR
     return rcode
 

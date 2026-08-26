@@ -66,7 +66,11 @@ def test_no_padded_files_means_no_claim_about_the_unit():
 
 
 def test_padding_is_named_and_quantified():
-    out = "\n".join(report.render_allocation(padded(), PLAIN))
+    # Whitespace-collapsed, not just newline-joined: these are prose assertions
+    # and prose wraps. The headline now wraps to the report's layout width like
+    # every other warning (see `report._LAYOUT_COLUMNS`), so "charged the first
+    # number" straddles a line break at some widths and not others.
+    out = " ".join(" ".join(report.render_allocation(padded(), PLAIN)).split())
     assert "2.0x" in out
     assert "quota is charged the first number" in out
     assert "16.0 KiB allocation unit" in out

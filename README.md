@@ -46,6 +46,13 @@ rdu -a                   # the full audit: quota + /proc scan + reconciliation
 
 Same total as `du`, to the byte. That is checked on every commit.
 
+One deliberate difference, and only when you name more than one path. `du -s a b`
+dedupes inodes *across* its arguments, so a hard link already counted under `a` is
+missing from `b` — and the two figures swap when you swap the arguments: the same
+directory reads `23` after `a` and `100023` before it. Each `rdu` report is
+self-contained instead. Every path gets its own true total, in whatever order you
+name them.
+
 ## Reading the table
 
 ```
@@ -79,9 +86,44 @@ The hatched last row is everything not listed, and it names how many that is --
 so a truncated table always says it is truncated. The bar is share of the whole
 walk, so it always agrees with the number beside it.
 The count column is headed `inodes`, not `files`: it counts directories too,
-which is what an inode quota charges for. `files` in this tool means regular
-files and symlinks — the population `BY AGE` buckets — and one word naming two
-quantities is the confusion this heading used to cause.
+which is what an inode quota charges for. `files` in this tool means every
+non-directory entry — regular files, symlinks, and the sockets and fifos a live
+home directory collects — which is the population `BY AGE` buckets, and one word
+naming two quantities is the confusion this heading used to cause. `-a` splits
+that population into terms that sum to the total, so each one is checkable
+against the `find -type` that measures it.
 The column you sorted by is the one in colour — under `-i`, `inodes` takes the tone
 and `size` steps back. Sizes are cumulative, so any row agrees with `du -s` on
 that path.
+
+## What changes with the filesystem
+
+Three things the tool reports are properties of the storage, not of the tool, and
+they differ enough between clusters to be worth naming. All three are measured,
+on GPFS, on xfs, and on an NFS export of OneFS.
+
+**Deleted-but-open space looks different on NFS.** Everywhere else, unlinking an
+open file removes the directory entry at once and the blocks stay charged with no
+name attached — that invisible space is what `-D` exists to find. NFS instead
+renames the entry to `.nfsXXXX` and removes it when the last descriptor closes,
+so nothing is ever *unlinked*: `du` can see the space, under a name that explains
+nothing. `-D` reports both forms, and says which it found, because the remedy
+differs — a `.nfsXXXX` entry goes away on its own and deleting it by hand frees
+nothing sooner.
+
+**Allocated above apparent is not always padding.** On a filesystem with a fixed
+allocation unit, a tree charged more than it holds is paying for partly filled
+units, and packing the files returns the difference. Where the overhead is
+charged per byte stored — replication, erasure coding, per-block checksums — it
+is not, and packing returns none of it. rapiDU tells them apart from its own
+figures: padding above `padded_files × (unit − 1)` cannot be a partly filled
+unit, so it is reported as what it is instead of carrying advice that cannot
+work.
+
+**A quota backend may be absent rather than broken.** `quota` exits 1 with no
+output on one of these clusters and prints `Disk quotas for user ...: none` on
+another; `mmlsquota` is installed on a third whose GPFS client is not running.
+None of those is a parse failure, and none of them is "you have no quota" — the
+panel names the backend, what it said, and falls back to `statvfs` with the
+caveat that `statvfs` cannot tell a per-user export limit from the whole
+filesystem.
