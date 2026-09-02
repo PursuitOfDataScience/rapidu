@@ -1,6 +1,7 @@
 """Presentation rules: colour is opt-in, bars are honest, glyphs degrade."""
 
 import argparse
+import os
 import re
 
 from rapidu import cli, ui
@@ -552,3 +553,150 @@ def test_an_embedded_newline_does_not_tear_the_frame():
     assert len(widths) == 1, widths
     for line in out[1:-1]:
         assert line.startswith("│") and line.endswith("│"), line
+
+
+# ---------------------------------------------------------------------------
+# Width is columns, not characters
+# ---------------------------------------------------------------------------
+#
+# Everything below `_ANSI_RE` in `ui` measures with `visible_width`, and two
+# places did not: `truncate` and the spinner's own clip. Both looked right for as
+# long as every path was ASCII.
+
+
+class Recorder(FakeTTY):
+    """A terminal that keeps what was written to it."""
+
+    def __init__(self, tty=True, encoding="utf-8"):
+        FakeTTY.__init__(self, tty=tty, encoding=encoding)
+        self.chunks = []
+
+    def write(self, text):
+        self.chunks.append(text)
+
+    def flush(self):
+        pass
+
+
+def _wide_dir(tmp_path):
+    """A real directory whose name is CJK, read back off the filesystem.
+
+    Created and listed rather than spelled inline, because the failure guarded
+    here is one a *name* causes, and a name reaches the report from `scandir`.
+    """
+    name = "\u6570\u636e\u96c6" * 12  # 36 characters, 72 columns
+    (tmp_path / name).mkdir()
+    listed = os.listdir(str(tmp_path))
+    assert listed == [name], listed
+    return os.path.join(str(tmp_path), listed[0])
+
+
+def test_truncate_counts_columns_not_characters(tmp_path):
+    """`truncate(name, 26)` returned 26 characters occupying 49 columns.
+
+    A wide glyph is two columns, so a `len`-based cut overflows every field it was
+    cut to fit -- the quota table's fixed-width label, the WALK header's path, the
+    progress line -- by one column per character.
+    """
+    path = _wide_dir(tmp_path)
+    for width in (4, 12, 26, 53):
+        cut = ui.truncate(path, width)
+        got = ui.visible_width(cut)
+        assert got <= width, (width, got, cut)
+        # One column short is a wide glyph that cannot be split, and is invisible.
+        # More than one would mean the cut is throwing away readable path.
+        assert got >= width - 1, (width, got, cut)
+    assert ui.truncate(path, 26).endswith("\u96c6"), "the tail is the distinguishing part"
+
+
+def test_truncate_is_unchanged_for_an_ascii_path():
+    """Control: the paths that were always fine must be cut exactly as before.
+
+    Every path in this report is ASCII until someone names a directory in
+    Chinese. A column rule that also shifted the ordinary case by a character
+    would be trading a regression for a fix, so this pins `truncate` to the `len`
+    slice it replaced, character for character, including the degenerate widths.
+    """
+
+    def by_length(text, width):  # what `truncate` used to do
+        if width <= 0 or len(text) <= width:
+            return text
+        return text[-width:] if width <= 3 else "..." + text[-(width - 3) :]
+
+    for text in ("a/very/long/path/step-4000", "short", "", "a b  c", "/x/" + "y" * 40):
+        for width in range(-1, 30):
+            assert ui.truncate(text, width) == by_length(text, width), (text, width)
+
+
+def test_the_progress_line_fits_the_terminal_in_columns(tmp_path):
+    """Measured: an 80-column terminal, a CJK directory, a 94-column line.
+
+    The spinner truncates rather than wraps precisely because a wrapped progress
+    line cannot be erased with one carriage return. Cut by `len` it was not
+    truncated at all in the terminal's own units -- 71 characters, 94 columns --
+    so the terminal wrapped it, the next `\r` returned to the start of the *last*
+    physical row, and the row above stayed on screen for the rest of the walk. The
+    erase was short by the same 23 columns.
+
+    Assembled the way `cli._walk_with_progress` assembles it, so the two cuts the
+    line passes through are both under test and in the order they really happen.
+    """
+    path = _wide_dir(tmp_path)
+    style = ui.Style(color=False, unicode_ok=True, width=80, depth=8)
+    stream = Recorder()
+    spinner = ui.Spinner(style, stream=stream)
+    spinner.paint(
+        ui.progress_text(ui.truncate(path, max(20, style.width // 3)), 1234, 56, 900.0, 3.0)
+    )
+
+    line = stream.chunks[-1].lstrip("\r")
+    assert "scanning" in line
+    assert ui.visible_width(line) <= style.width - 1, ui.visible_width(line)
+
+    painted = ui.visible_width(line)
+    spinner.clear()
+    assert len(stream.chunks[-1].strip("\r")) >= painted, "the erase left debris behind"
+
+
+def test_an_escaped_name_cannot_widen_the_progress_line(tmp_path):
+    """The spinner's own clip is the last measurement before the write.
+
+    A control character in a name is one column of `len` and four of terminal
+    (`printable` turns it into `\\x01`), and it is the spinner that expands it --
+    so no earlier cut can bound the line, and `truncate` correctly counts the
+    unexpanded character as the nothing it renders as. That leaves exactly one
+    place the terminal's width can be enforced, which is why the clip has to
+    happen after `printable` and in columns.
+    """
+    name = "\u6570\u636e" * 4 + "\x01" * 24 + "log"
+    (tmp_path / name).mkdir()
+    path = os.path.join(str(tmp_path), os.listdir(str(tmp_path))[0])
+    style = ui.Style(color=False, unicode_ok=True, width=80, depth=8)
+    stream = Recorder()
+    spinner = ui.Spinner(style, stream=stream)
+    spinner.paint(
+        ui.progress_text(ui.truncate(path, max(20, style.width // 3)), 1234, 56, 900.0, 3.0)
+    )
+
+    line = stream.chunks[-1].lstrip("\r")
+    assert "\x01" not in line, "a raw control character reached the terminal"
+    assert ui.visible_width(line) <= style.width - 1, ui.visible_width(line)
+
+
+def test_a_progress_line_that_fits_is_not_cut():
+    """Control: the clip is a backstop, not a formatter.
+
+    An ASCII line inside the budget has to arrive whole -- a clip that shortened
+    it would drop the throughput figures off the right-hand end -- and the erase
+    that follows must match it exactly rather than overshoot into the prompt.
+    """
+    style = ui.Style(color=False, unicode_ok=True, width=100, depth=8)
+    stream = Recorder()
+    spinner = ui.Spinner(style, stream=stream)
+    text = ui.progress_text("/project/rcc/youzhi/data", 1234, 56, 900.0, 3.0)
+    spinner.paint(text)
+
+    line = stream.chunks[-1].lstrip("\r")
+    assert line.endswith(text), line  # only the spinner frame was added
+    spinner.clear()
+    assert len(stream.chunks[-1].strip("\r")) == len(line)

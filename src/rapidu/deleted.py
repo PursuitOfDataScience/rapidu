@@ -60,7 +60,18 @@ _PROC = "/proc"
 # The width is not pinned to 24: the field sizes come from kernel types that have
 # changed before, and a prefix plus all-hex is already specific enough that no
 # ordinary filename reaches it.
-_SILLY_RENAME_RE = re.compile(r"^\.nfs[0-9a-fA-F]{8,}$")
+#
+# `\Z`, not `$`. This pattern is the *whole* proof for the NFS half -- unlike the
+# unlinked half there is no `nlink == 0` to fall back on, since a silly-rename
+# entry has nlink == 1 exactly like every ordinary file -- so it has to mean what
+# it looks like it means. Python's `$` also matches immediately before a trailing
+# newline, and a newline is a legal byte in a filename: a real, still-linked,
+# still-charged `.nfs00000002945e149d\n` held open by any process was reported as
+# a deleted-but-open file, and its blocks were added to `silly_renamed_size` and
+# to the report's "held by deleted-but-open files on NFS" line. That is a
+# fabricated finding of the same class as trusting the " (deleted)" suffix, which
+# `_sweep` already refuses to do.
+_SILLY_RENAME_RE = re.compile(r"^\.nfs[0-9a-fA-F]{8,}\Z")
 
 
 # `st_uid` of an inode whose owner was never read. Not 0: that is root, and a
@@ -156,8 +167,27 @@ class DeletedScan:
 
     @property
     def complete(self) -> bool:
-        """False when other users' processes could not be inspected."""
-        return self.unreadable_pids == 0 and not self.namespaced and not self.timed_out
+        """False when anything was hidden from the sweep -- the sweep included.
+
+        ``available`` is the first term because a scan that never ran hid
+        *everything*. With ``--no-deleted``, or on a platform with no ``/proc``,
+        every counter below is 0 and the three tests all pass, so this said True
+        and ``--json`` published ``"complete": true`` beside
+        ``"available": false`` for a sweep that had not happened. A consumer
+        reading the completeness flag -- which is the field that exists to say
+        whether the figures can be trusted -- got the most reassuring possible
+        answer from the least informative possible run.
+
+        The other three are the ways a sweep that *did* run can still be partial:
+        another user's process (EACCES), a PID namespace that lists only its own
+        processes, and a sweep abandoned on a hung mount.
+        """
+        return (
+            self.available
+            and self.unreadable_pids == 0
+            and not self.namespaced
+            and not self.timed_out
+        )
 
     def under(self, prefix: str) -> "DeletedScan":
         """Restrict to inodes whose pre-deletion path was under ``prefix``."""
@@ -339,6 +369,44 @@ def _record_silly_rename(
     rec.add_holder(pid, _read_comm(pid))
 
 
+def _is_anonymous_kernel_object(path: str, dev: int, root_dev: Optional[int]) -> bool:
+    """Is ``path`` an anonymous kernel object rather than a file someone unlinked?
+
+    ``memfd_create``, a SysV shm segment, an aio/io_uring ring and a dma-buf each
+    produce a *regular file* on a kernel-internal shmem mount that was never
+    linked into any directory. ``d_path`` renders such a dentry as though it sat
+    in the root directory -- ``/memfd:torch-shm``, ``/SYSV00000000``, ``/[aio]``,
+    ``/dmabuf`` -- and, because it is unlinked by construction, appends
+    " (deleted)" to it unconditionally.
+
+    So ``S_ISREG`` is true and ``st_nlink`` is 0: both of the gates that make the
+    unlinked finding trustworthy pass, and the object is recorded as space held by
+    a deleted file. Measured on an ordinary login node here, with no setup at all,
+    ``/memfd:pulseaudio`` was reported under a header promising files "invisible to
+    ``du``" whose "blocks are still allocated, and on a quota-enforced filesystem
+    may still be charged" -- for a path that has never existed in any filesystem
+    and bytes no quota will ever show. A synthetic 16 MiB ``memfd`` was attributed
+    in full, and ``reconcile`` added it to ``accounted``, closing part of a real
+    quota gap with anonymous memory.
+
+    :func:`_sweep` already drops this entire class wherever the kernel renders it
+    *without* a leading slash -- ``pipe:[...]``, ``socket:[...]``,
+    ``anon_inode:[...]``, which its own comment names. These are the same kind of
+    object; they slip past that guard only because their rendering begins with "/".
+
+    **The test is exact, not a name match.** A path with no directory component
+    means the file sat in the root directory, so it lived on whatever is mounted at
+    "/" and its ``st_dev`` is that filesystem's by definition. A different
+    ``st_dev`` therefore proves the string is not a path. A genuine unlinked
+    ``/core.1234`` on the root filesystem matches ``root_dev`` and is still
+    reported, and anything with a directory component is not considered here at
+    all -- so no real finding is dropped to catch these.
+    """
+    if root_dev is None or os.path.dirname(path) != "/":
+        return False
+    return dev != root_dev
+
+
 def _sweep(
     res: DeletedScan, found: "List[DeletedFile]", prefix: Optional[str], done: "threading.Event"
 ) -> None:
@@ -350,6 +418,14 @@ def _sweep(
     # partial findings are readable exactly as `found` already is.
     silly_by_inode = {}  # type: Dict[Tuple[int, int], DeletedFile]
     pref = os.path.abspath(prefix).rstrip("/") if prefix else None
+    # For `_is_anonymous_kernel_object`. Read once: it is the same answer for every
+    # fd in the sweep, and "/" is never on the kind of mount this sweep is bounded
+    # against. `None` where even that cannot be read, which leaves the check
+    # inoperative rather than dropping a finding on evidence we do not have.
+    try:
+        root_dev = os.stat("/").st_dev  # type: Optional[int]
+    except OSError:
+        root_dev = None
 
     for entry in os.listdir(_PROC):
         if not entry.isdigit():
@@ -404,6 +480,11 @@ def _sweep(
             # tool whose entire job is to avoid making them. We already hold the
             # fd, so the authoritative test costs nothing.
             if st.st_nlink != 0:
+                continue
+            # ...and nlink == 0 is not the whole proof either, because an object
+            # that was never linked in the first place also has none. See
+            # `_is_anonymous_kernel_object`.
+            if _is_anonymous_kernel_object(path, st.st_dev, root_dev):
                 continue
             key = (st.st_dev, st.st_ino)
             rec = by_inode.get(key)

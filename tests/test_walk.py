@@ -694,3 +694,87 @@ def test_the_walk_uses_the_count_it_chose(tmp_path, monkeypatch):
     _fixed(monkeypatch, "gpfs", 400.0)
     assert walk(str(tmp_path)).threads == walkmod.DEFAULT_THREADS
     assert walk(str(tmp_path), threads=3).threads == 3
+
+
+# --------------------------------------------------------------------------
+# "an mtime ahead of this node's clock" is a live question, not a walk-start one
+# --------------------------------------------------------------------------
+#
+# `future_files` exists so that a tree whose timestamps sit ahead of this node's
+# clock -- a client trailing the fileserver, a restored archive -- is not reported
+# as permanently just-written. The report names that cause out loud: "most likely
+# a clock difference between this node and the fileserver, or restored
+# timestamps".
+#
+# The walk pins one `now` at the start, which is right for the settle window and
+# the age buckets (they have to be one measurement) and wrong for this: a file
+# written *while the walk was running* is ahead of the walk's start on a node
+# whose clock is perfect. This walk takes tens of seconds on the trees it exists
+# for, and an actively written tree is exactly what it gets pointed at, so that is
+# one false clock finding per file written during the run.
+
+
+def _rate_limited_tree(root, ballast):
+    """A tree the rate limiter walks in a known *minimum* time.
+
+    `TokenBucket` hands out `burst` tokens free and then one per `1/rate`
+    seconds, and one token is taken before each directory is opened, so
+    directory *k* cannot be opened before `(k - burst) / rate` seconds have
+    passed. Scheduling can only make it later, which is the safe direction for
+    the assertion below.
+
+    The file under test sits at the bottom of a five-deep chain, so it is
+    breadth-first last: every depth-1 entry is scanned before the chain's second
+    link is even queued.
+    """
+    os.makedirs(root)
+    for i in range(ballast):
+        os.makedirs(os.path.join(root, "b%02d" % i))
+    deep = root
+    for link in ("c1", "c2", "c3", "c4", "c5"):
+        deep = os.path.join(deep, link)
+        os.makedirs(deep)
+    return os.path.join(deep, "written_during_the_walk")
+
+
+def test_a_file_written_during_the_walk_is_not_a_clock_difference(tmp_path):
+    """The one case where the walk's own duration decides the answer.
+
+    Reproduced before the fix on an ordinary walk: 2.05s of wall time, one file
+    written 1.5s in, ``future_files: 1`` -- on a node whose clock was correct, so
+    the report's stated cause was false. The mtime here is 0.4s ahead of the
+    walk's start and the rate limit puts the file's own ``stat`` at least 1.2s in,
+    so by the time it is read the wall clock has passed it.
+    """
+    root = str(tmp_path / "t")
+    target = _rate_limited_tree(root, ballast=40)
+
+    started = time.time()
+    with open(target, "wb") as fh:
+        fh.write(b"x" * 4096)
+    os.utime(target, (started + 0.4, started + 0.4))
+
+    res = walk(root, threads=1, depth=1, max_dirs_per_sec=20.0)
+    assert res.recent_files == 1, "it really was written recently, which must stay true"
+    assert res.future_files == 0, (
+        "an mtime 0.4s after the walk started, read 1.2s in, is behind the clock"
+    )
+
+
+def test_a_genuinely_future_dated_file_is_still_counted(tmp_path):
+    """The control: the finding this counter exists for must survive the fix.
+
+    Same tree, same rate limit, same walk -- only the mtime differs, and it is
+    ahead of the clock by an hour rather than by less than the walk's duration.
+    """
+    root = str(tmp_path / "t")
+    target = _rate_limited_tree(root, ballast=40)
+
+    started = time.time()
+    with open(target, "wb") as fh:
+        fh.write(b"x" * 4096)
+    os.utime(target, (started + 3600.0, started + 3600.0))
+
+    res = walk(root, threads=1, depth=1, max_dirs_per_sec=20.0)
+    assert res.recent_files == 1
+    assert res.future_files == 1, "an hour ahead is a clock difference, whenever it is read"

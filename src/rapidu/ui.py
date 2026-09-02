@@ -483,6 +483,21 @@ BOX_CHROME = 4
 _MIN_INNER = 20
 
 
+def _char_columns(ch: str) -> int:
+    """Columns one character occupies: two, one, or none.
+
+    Split out of :func:`visible_width` so that a *cut* measured in columns
+    (:func:`_clip`) cannot disagree with the measurement it is cutting to. Two
+    copies of this rule is how a string that had been "truncated to 26" came back
+    26 characters and 49 columns wide.
+    """
+    if unicodedata.combining(ch):
+        return 0
+    if ch != " " and not ch.isprintable():
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
 def visible_width(text: str) -> int:
     """Columns ``text`` occupies on a terminal.
 
@@ -498,15 +513,43 @@ def visible_width(text: str) -> int:
     their true zero width anyway, so that a caller which forgets is off by
     nothing rather than off by one per character.
     """
-    plain = _ANSI_RE.sub("", text)
     width = 0
-    for ch in plain:
-        if unicodedata.combining(ch):
-            continue
-        if ch != " " and not ch.isprintable():
-            continue
-        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    for ch in _ANSI_RE.sub("", text):
+        width += _char_columns(ch)
     return width
+
+
+def _clip(text: str, width: int, keep_tail: bool = False) -> str:
+    """The longest prefix -- or suffix -- of ``text`` that fits in ``width`` columns.
+
+    A wide glyph is never split: where one would straddle the edge it is dropped
+    instead, so the result can come out a column short and can never come out a
+    column over. That asymmetry is deliberate -- one column of slack is invisible,
+    one column of overrun is a wrapped line or a broken border.
+
+    ``text`` is expected to be unpainted; an SGR sequence would be cut like the
+    characters it is made of. Both callers cut before anything is painted.
+    """
+    if width <= 0:
+        return ""
+    chars = list(text)
+    if keep_tail:
+        chars.reverse()
+    kept = []  # type: List[str]
+    used = 0
+    for ch in chars:
+        columns = _char_columns(ch)
+        if used + columns > width:
+            break
+        kept.append(ch)
+        used += columns
+    if keep_tail:
+        kept.reverse()
+        # A suffix must not open with a combining mark whose base was cut away:
+        # it would attach itself to whatever precedes it, which is the ellipsis.
+        while kept and unicodedata.combining(kept[0]):
+            kept.pop(0)
+    return "".join(kept)
 
 
 def _escape_char(ch: str) -> str:
@@ -907,15 +950,50 @@ def _lstrip_visible(piece: str) -> str:
 
 
 def truncate(text: str, width: int) -> str:
-    """Shorten to ``width``, keeping the tail, which is the distinguishing part.
+    """Shorten to ``width`` **columns**, keeping the tail, which is distinguishing.
 
     ``.../checkpoints/step-4000`` says more than ``experiments/run-a/che...``.
+
+    Columns, not characters -- the same rule as everything else below
+    :data:`_ANSI_RE`, and for the same reason. Slicing by ``len`` looked right for
+    as long as every path was ASCII and then silently overflowed the field it was
+    cut for: a directory named in Chinese is two columns per character, so
+    ``truncate(name, 26)`` handed back 26 characters occupying 49 columns.
+    Measured, on a real directory whose name came off the filesystem: a progress
+    line cut to "79" rendered 94 columns wide on an 80-column terminal, wrapped,
+    and could no longer be erased by the carriage return that erases it.
     """
-    if width <= 0 or len(text) <= width:
+    if width <= 0 or visible_width(text) <= width:
         return text
     if width <= 3:
-        return text[-width:]
-    return "..." + text[-(width - 3) :]
+        return _clip(text, width, keep_tail=True)
+    return "..." + _clip(text, width - 3, keep_tail=True)
+
+
+def pad(text: str, width: int) -> str:
+    """``text`` left-justified to ``width`` **columns**, the way ``truncate`` cuts.
+
+    ``"{:<{w}}".format(text, w=width)`` -- and ``str.ljust`` -- count *characters*,
+    which is the same mistake :func:`truncate` was fixed for, at the other end of
+    the same field. A field whose width is measured in columns and then filled by
+    character count cannot align: the padding is computed against a length the
+    terminal does not use.
+
+    Measured, on the quota table's fileset column: a label of three wide glyphs
+    (``len`` 3, six columns) padded by ``{:<16}`` came out sixteen characters and
+    *nineteen* columns, pushing the scope, kind, used/limit, bar, percentage and
+    mount columns three columns right on that row alone. A thirty-glyph label,
+    which ``truncate`` had already cut to fit, came out thirteen columns over.
+    Both are strings a subprocess printed -- a GPFS fileset name, a device path --
+    so neither is under this tool's control.
+
+    Never shortens: a caller that wants a bound uses :func:`truncate` first, and
+    silently cutting here would hide the case where it forgot. Where ``truncate``
+    has dropped a wide glyph rather than split it and come back a column short,
+    this fills that column, which is the whole point of measuring both ends the
+    same way.
+    """
+    return text + " " * max(0, width - visible_width(text))
 
 
 def heading(text: str, style: Style) -> str:
@@ -1126,11 +1204,18 @@ class Spinner:
         line = "{} {}".format(self.frame(), printable(text))
         # Truncate rather than wrap: a wrapped progress line cannot be erased
         # with a single carriage return and leaves debris behind.
-        line = line[: max(0, self.style.width - 1)]
-        pad = " " * max(0, self._painted - len(line))
+        #
+        # In columns, and after `printable`, because those are the two ways a
+        # `len`-based cut lets the line through wider than the terminal -- one CJK
+        # character is two columns, and one control character becomes four. This
+        # is the last measurement before the write, so it is the one that has to be
+        # the terminal's own.
+        line = _clip(line, max(0, self.style.width - 1))
+        painted = visible_width(line)
+        pad = " " * max(0, self._painted - painted)
         self.stream.write("\r" + self.style.paint(line, "dim") + pad)
         self.stream.flush()
-        self._painted = len(line)
+        self._painted = painted
 
     def clear(self) -> None:
         if not self.enabled or not self._painted:

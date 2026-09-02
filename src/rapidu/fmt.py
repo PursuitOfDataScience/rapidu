@@ -25,8 +25,24 @@ def human_bytes(n: Optional[int], precision: int = 1) -> str:
     neg = n < 0
     v = float(abs(n))
     for unit in _UNITS:
-        if v < 1024.0 or unit == _UNITS[-1]:
-            s = "{:.{p}f} {}".format(v, unit, p=0 if unit == "B" else precision)
+        places = 0 if unit == "B" else precision
+        # Compare the ROUNDED value, not the raw one. `v < 1024.0` let a figure
+        # just under a boundary through and then rounded it *up* across it, so
+        # 1 GiB - 1 printed as "1024.0 MiB" -- 1024 of a unit that has a larger
+        # sibling, which no formatter should ever emit. `du -h` and
+        # `numfmt --to=iec` both give "1.0G" for that byte count. The window is
+        # narrow at MiB (~52 KiB wide) and wide where the numbers here actually
+        # live: ~52 MiB below every TiB boundary, on a tool whose headline figure
+        # is a filesystem total. Rounded at the same precision the format string
+        # will use, so the test and the output cannot disagree.
+        #
+        # The docstring above `_UNITS` already describes this defect at the TOP of
+        # the scale ("rendering 1 EiB as 1024.0 PiB") and fixed it by extending the
+        # unit list; the interior boundaries have the same bug for a different
+        # reason. A sibling package's `format_bytes` has compared the rounded value
+        # since its own sighting of this (A5).
+        if unit == _UNITS[-1] or round(v, places) < 1024.0:
+            s = "{:.{p}f} {}".format(v, unit, p=places)
             return "-" + s if neg else s
         v /= 1024.0
     return "n/a"  # unreachable

@@ -257,3 +257,158 @@ def test_count_mode_file_comparison_is_blocked_by_hardlinks():
     )
     assert rec.verdict == rc.INCONCLUSIVE
     assert any("one entry per name" in b for b in rec.blockers)
+
+
+# ---- SUBTREE prints a number, so the number has to say what it is --------
+
+
+def test_a_subtree_share_computed_from_an_incomplete_walk_is_a_lower_bound():
+    """SUBTREE returns before the blocker list, and still prints a percentage.
+
+    Every other verdict routes an unreadable directory or an interrupted walk into
+    ``blockers`` and downgrades to INCONCLUSIVE. SUBTREE returns first, so
+    ``blockers`` was empty and ``verdict_line`` read "this subtree is 25.0% of the
+    fs quota figure" for a walk that had been interrupted and could not read
+    11,267 of its own directories -- a floor over a fixed denominator, stated as a
+    measurement. SUBTREE is not a finding and needs no downgrade; it is the figure
+    that has to be labelled.
+    """
+    w = make_walk(1000, root=MOUNT + "/subdir")
+    w.unreadable_dirs = [(MOUNT + "/subdir/x", "Permission denied")]
+    w.unreadable_dirs_dropped = 11266
+    w.unstatable = 40
+    w.partial = True
+    r = rc.reconcile(w, fresh_settle(), make_snap(4000), empty_scan(), "blocks")
+
+    assert r.verdict == rc.SUBTREE
+    assert r.walk_is_floor
+    line = rc.verdict_line(r)
+    assert line == "this subtree is at least 25.0% of the fs quota figure", line
+    # And the note has to name the causes, since the blocker list never runs here.
+    floor_notes = [n for n in r.notes if "floor" in n]
+    assert len(floor_notes) == 1, r.notes
+    note = floor_notes[0]
+    assert "lower bound" in note
+    assert "not a measurement" in note
+    assert "11,267 directories could not be read" in note
+    assert "40 entries could not be stat'ed" in note
+    assert "interrupted" in note
+
+
+def test_a_subtree_share_from_a_complete_walk_is_stated_plainly():
+    """Control: the label must be attached to the floor, not to every subtree.
+
+    Marking every SUBTREE "at least" would pass the test above and make the
+    qualifier meaningless -- a hedge on a number that is not hedged is the same
+    failure as an unhedged floor, one direction over. Identical walk, nothing
+    unread, nothing unstat'ed, not interrupted.
+    """
+    w = make_walk(1000, root=MOUNT + "/subdir")
+    assert w.complete
+    r = rc.reconcile(w, fresh_settle(), make_snap(4000), empty_scan(), "blocks")
+
+    assert r.verdict == rc.SUBTREE
+    assert not r.walk_is_floor
+    assert rc.verdict_line(r) == "this subtree is 25.0% of the fs quota figure"
+    assert not [n for n in r.notes if "floor" in n or "lower bound" in n]
+
+
+def gap_candidates(scan):
+    """The candidate causes for a large positive gap, given one /proc scan."""
+    r = rc.reconcile(make_walk(1000), fresh_settle(), make_snap(50_000_000), scan, "blocks")
+    assert r.gap > 0, r.gap
+    return r.candidates
+
+
+def test_a_namespaced_scan_does_not_blame_zero_other_users():
+    """A cause naming a population the scan measured as empty is not a cause.
+
+    ``DeletedScan.complete`` is False for three unrelated reasons -- EACCES, a PID
+    namespace, an abandoned sweep -- and the candidate list was gated on it while
+    printing only the first. Inside Apptainer, which is how most work on this
+    cluster runs, ``unreadable_pids`` is 0 and every gap listed
+    "unlinked-but-open files held by 0 processes belonging to other users" while
+    the limit that actually applied went unmentioned.
+    """
+    scan = DeletedScan()
+    scan.scanned_pids = 1
+    scan.namespaced = True
+    assert not scan.complete
+    cands = gap_candidates(scan)
+
+    assert not [c for c in cands if "0 process" in c], cands
+    assert not [c for c in cands if "belonging to other users" in c], cands
+    assert [c for c in cands if "outside this PID namespace" in c], cands
+
+
+def test_an_abandoned_sweep_names_itself_rather_than_other_users():
+    """The same substitution, for the other reason ``complete`` goes False."""
+    scan = DeletedScan()
+    scan.scanned_pids = 12
+    scan.timed_out = True
+    assert not scan.complete
+    cands = gap_candidates(scan)
+
+    assert not [c for c in cands if "0 process" in c], cands
+    assert [c for c in cands if "abandoned on an unresponsive mount" in c], cands
+
+
+def test_a_scan_that_never_ran_is_not_credited_with_covering_this_node():
+    """``complete`` said True for a scan that did not happen, which reads backwards.
+
+    With ``--no-deleted`` -- or on a platform with no ``/proc`` -- ``available`` is
+    False and every counter is 0, so ``complete`` said yes and the candidate list
+    offered only "this scan only sees this node". An unlinked-but-open file on
+    *this* node is precisely what a scan that did not run cannot rule out, so the
+    one caveat printed was the one that did not apply.
+    """
+    scan = DeletedScan()
+    scan.available = False
+    scan.reason = "skipped (--no-deleted)"
+    # `complete` now tests `available` first, so the flag agrees with the wording:
+    # see `test_deleted.TestCompleteRequiresAScanThatRan`.
+    assert not scan.complete
+    cands = gap_candidates(scan)
+
+    assert not [c for c in cands if "only sees this node" in c], cands
+    did_not_run = [c for c in cands if "did not run" in c]
+    assert len(did_not_run) == 1, cands
+    assert "this node" in did_not_run[0]
+    assert "skipped (--no-deleted)" in did_not_run[0]
+    # The rest of the list is untouched: this is about coverage, not about
+    # withholding the other hypotheses.
+    assert [c for c in cands if "snapshots" in c], cands
+
+
+def test_refused_processes_are_still_named_as_a_cause():
+    """Control: the EACCES caveat is the point of the list and must survive.
+
+    Silencing the other-users candidate whenever ``complete`` is False would pass
+    all three tests above and delete the module's most useful hypothesis -- on a
+    shared login node 579 of 646 processes are another user's, which is the whole
+    reason a group quota can show a gap nobody can attribute. Both figures also
+    have to agree with their noun; the old wording was a fixed plural.
+    """
+    scan = DeletedScan()
+    scan.scanned_pids = 67
+    scan.unreadable_pids = 579
+    many = gap_candidates(scan)
+    assert [c for c in many if "579 processes belonging to other users" in c], many
+    assert [c for c in many if "only sees this node" in c], many
+
+    scan.unreadable_pids = 1
+    one = gap_candidates(scan)
+    assert [c for c in one if "1 process belonging to other users" in c], one
+
+
+def test_a_complete_local_scan_lists_only_the_other_nodes_caveat():
+    """Control: a scan with nothing to caveat must not invent one."""
+    scan = DeletedScan()
+    scan.scanned_pids = 646
+    assert scan.complete
+    cands = gap_candidates(scan)
+
+    assert [c for c in cands if "only sees this node" in c], cands
+    assert not [c for c in cands if "belonging to other users" in c], cands
+    assert not [c for c in cands if "PID namespace" in c], cands
+    assert not [c for c in cands if "did not run" in c], cands

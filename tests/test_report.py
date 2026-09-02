@@ -10,6 +10,7 @@ import re
 
 from rapidu import report, ui
 from rapidu.deleted import DeletedScan
+from rapidu.quota import QuotaRow, QuotaSnapshot
 from rapidu.walk import Entry, SettleCheck, WalkResult
 
 PLAIN = ui.resolve_style("never")
@@ -222,6 +223,130 @@ def test_every_row_of_a_skewed_listing_gets_its_own_colour():
     assert len(set(tones)) == len(shares), tones
 
 
+# --- the listing's arithmetic has to close ---------------------------------
+
+_BAR_GLYPHS = "".join(
+    set(PLAIN.bar_chars + PLAIN.partials + (ui._BAR_HATCH, ui._BAR_HATCH_ASCII)) - {""}
+)
+_BYTE_UNITS = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}
+
+
+def row_figures(row):
+    """The bytes and inodes one *rendered* row shows, or None if it shows none.
+
+    Parsed back out of the text rather than read off the entries, because the
+    claim under test is about what the reader is told. Every figure in the
+    fixtures below is a whole number of GiB, so the round trip through
+    ``human_bytes`` is lossless and the sums can be compared exactly.
+    """
+    left, _, right = re.sub("[" + re.escape(_BAR_GLYPHS) + "]+", "\x00", row).partition("\x00")
+    cells = [c for c in re.split(r"\s{2,}", right.strip()) if c]
+    counts = [c for c in cells if re.match(r"^[\d,]+$", c)]
+    if not counts:
+        # A bare "N more" line: a count, no columns, nothing summed.
+        return None
+    inodes = int(counts[0].replace(",", ""))
+    figure = left.strip()
+    if not figure:
+        return None, inodes  # `-c` prints no byte column at all
+    number, unit = figure.split()
+    return int(round(float(number) * _BYTE_UNITS[unit])), inodes
+
+
+def sparse_listing(root="/tmp/tree"):
+    """A tree whose smaller children hold inodes and no *allocated* bytes.
+
+    Not a contrived shape. On XFS a small directory is stored inside its own
+    inode, so ``st_blocks`` is 0 -- a subtree of directories costs inodes and no
+    space at all, and ``/tmp`` on this host is exactly such a filesystem: every
+    fixture directory this suite builds reports zero allocated bytes.
+
+    ``d0``, ``d1`` and ``d2`` are deliberately identical on both ranking keys, so
+    the listings below also cover a tie: which of them lands above the summary row
+    may vary, but what the summary has to account for must not.
+    """
+    r = make_walk(root=root)
+    kids = [("big", 4 << 30, 3), ("mid", 2 << 30, 3), ("d0", 0, 4), ("d1", 0, 4), ("d2", 0, 4)]
+    for name, nbytes, inodes in kids:
+        e = Entry(os.path.join(root, name), True)
+        e.add(nbytes, inodes - 1, 1)
+        r.dir_agg[e.path] = e
+    r.size = sum(e.size for e in r.dir_agg.values())
+    r.apparent = r.size
+    r.files = sum(e.files for e in r.dir_agg.values())
+    # The root's own inode is not a child of anything and so has no row. It is
+    # the one thing a complete listing legitimately leaves out.
+    r.dirs = sum(e.dirs for e in r.dir_agg.values()) + 1
+    r.by_uid = {os.getuid(): (r.size, r.inodes)}
+    r.by_dev = {42: (r.size, r.inodes)}
+    return r
+
+
+def test_the_shown_rows_and_the_summary_complete_the_total():
+    """Rows + "(N more -- use -n 0 for all)" == the tree, in both columns.
+
+    The summary row was gated on ``rest_size > 0`` -- bytes only -- and that is
+    the wrong column twice over. A root whose hidden children are directories has
+    ``rest_size == 0`` on any filesystem that stores a small directory in its
+    inode, so ``-n 1`` printed one row of 3 inodes, then a bare "4 more", and the
+    other 12 inodes were stated nowhere in the report. Under ``-c`` every size is
+    zero, so the one mode whose only measurement is inodes never printed a
+    summary at all.
+    """
+    res = sparse_listing()
+    for top in (0, 1, 2, 3, 99):
+        for by_inodes in (False, True):
+            rows = report.render_entries(res, top, by_inodes, PLAIN)
+            figures = [row_figures(row) for row in rows]
+            assert None not in figures, (top, by_inodes, rows)
+            shown_bytes = sum(f[0] for f in figures)
+            shown_inodes = sum(f[1] for f in figures)
+            if "more" in rows[-1]:
+                assert shown_bytes == res.size, (top, by_inodes, rows)
+                assert shown_inodes == res.inodes, (top, by_inodes, rows)
+            else:
+                # Nothing hidden, so the only thing off the table is the root's
+                # own inode -- and every byte is still accounted for.
+                assert shown_bytes == res.size, (top, by_inodes, rows)
+                assert shown_inodes == res.inodes - 1, (top, by_inodes, rows)
+
+    counted = sparse_listing()
+    counted.count_only = True
+    counted.size = 0
+    for entry in counted.dir_agg.values():
+        entry.size = 0
+    rows = report.render_entries(counted, 2, True, PLAIN)
+    figures = [row_figures(row) for row in rows]
+    assert None not in figures, rows
+    assert [f[0] for f in figures] == [None] * len(rows), rows
+    assert "more" in rows[-1], rows
+    assert sum(f[1] for f in figures) == counted.inodes, rows
+
+
+def test_the_summary_row_is_still_withheld_where_it_would_double_count():
+    """The control on the test above: the fix widened *which figures* earn the
+    summary row, not *when* a row may carry figures at all.
+
+    Nested rows overlap, so bytes or inodes attached to them would double-count,
+    and an interrupted walk does not know what it failed to scan. Both still get
+    the bare count, or nothing -- a total is withheld because it would be wrong,
+    not because one of its columns happens to be zero.
+    """
+    nested = sparse_listing()
+    inner = Entry(os.path.join("/tmp/tree", "big", "inner"), True)
+    inner.add(1 << 30, 2, 1)
+    nested.dir_agg[inner.path] = inner
+    assert not report._entries_partition_tree(nested)
+    tail = report.render_entries(nested, 2, False, PLAIN)[-1]
+    assert "more" in tail and "use -n 0 for all" in tail
+    assert row_figures(tail) is None, tail
+
+    stopped = sparse_listing()
+    stopped.partial = True
+    stopped.finished_tops = {os.path.basename(e.path) for e in stopped.dir_agg.values()}
+    assert "more" not in "\n".join(report.render_entries(stopped, 1, False, PLAIN))
+
+
 def test_a_clean_deleted_scan_is_one_fact_on_the_walk_line():
     scan = DeletedScan()
     scan.scanned_pids = 27
@@ -244,3 +369,272 @@ def test_an_empty_deleted_scan_does_not_read_as_an_all_clear():
     assert "not an all-clear" in out
     assert "compute node" in out
     assert "27 of 1443" in out
+
+
+# ---------------------------------------------------------------------------
+# The quota table's label column, measured and filled in COLUMNS
+# ---------------------------------------------------------------------------
+
+# Nine CJK characters: `len` says 9, a terminal spends 18 cells drawing them.
+# Both numbers are under and over the column's 16-cell floor respectively, so a
+# character-based width both under-sizes the column and over-fills it.
+_WIDE = "\u4e2d\u6587\u9879\u76ee\u6587\u4ef6\u96c6\u5408\u533a"
+
+
+def quota_snapshot(*filesets):
+    """One `blocks` row per fileset, all on one device, all half full."""
+    snap = QuotaSnapshot("mmlsquota")
+    snap.rows = [
+        QuotaRow(name, "blocks", "user", 100, 200, 300, "", "/mnt/" + str(i), False, "dev")
+        for i, name in enumerate(filesets)
+    ]
+    snap.available = True
+    snap.taken_at = snap.read_at
+    return snap
+
+
+def quota_label_cells(snap):
+    """The rendered label field of every row, scope column onward stripped."""
+    cells = []
+    for line in report.render_quota(snap, style=PLAIN):
+        if " blocks " in line:
+            cells.append(line.split("user")[0])
+    return cells
+
+
+def test_the_quota_label_column_is_sized_and_filled_in_columns():
+    """A fileset named in Chinese took the label column apart two ways at once.
+
+    `render_quota` sized the field with `len` and filled it with `{:<{w}}`, both
+    character counts, in a module whose `ui` measures and cuts in columns. For a
+    nine-glyph name that is 9 against the 18 cells it actually occupies, so the
+    column was sized at the 16-cell floor -- narrower than the label needed --
+    and `ui.truncate`, which *does* count columns, then cut a name that fits.
+    The row lost data and still pushed the scope, kind, used/limit, bar,
+    percentage and mount columns six cells right of every other row.
+
+    Fileset names come from whatever `mmlsquota` printed, so this is a name the
+    tool is handed, not one it composes.
+    """
+    cells = quota_label_cells(quota_snapshot("home", _WIDE))
+    assert len(cells) == 2, cells
+    # Nothing was cut: the column is as wide as its widest member needs.
+    assert _WIDE in cells[1], cells[1]
+    assert "..." not in cells[1], cells[1]
+    # And the next column starts at one cell on both rows -- which is the only
+    # sense in which a table is aligned.
+    assert ui.visible_width(cells[0]) == ui.visible_width(cells[1]), cells
+    # Not by accident of equal character counts: these two differ there.
+    assert len(cells[0]) != len(cells[1]), cells
+
+
+def test_an_ascii_quota_label_is_padded_exactly_as_it_always_was():
+    """The control: counting columns must not re-pad a table of ASCII names.
+
+    `ui.visible_width` and `len` agree on every character a POSIX fileset name
+    normally contains, so every existing panel has to come out unchanged --
+    including the 16-cell floor for short names and the measured width for a
+    name that passes it. A fix that widened or shifted these would satisfy the
+    test above and quietly move every column in every report anyone has.
+    """
+    # Short names: the floor, filled to 16 by the old character-based expression.
+    cells = quota_label_cells(quota_snapshot("home", "scratch"))
+    assert cells == [
+        "  " + "{:<{w}}".format("dev:home", w=16) + "  ",
+        "  " + "{:<{w}}".format("dev:scratch", w=16) + "  ",
+    ], cells
+    # A name past the floor: measured, still character-for-character the same.
+    longer = "project-with-a-long-name"
+    cells = quota_label_cells(quota_snapshot("home", longer))
+    width = max(len("dev:home"), len("dev:" + longer))
+    assert cells == [
+        "  " + "{:<{w}}".format("dev:home", w=width) + "  ",
+        "  " + "{:<{w}}".format("dev:" + longer, w=width) + "  ",
+    ], cells
+
+
+# ---------------------------------------------------------------------------
+# The owners / groups block's name column, measured and filled in COLUMNS
+# ---------------------------------------------------------------------------
+
+# The byte figure of an owners row, wherever it has ended up. The inode count
+# beside it cannot match: `human_count` prints no unit.
+_ROW_BYTES = re.compile(r"[\d.]+ (?:[KMGTP]i)?B")
+
+
+def owner_rows(uids, gids, monkeypatch):
+    """The rendered `by-uid` and `by-gid` rows of a walk, names substituted.
+
+    `uids` and `gids` map a name to its `(size, inodes)` cell; the uid and gid
+    numbers are an implementation detail of the lookup being stubbed. What `pwd`
+    and `grp` return is the site's business and not this tool's -- see the two
+    real names quoted in the test below.
+    """
+    r = make_walk()
+    r.by_uid = {}
+    r.by_gid = {}
+    unames = {}
+    gnames = {}
+    for i, (name, cell) in enumerate(uids.items()):
+        r.by_uid[1000 + i] = cell
+        unames[1000 + i] = name
+    for i, (name, cell) in enumerate(gids.items()):
+        r.by_gid[2000 + i] = cell
+        gnames[2000 + i] = name
+    monkeypatch.setattr(report, "_uname", lambda uid: unames.get(uid, str(uid)))
+    monkeypatch.setattr(report, "_gname", lambda gid: gnames.get(gid, str(gid)))
+    lines = report.render_walk(r, make_settle(), style=PLAIN)
+    # Six spaces of indent and a trailing inode count is the row shape; the facts
+    # line above also says "inodes" and starts at two.
+    return [ln for ln in lines if re.match(r"^ {6}\S.* [\d,]+ inodes?$", ln)]
+
+
+def test_the_owner_name_column_is_sized_and_filled_in_columns(monkeypatch):
+    """A name longer than sixteen characters moved its own row's columns.
+
+    The field was a hard-coded `{:<16}` with no measurement behind it at all, for
+    a string `pwd` and `grp` hand over from whatever the site's directory holds.
+    Both long names below are real accounts and groups on the cluster this was
+    written for: `gnome-initial-setup` is nineteen characters and
+    `caprioli-cattaneo-software` is twenty-six, so each shifted its own row's
+    bytes, inode count and noun three and ten cells right of the column every
+    other row keeps them in -- in plain ASCII, before any question of glyph
+    width. `_WIDE` is the same field failing at the other end: nine characters
+    and eighteen cells, so `{:<16}` filled it to sixteen characters and
+    twenty-two columns.
+
+    The width is shared by both blocks, which print under two captions with no
+    break between them and are read against each other.
+    """
+    rows = owner_rows(
+        {"youzhi": (3 << 30, 500), "gnome-initial-setup": (2 << 30, 400), _WIDE: (1 << 30, 300)},
+        {"rcc": (3 << 30, 500), "caprioli-cattaneo-software": (2 << 30, 400)},
+        monkeypatch,
+    )
+    assert len(rows) == 5, rows
+    # Nothing was cut -- the column is as wide as its widest member needs.
+    for name in ("gnome-initial-setup", "caprioli-cattaneo-software", _WIDE):
+        assert any(name in row for row in rows), (name, rows)
+    # And the byte column ends on the same cell on every row, which is the only
+    # sense in which a table is aligned.
+    ends = {ui.visible_width(row[: _ROW_BYTES.search(row).end()]) for row in rows}
+    assert len(ends) == 1, rows
+    # Not by accident of equal character counts: the wide-glyph row differs there.
+    assert len({len(row[: _ROW_BYTES.search(row).end()]) for row in rows}) > 1, rows
+
+
+def test_a_short_ascii_owner_name_is_padded_exactly_as_it_always_was(monkeypatch):
+    """The control: measuring the column must not re-pad the panel everyone has.
+
+    `len` and `ui.visible_width` agree on every character a POSIX account or group
+    name normally contains, so a block of short ASCII names has to come out
+    character-for-character what the hard-coded field produced -- sixteen is now
+    the floor rather than the whole rule, and it still has to be the answer here.
+    A fix that widened these rows would satisfy the test above and quietly move
+    every column of every owners block already in a support ticket.
+    """
+    rows = owner_rows(
+        {"youzhi": (3 << 30, 500), "root": (2 << 30, 400)},
+        {"rcc": (3 << 30, 500), "kicp": (2 << 30, 400)},
+        monkeypatch,
+    )
+    # Written out as the old expression, not as literals: the field width, the
+    # two figure columns and the single space before the noun are all pinned.
+    assert rows == [
+        "      {:<16}{:>12}  {:>12} inodes".format(name, size, count)
+        for name, size, count in [
+            ("youzhi", "3.0 GiB", "500"),
+            ("root", "2.0 GiB", "400"),
+            ("rcc", "3.0 GiB", "500"),
+            ("kicp", "2.0 GiB", "400"),
+        ]
+    ], rows
+
+
+class TestCountOnlyDoesNotPublishAZeroItNeverMeasured:
+    """`hardlinked_inodes` and `hardlink_extra_refs` were emitted raw under `-c`.
+
+    Both need `st_nlink`/`st_ino`, which `-c` skips by design, so the dedup pass
+    never runs and both stay at their initial 0. Published unwrapped, the document
+    said "0 hard-linked files, 0 extra names" about a walk that never looked --
+    on the same tree where the full walk reports 1 and 2.
+
+    `_unmeasured`'s own docstring is the standard being applied here: *"Zero and
+    unmeasured are not the same claim... the sites disagreeing is how the document
+    came to null `top_by_size` correctly while leaving `bytes: 0` on every row of
+    `top_by_inodes`."* Every sibling stat-derived count in this document
+    (`inline_files`, `recent_files`, `touched_files`, `padded_files`) already goes
+    through it. These two were the remaining pair.
+
+    The user-facing help is not at fault and is not changed: `-c` says "hard links
+    count once per name" and `-i` spells out the same trade in full. The terminal
+    is not at fault either -- it gates the note on `if res.hardlinked_inodes:`, so
+    it prints nothing rather than a false zero. Only the JSON asserted it.
+    """
+
+    @staticmethod
+    def _tree(tmp_path, hardlink: bool):
+        root = tmp_path / "t"
+        root.mkdir()
+        for i in range(4):
+            (root / f"f{i}.bin").write_bytes(b"x" * 512)
+        if hardlink:
+            os.link(str(root / "f0.bin"), str(root / "another-name.bin"))
+        return str(root)
+
+    @staticmethod
+    def _walk_doc(root, count_only):
+        from rapidu import report
+        from rapidu.walk import walk
+
+        res = walk(root, threads=1, depth=1, count_only=count_only)
+        # `res` is to_json's FIRST parameter; the 4th is a DeletedScan.
+        return report.to_json(res, None, None, None, None, 10)["walk"]
+
+    def test_the_hardlink_figures_are_null_under_count_only(self, tmp_path):
+        doc = self._walk_doc(self._tree(tmp_path, hardlink=True), count_only=True)
+        assert doc["hardlinked_inodes"] is None
+        assert doc["hardlink_extra_refs"] is None
+
+    def test_no_field_reports_zero_where_the_full_walk_reports_a_number(self, tmp_path):
+        """The general invariant, so a future missed site is caught too.
+
+        Rather than naming the two fields, this compares the whole walk document
+        against the full walk's: any key the full walk gives a nonzero number and
+        `-c` gives exactly 0 is a figure claimed rather than measured. `None` is
+        the correct answer and passes; a different nonzero number passes too
+        (`inodes` legitimately differs, 5 against 4, because a hard link is
+        counted once per name without stat -- which the help states).
+        """
+        root = self._tree(tmp_path, hardlink=True)
+        full = self._walk_doc(root, count_only=False)
+        lean = self._walk_doc(root, count_only=True)
+        false_zeroes = [
+            k
+            for k, v in full.items()
+            if isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and v
+            and lean.get(k) == 0
+            and not isinstance(lean.get(k), bool)
+        ]
+        assert false_zeroes == [], (
+            "these fields publish a measured-looking 0 under -c: %s" % false_zeroes
+        )
+
+    def test_the_full_walk_still_reports_the_real_figures(self, tmp_path):
+        """CONTROL -- passes before and after; the fix must not null everything."""
+        doc = self._walk_doc(self._tree(tmp_path, hardlink=True), count_only=False)
+        assert doc["hardlinked_inodes"] == 1
+        assert doc["hardlink_extra_refs"] == 1
+
+    def test_a_genuinely_measured_zero_stays_zero(self, tmp_path):
+        """CONTROL -- and the one that matters most.
+
+        A full walk over a tree with no hard links measured zero of them, and that
+        IS a measurement. Turning it into `null` would trade this defect for its
+        mirror: a consumer unable to tell "no hard links" from "did not look".
+        """
+        doc = self._walk_doc(self._tree(tmp_path, hardlink=False), count_only=False)
+        assert doc["hardlinked_inodes"] == 0
+        assert doc["hardlink_extra_refs"] == 0

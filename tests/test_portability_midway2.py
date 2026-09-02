@@ -171,13 +171,18 @@ def _mm_record(device):
 
 
 def test_every_gpfs_device_is_merged_into_one_snapshot(midway2_mounts, monkeypatch):
-    """Seven devices, one reading -- and the mount comes from the device.
+    """Seven devices, one reading -- and every row named by its own fileset.
 
-    This is the shape round 8 validated: with the mount taken from
-    ``/proc/mounts`` by device name, nothing is guessed, so RD-3's
-    mis-attribution cannot happen here at all -- there is no guess left to get
-    wrong. A walk of ``/scratch/midway3`` reaches midway3's quota and only
+    Round 8 validated the mount half of this: taken from ``/proc/mounts`` by
+    device name, nothing is guessed, so RD-3's mis-attribution cannot happen
+    here at all. A walk of ``/scratch/midway3`` reaches midway3's quota and only
     midway3's, on a login node that mounts all three clusters.
+
+    RD-18 is the other half. Every row used to be *named* after its device,
+    because `filesetName` was read only on ``scope == "fileset"`` rows and the
+    per-device fan-out asks for ``-u <user>``, which returns ``USR`` rows and
+    nothing else. So the name was applied only on rows this code never fetches.
+    Now the fileset names the row and the device is a field of its own.
     """
     asked = []
 
@@ -194,19 +199,38 @@ def test_every_gpfs_device_is_merged_into_one_snapshot(midway2_mounts, monkeypat
     assert sorted(c[-1] for c in asked[1:]) == sorted(ROUND8_DEVICES)
     assert not any(r.guessed for r in snap.rows), "a device name is not a guess"
 
-    home = next(r for r in snap.rows if r.fileset == "midway2_perf2" and r.kind == "blocks")
+    home = next(r for r in snap.rows if r.fileset == "home" and r.kind == "blocks")
+    assert home.device == "midway2_perf2", "the device survives as its own field"
     assert home.used == 1962213376, "cross-checked against the site's own tool"
     assert home.soft == 32212254720, "exactly 30 GiB"
-    assert home.mounts == ["/home", "/software"], "every mount of the device, not just one"
-    files = next(r for r in snap.rows if r.fileset == "midway2_perf2" and r.kind == "files")
+    # `/home`, not `["/home", "/software"]`. Two filesets share this device and
+    # the first entry of its mount list was right for only one of them -- which
+    # is how 12.8 GiB that lives in /software came to be shown against /home.
+    assert home.mounts == ["/home"], "the fileset's mount, not the device's list"
+    assert home.label == "midway2_perf2:home", (
+        "qualified even though `home` is unique in THIS row set -- see the "
+        "host-independence test below"
+    )
+    files = next(r for r in snap.rows if r.fileset == "home" and r.kind == "files")
     assert (files.used, files.soft) == (23232, 300000)
 
-    # The RD-3 hazard, closed as a side effect: three clusters under one /scratch.
-    assert [r.fileset for r in snap.rows_for_path("/scratch/midway3/me")] == [
-        "midway3_perf",
-        "midway3_perf",
-    ]
-    assert {r.fileset for r in snap.rows_for_path("/scratch/midway2/me")} == {"midway2_perf"}
+    # A fileset name is unique inside a filesystem and not across one: three
+    # clusters each call theirs `scratch`, so the bare name identifies nothing
+    # and the label carries the device.
+    scratch = [r for r in snap.rows if r.fileset == "scratch"]
+    assert len(scratch) == 6, "three devices, blocks and files each"
+    assert all(r.ambiguous_fileset for r in scratch)
+    assert {r.label for r in scratch} == {
+        "midway2_perf:scratch",
+        "midway3_perf:scratch",
+        "beagle3_perf:scratch",
+    }
+
+    # The RD-3 hazard, still closed: three clusters under one /scratch.
+    matched = snap.rows_for_path("/scratch/midway3/me")
+    assert [r.device for r in matched] == ["midway3_perf", "midway3_perf"]
+    assert {r.label for r in matched} == {"midway3_perf:scratch"}
+    assert {r.device for r in snap.rows_for_path("/scratch/midway2/me")} == {"midway2_perf"}
     assert snap.rows_for_path("/scratch") == [], "/scratch is a directory, not a filesystem"
 
 

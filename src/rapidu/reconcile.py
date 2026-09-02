@@ -21,6 +21,7 @@ import os
 import shutil
 from typing import List, Optional, Tuple
 
+from . import quota as quotamod
 from . import walk as walkmod
 from .deleted import DeletedScan
 from .fmt import human_bytes, human_count, plural
@@ -60,6 +61,12 @@ class Reconciliation:
         self.blockers = []  # type: List[str]
         self.candidates = []  # type: List[str]
         self.notes = []  # type: List[str]
+        # True when the walk this was computed from did not finish reading its own
+        # tree, so ``walk_value`` -- and everything derived from it, ``accounted``
+        # and ``share`` -- is a floor. Every verdict below turns that into a
+        # blocker; :data:`SUBTREE` returns before the blocker list is built and
+        # prints a percentage anyway, so it reads the flag itself.
+        self.walk_is_floor = False
 
     @property
     def within_tolerance(self) -> bool:
@@ -145,6 +152,29 @@ def _fileset_hint(path: str, mount: str) -> str:
     if not stem or not target.startswith(stem + "/"):
         return ""
     return target[len(stem) + 1 :].split(os.sep)[0]
+
+
+def _floor_phrase(res: "walkmod.WalkResult") -> str:
+    """Why the walked total is a floor, in the fewest words that name the causes.
+
+    :func:`reconcile`'s blocker list says all of this at length, split by cause
+    and by remedy. This is the short form, for the one branch that returns before
+    that list is built.
+    """
+    parts = []  # type: List[str]
+    if res.unreadable_dir_count:
+        parts.append(
+            "{} could not be read".format(
+                plural(res.unreadable_dir_count, "directory", irregular="directories")
+            )
+        )
+    if res.unstatable:
+        parts.append(
+            "{} could not be stat'ed".format(plural(res.unstatable, "entry", irregular="entries"))
+        )
+    if res.partial:
+        parts.append("it was interrupted before it finished")
+    return "; ".join(parts)
 
 
 def _changed_phrase(res: "walkmod.WalkResult") -> str:
@@ -261,7 +291,10 @@ _SCOPE_RANK = {"user": 0, "project": 1, "fileset": 2, "group": 3}
 
 
 def _pick_row(
-    rows: List[QuotaRow], kind: str, path: str = ""
+    rows: List[QuotaRow],
+    kind: str,
+    path: str = "",
+    probe_timeout: float = quotamod.DEFAULT_TIMEOUT_S,
 ) -> Tuple[Optional[QuotaRow], List[str]]:
     """The row that governs ``path``, and any note about how it was chosen.
 
@@ -278,19 +311,60 @@ def _pick_row(
     if len(matching) == 1:
         return matching[0], []
 
+    # Asked first, inferred second.
+    #
+    # The note this used to print told the reader to run `mmlsattr -L` to settle
+    # it. That was the right advice and the wrong division of labour: it is one
+    # unprivileged call per walked path, it answers exactly the question, and it
+    # matches `mmlsquota`'s own `filesetName` field exactly. Where it answers,
+    # the tie is not broken -- there is no tie.
+    # `probe_timeout` rather than the 45 s default: every other subprocess in
+    # `quota` is bounded by the caller's budget (`--quota-timeout`), and this one
+    # is on the same GPFS that a hung `mmlsquota` was already given a deadline
+    # for. `read_path_fileset` memoizes per path, so this runs at most once for a
+    # path however many kinds ask.
+    measured = quotamod.read_path_fileset(path, probe_timeout) if path else None
     hint = ""
-    for r in matching:
-        hint = _fileset_hint(path, r.mount or "") or hint
-        if hint:
-            break
-    named = [r for r in matching if hint and r.fileset.lower() == hint.lower()]
+    if not measured:
+        for r in matching:
+            hint = _fileset_hint(path, r.mount or "") or hint
+            if hint:
+                break
+    key = measured or hint
+    named = [r for r in matching if key and r.fileset.lower() == key.lower()]
     pool = named or matching
     best = min(pool, key=lambda r: (_SCOPE_RANK.get(r.scope, 4), pool.index(r)))
 
     notes = []  # type: List[str]
     others = [r for r in matching if r is not best]
     if named:
-        if len(named) > 1:
+        if measured:
+            # Stated in the note, NOT written back onto the row.
+            #
+            # This used to do `best.guessed = False`, and two things were wrong
+            # with that. It mutates a `QuotaRow` that is shared: the same objects
+            # are handed to both the blocks and the files `reconcile()` call, and
+            # to every path in the `rdu -a p1 p2` loop, so one confirmed path
+            # permanently suppressed the inferred-mount blocker, the
+            # ", mount inferred from its name" text and `to_json`'s
+            # `mount_guessed` for every later consumer of that row -- including
+            # paths `mmlsattr` was never asked about.
+            #
+            # And it is wrong on the merits even for this path. `guessed`
+            # documents one thing: whether the BACKEND published this row's
+            # mount or rapidu inferred it from the fileset's name. `mmlsattr -L`
+            # confirms which fileset a PATH is in. That settles the tie, which is
+            # what it is used for here, and says nothing about where the
+            # filesystem is mounted -- so it cannot retire the caveat about the
+            # mount. The measured fact travels in the note instead, where it is
+            # scoped to the path it was measured on.
+            if len(named) > 1 or len(matching) > 1:
+                notes.append(
+                    "{} of {} {} rows kept: `mmlsattr -L` reports {} is in fileset '{}'".format(
+                        len(named), len(matching), kind, path, best.fileset
+                    )
+                )
+        elif len(named) > 1:
             notes.append(
                 "{} {} rows govern {} equally; reconciled against the {}-scoped "
                 "one because {} is the fileset this path sits in".format(
@@ -304,8 +378,15 @@ def _pick_row(
             "to be the right one{}".format(
                 len(matching),
                 kind,
-                ", ".join(sorted({r.fileset for r in others} | {best.fileset})),
-                best.fileset,
+                # `label`, not `fileset`. This sentence exists to show that
+                # several rows govern the path, and a fileset name is unique
+                # inside a filesystem but not across one -- so two `scratch`
+                # rows on different devices rendered as "2 rows govern this path
+                # equally (scratch)", a set of two collapsing to one word in the
+                # one message whose whole job is to distinguish them. RD-18
+                # added `label` for exactly this and the notes did not use it.
+                ", ".join(sorted({r.label for r in others} | {best.label})),
+                best.label,
                 _fileset_probe_hint(),
             )
         )
@@ -319,9 +400,18 @@ def reconcile(
     deleted: DeletedScan,
     kind: str = "blocks",
     max_snapshot_age: float = DEFAULT_MAX_SNAPSHOT_AGE_S,
+    probe_timeout: float = quotamod.DEFAULT_TIMEOUT_S,
 ) -> Reconciliation:
-    """Compare one walked tree against the quota row that governs it."""
+    """Compare one walked tree against the quota row that governs it.
+
+    ``probe_timeout`` bounds the one subprocess this module can start -- the
+    `mmlsattr -L` fileset probe in :func:`_pick_row` -- and is the caller's
+    ``--quota-timeout``, so it is the same budget the backend query ran under.
+    """
     rec = Reconciliation(kind)
+    # Recorded before any branch can return, because one of them returns before
+    # the blocker list that normally carries this.
+    rec.walk_is_floor = not res.complete
 
     if not snap.available:
         # The backend's own explanation is not repeated here. It is on the
@@ -336,7 +426,7 @@ def reconcile(
         return rec
 
     rows = snap.rows_for_path(res.root)
-    row, pick_notes = _pick_row(rows, kind, res.root)
+    row, pick_notes = _pick_row(rows, kind, res.root, probe_timeout)
     rec.notes.extend(pick_notes)
     if row is None:
         rec.notes.append(
@@ -520,6 +610,32 @@ def reconcile(
                 row.fileset, mount or "an unknown mount", how, root
             )
         )
+        # ...and the walk may also be short of the *subtree*, which the note above
+        # does not cover and this branch returns before the blocker list can.
+        #
+        # So a walk that was interrupted, or that could not read 11,267 of its own
+        # directories, reached `verdict_line` as "this subtree is 25.0% of the fs
+        # quota figure" -- a percentage whose numerator is a floor, printed as a
+        # measurement, with `blockers` empty. And SUBTREE is by far the most
+        # common verdict on a real cluster (`_candidates` says why: reaching GAP
+        # needs the walk root to *be* the mount root), so this was the usual way
+        # the number was read.
+        #
+        # Not a blocker and not a downgrade: SUBTREE is already "the difference is
+        # expected", not a finding, and there is nothing to withhold. It is the
+        # figure itself that has to say what it is -- the same rule the walk panel
+        # follows with "a floor, not a total".
+        if rec.walk_is_floor:
+            # No figure interpolated beside the verbs. The walked total is already
+            # on the line above and in the walk panel, and pairing it with "is a
+            # floor" here made this the one message in `src/` that
+            # `test_no_message_pairs_a_count_with_a_fixed_verb` catches -- "the
+            # 11,267 it measured is a floor" for the files kind.
+            rec.notes.append(
+                "the walk did not finish reading even that subtree ({}), so its "
+                "total counts as a floor and the percentage above as a lower "
+                "bound, not a measurement".format(_floor_phrase(res))
+            )
         # A subtree smaller than its quota needs no explanation: the rest of the
         # mount is the explanation, and the note above just said so. A subtree
         # *larger* than the whole quota figure is the interesting case -- it was
@@ -535,13 +651,48 @@ def reconcile(
         rec.blockers.append(
             "the quota backend published no timestamp, so the age of its figure is unknown"
         )
-    elif age > max_snapshot_age:
-        rec.blockers.append(
-            "the quota figure is a snapshot taken {:.0f}s ago and may predate "
-            "recent writes or deletions{}".format(
-                age, " -- though " + snap.time_note if snap.time_note else ""
+    else:
+        # The cap is about the distance between the two figures being compared,
+        # and `age` is only half of it. `QuotaSnapshot.age_seconds` deliberately
+        # measures how stale the figures were *when they were read*, and
+        # `cli.cmd_walk` reads them before it starts the walk -- so by the time
+        # the walk has produced the other half of this comparison, the two
+        # measurements are `age + res.elapsed` apart.
+        #
+        # Testing `age` alone made the gate blind to the walk it was gating. A
+        # backend that computes on demand has `taken_at == read_at`, so `age` is
+        # 0.0; add a half-hour walk and the blocker list came back empty and the
+        # verdict was a confident `gap` between two numbers measured thirty
+        # minutes apart, with nothing on the report saying so.
+        #
+        # The sum, and not the larger of the two, because they compose: the
+        # figure was already `age` seconds behind reality when it was read, and
+        # then reality moved for another `res.elapsed` while the walk ran.
+        # Anything written or deleted anywhere in that combined window lands in
+        # one measurement and not the other, which is exactly what this blocker
+        # is about. It is the separation at the *end* of the walk -- the widest
+        # of it, since the first entry the walk stat'ed was only `age` seconds
+        # off -- and the widest is the right one for a gate whose job is to
+        # refuse, not to reassure. It is still a lower bound on the true gap:
+        # the settle re-stat and the /proc sweep happen later again.
+        age_at_walk_end = age + res.elapsed
+        if age_at_walk_end > max_snapshot_age:
+            rec.blockers.append(
+                # Not "{}s ago": the reader is being told how far apart the two
+                # sides of the comparison are, and "ago" understated that by the
+                # whole duration of the walk. The split is spelled out whenever
+                # the walk contributed a measurable part of it, because "2200s"
+                # against a backend that reported a fresh figure is otherwise
+                # unattributable.
+                "the quota figure is a snapshot taken {:.0f}s before this walk "
+                "finished{} and may predate recent writes or deletions{}".format(
+                    age_at_walk_end,
+                    ""
+                    if res.elapsed < 1
+                    else " ({:.0f}s stale when read, then a {:.0f}s walk)".format(age, res.elapsed),
+                    " -- though " + snap.time_note if snap.time_note else "",
+                )
             )
-        )
 
     if kind == "blocks":
         if settle.moved:
@@ -580,12 +731,14 @@ def reconcile(
             "file is one inode to the quota and several names to this count"
         )
 
-    if res.unreadable_dirs:
+    if res.unreadable_dir_count:
         # Two causes, two remedies. "could not be read" points at permissions; a
         # directory deleted between being listed and being opened points at
         # something writing to the tree, and the answer there is to re-run when it
         # is idle, not to chase access. Both still make the total a floor.
-        refused = len(res.unreadable_dirs) - res.vanished_dirs
+        #
+        # The exact count, not the capped path sample beside it.
+        refused = res.unreadable_dir_count - res.vanished_dirs
         if refused > 0:
             rec.blockers.append(
                 "{} could not be read, so the walk total is a floor, not a total".format(
@@ -710,15 +863,64 @@ def _candidates(
         return out
     if rec.gap > 0:
         # Quota says more than we can see.
-        out.append(
-            "unlinked-but-open files held by processes on other nodes -- this "
-            "scan only sees this node"
-        )
-        if not deleted.complete:
+        #
+        # What the /proc scan could not see, one cause at a time.
+        #
+        # This used to be a single sentence about other users, gated on
+        # `DeletedScan.complete`, and `complete` is False for three unrelated
+        # reasons: EACCES on another user's process, a PID namespace showing only
+        # its own processes, and a sweep abandoned on a hung mount. So the two
+        # that are not EACCES printed "held by 0 processes belonging to other
+        # users" -- a possible cause naming a population the same scan had just
+        # measured as empty -- while the cause that actually limited coverage was
+        # not listed at all. Inside Apptainer, which is how most work on this
+        # cluster runs, that was the only wording a reader ever saw.
+        #
+        # And `complete` used to be True for a scan that never ran: with
+        # `--no-deleted`, or on a platform without /proc, `available` is False and
+        # the counters are all zero, so all three tests passed. The line below
+        # then credited a scan that did not happen with covering "this node",
+        # which is both false and backwards -- an unlinked file on *this* node is
+        # the one thing a scan that did not run cannot rule out. `complete` now
+        # tests `available` first; this list still reads the four fields directly,
+        # because it has to say *which* limit applied, not merely that one did.
+        if not deleted.available:
             out.append(
-                "unlinked-but-open files held by {} processes belonging to other "
-                "users, which an unprivileged scan cannot inspect".format(deleted.unreadable_pids)
+                # No "would have" beside the interpolation: the value is a reason
+                # string, not a count, but `have` is one of the words
+                # `test_no_message_pairs_a_count_with_a_fixed_verb` sweeps for, and
+                # rewording is cheaper than another allow-list entry to read past.
+                "unlinked-but-open files on any node, this one included -- the "
+                "/proc scan of this node did not run{}".format(
+                    " ({})".format(deleted.reason) if deleted.reason else ""
+                )
             )
+        else:
+            out.append(
+                "unlinked-but-open files held by processes on other nodes -- this "
+                "scan only sees this node"
+            )
+            if deleted.unreadable_pids:
+                out.append(
+                    # Through `plural`, because the guard is now a truth test
+                    # rather than `!= 0` on a complete flag: one refused process
+                    # on a shared node is the common case, and it read "held by 1
+                    # processes".
+                    "unlinked-but-open files held by {} belonging to other "
+                    "users, which an unprivileged scan cannot inspect".format(
+                        plural(deleted.unreadable_pids, "process", irregular="processes")
+                    )
+                )
+            if deleted.namespaced:
+                out.append(
+                    "unlinked-but-open files held by processes outside this PID "
+                    "namespace, which /proc did not list"
+                )
+            if deleted.timed_out:
+                out.append(
+                    "unlinked-but-open files the /proc sweep had not reached when "
+                    "it was abandoned on an unresponsive mount"
+                )
         if rec.row is not None and rec.row.scope != "user":
             out.append(
                 "files under this tree owned by other members of the '{}' group".format(
@@ -750,8 +952,14 @@ def verdict_line(rec: Reconciliation) -> str:
         share = rec.share
         if share is None:
             return "subtree of a larger quota'd tree"
-        return "this subtree is {:.1f}% of the {} quota figure".format(
-            100.0 * share, rec.row.fileset if rec.row else "?"
+        return "this subtree is {}{:.1f}% of the {} quota figure".format(
+            # A floor over a fixed denominator is a lower bound, and the two words
+            # that say so belong in the headline rather than only in the note
+            # underneath it. Without them the line is a measurement, and the
+            # reader has no way to tell it from one.
+            "at least " if rec.walk_is_floor else "",
+            100.0 * share,
+            rec.row.fileset if rec.row else "?",
         )
     if rec.verdict == CLOSES:
         tol = human_count(rec.tolerance) if rec.kind == "files" else human_bytes(rec.tolerance)

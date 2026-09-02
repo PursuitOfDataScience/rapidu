@@ -912,9 +912,14 @@ def test_no_walk_or_settle_measurement_is_left_unpublished():
         "alloc_ratio": "ratio",
         "alloc_unit": "unit_bytes",
         "checked": "rechecked",
+        "unreadable_dir_count": "unreadable_dirs",
+        "unreadable_dirs_dropped": "unreadable_dir_paths_dropped",
+        "watched_seen": "watched_dirs_seen",
+        "watched_dropped": "watched_dirs_untracked",
         "drift": "drift_bytes",
         "gap": "recheck_gap_seconds",
         "gone": "vanished_files",
+        "gone_bytes": "vanished_allocated_bytes",
         "ran": "recheck_ran",
     }
     # Internals and raw halves of a published derived figure: not measurements a
@@ -936,6 +941,8 @@ def test_no_walk_or_settle_measurement_is_left_unpublished():
         "sampled_of",
         "unreadable_dirs",
         "hardlinked_inodes",
+        # The raw pair behind `watched_bytes_over_cap` / `watched_inodes_over_cap`.
+        "watched_overflow",
     }
     res = _hung(1)
     chk = _checked(60.0)
@@ -2467,6 +2474,12 @@ def test_no_message_pairs_a_count_with_a_fixed_verb():
         "none of the {} walked is",  # a rendered phrase
         "wins it on the denominator",  # prose after an agreed clause
         "ratio, as a figure that is never",  # a docstring
+        # Also a docstring: `ui.pad` quotes the `"{:<{w}}".format(...)` call it
+        # exists to replace, so the sweep sees a format spec and the `is` of the
+        # prose explaining it. Nothing in this package reads `__doc__`, so no
+        # docstring is a message; this one is here because it names a format
+        # string, which is the one thing a docstring can do to look like one.
+        "count *characters*",  # a docstring
         "inodes are the cost to watch",  # always plural where this fires
         "more holding it",  # a bare "+N more"
         "of them disappeared between the walk",  # "1 of them" is correct
@@ -2494,6 +2507,14 @@ def test_no_message_pairs_a_count_with_a_fixed_verb():
         "you own of the {} walked {} compared",
         "fewer than {} inodes and cannot be ranked",
         "of these {} an mtime ahead",
+        # `is` agrees with the path, which is one path. The count beside it is
+        # guarded by `len(matching) > 1`, so "rows" is never paired with 1.
+        "rows kept: `mmlsattr -L` reports",
+        # The plural noun comes from a conditional, and `is` agrees with "that",
+        # not with either count.
+        "beyond the walk's tracking cap",
+        # `each` is invariant, and this fires only above 5,000,000 inodes.
+        "and rapidu holds roughly",
     )
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     offenders = []
@@ -3022,7 +3043,10 @@ def test_the_entry_column_aligns_at_every_magnitude():
 def test_the_header_tracks_the_column_it_labels():
     for counts in ([42, 7], [12_345_678, 42], [1_234_567_890, 42]):
         lines = _wide_table(counts)
-        header = [ln for ln in lines if "entry" in ln][0]
+        # Both column words, as `test_audit_round_four` already does: a filter on
+        # "entry" alone picks up any warning line that happens to use the word,
+        # and then measures the alignment of something that is not the header.
+        header = [ln for ln in lines if "entry" in ln and "inodes" in ln][0]
         rows = [ln for ln in lines if "  d" in ln]
         assert header.index("entry") == rows[0].index("d0"), (counts, header, rows[0])
 
@@ -3820,6 +3844,65 @@ def test_the_decorations_lfs_uses_are_stripped_but_zero_is_not():
     assert _lfs_figure("21039052*") == "21039052"
     assert _lfs_figure("0") == "0", "0 is a figure, not a decoration"
     assert _lfs_figure("-") == "-"
+
+
+# A figure that is BOTH over its limit and unverifiable, which is one situation
+# rather than two: a degraded OST is what makes a figure unverifiable, and being
+# over quota is why anyone is reading this. `_budget` already notes those are the
+# same afternoon.
+#
+# `*` and `[]` are independent marks, so `lfs` can emit them either way round and
+# `_lfs_figure` must not care which. It did: `strip("[]").rstrip("*")` turned
+# `[21039052]*` into `21039052]*`, `int` rejected that, and `_parse_lfs_rows`
+# dropped the whole row -- reporting "could not parse `lfs quota` output" about a
+# reading it had in its hands, on the worse of the two inputs. That is the exact
+# failure `_lfs_figure` was written to stop.
+LFS_BRACKETED_OVER = """Disk quotas for usr youzhi (uid 38183):
+     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace
+          /home [21039052]* 358847931 391470470 6d23h59m   [31172]*       0       0       -
+"""
+
+
+def test_a_figure_carrying_both_marks_still_yields_its_row():
+    from rapidu.quota import _lfs_figure, _lfs_unverified, _parse_lfs_rows
+
+    assert _lfs_figure("[21039052]*") == "21039052", "brackets outside the star"
+    assert _lfs_figure("[21039052*]") == "21039052", "star inside the brackets"
+
+    rows = _parse_lfs_rows(LFS_BRACKETED_OVER, "user", "/home")
+    assert len(rows) == 2, rows
+    blocks = next(r for r in rows if r.kind == "blocks")
+    assert blocks.used == 21039052 * 1024
+    assert blocks.soft == 358847931 * 1024
+    assert blocks.grace == "6d23h59m", "the grace timer is the finding here"
+    assert next(r for r in rows if r.kind == "files").used == 31172
+    assert _lfs_unverified(LFS_BRACKETED_OVER) is True, "carried with its caveat, not silently"
+
+
+def test_the_single_marks_and_the_undecorated_form_are_unchanged():
+    """The control: widening the mark set must not eat a figure or a grace value.
+
+    `0` is Lustre's "no limit" and `-` is its "not in grace"; both reach `int()`
+    or `_clean_grace` and neither is a decoration. `_lfs_figure` is applied to
+    every numeric column, so a character stripped here is a figure changed.
+    """
+    from rapidu.quota import _lfs_figure, _parse_lfs_rows
+
+    assert _lfs_figure("[21039052]") == "21039052"
+    assert _lfs_figure("21039052*") == "21039052"
+    assert _lfs_figure("21039052") == "21039052"
+    assert _lfs_figure(" 21039052 ") == "21039052"
+    assert _lfs_figure("0") == "0"
+    assert _lfs_figure("-") == "-"
+
+    for text in (LFS_REAL, LFS_WARNED, LFS_BRACKETED):
+        rows = _parse_lfs_rows(text, "user", "/home")
+        assert len(rows) == 2, text[:40]
+        blocks = next(r for r in rows if r.kind == "blocks")
+        assert blocks.used == 21039052 * 1024, text[:40]
+        assert blocks.grace == "", text[:40]
+        files = next(r for r in rows if r.kind == "files")
+        assert (files.used, files.soft, files.hard, files.limit) == (31172, 0, 0, None)
 
 
 def test_an_unverified_lustre_reading_cannot_report_reconciles():

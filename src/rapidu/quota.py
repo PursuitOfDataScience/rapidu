@@ -25,7 +25,7 @@ import shutil
 import socket
 import subprocess
 import time
-from typing import Dict, List, Optional, Tuple  # noqa: F401  (`# type:` use)
+from typing import Dict, List, Optional, Set, Tuple  # noqa: F401  (`# type:` use)
 
 # Site wrappers can be slow (they may query the filesystem's quota manager).
 DEFAULT_TIMEOUT_S = 45.0
@@ -72,8 +72,19 @@ class QuotaRow:
         grace: str = "",
         mount: Optional[str] = None,
         guessed: bool = False,
+        device: str = "",
     ) -> None:
         self.fileset = fileset
+        # The FILESYSTEM this row is on, kept apart from the fileset name above.
+        #
+        # They are different identities and conflating them was a wrong answer,
+        # not a cosmetic one: on a GPFS site with seven filesets on one device,
+        # `mmlsquota` named every one in `filesetName` and rapidu showed seven
+        # rows all labelled `midway3_cap` pointing at `/project`, one of which
+        # was a 9.2 TiB figure belonging to a different directory tree entirely.
+        # The mount table is keyed by device, so the device has to survive
+        # separately from the label.
+        self.device = device or fileset
         self.kind = kind  # "blocks" | "files"
         self.scope = scope  # "user" | "group" | "fileset" | ""
         self.used = used
@@ -91,6 +102,51 @@ class QuotaRow:
         # published by the backend. Inferred mounts are dropped on ambiguity.
         self.guessed = guessed
         self.mount_note = ""
+        # True when another row on a DIFFERENT filesystem carries the same
+        # fileset name, so the name alone does not identify this row.  Set by
+        # `_mark_ambiguous_filesets` once the whole row set is known, because it
+        # is a property of the set and not of any row.
+        #
+        # `label` deliberately does NOT consult this: a label that qualifies only
+        # on a visible collision changes with the host's mount table, which is
+        # what review caught. Kept because it is a true and cheap fact about the
+        # set that a note may want to state -- not as an input to the label.
+        self.ambiguous_fileset = False
+
+    @property
+    def label(self) -> str:
+        """What to PRINT for this row: ``device:fileset`` wherever both are known.
+
+        A fileset name is unique within a filesystem and not across one.  On a
+        login node mounting three clusters, ``scratch`` is the fileset name on
+        ``midway2_perf``, ``midway3_perf`` and ``beagle3_perf`` alike, and so are
+        ``home`` and ``software`` -- printing the fileset alone would replace one
+        wrong label (the device, for every fileset) with a different one (the same
+        word, for three filesystems).
+
+        **Qualified unconditionally, not only when a collision is visible.**  The
+        first attempt qualified an ambiguous name and left a unique one bare,
+        which made a row's label depend on the host's mount table: the device set
+        is enumerated from ``/proc/mounts``, so on a node mounting only
+        ``midway2_perf2`` the home row read ``home``, and on a login node that
+        also sees ``midway3_cap`` the same row read ``midway2_perf2:home``.  Same
+        cluster, same quota, two labels, and a diff of two runs from different
+        nodes showed churn that meant nothing.  That is the RD-10 defect in a
+        milder form -- output that depends on what the host happens to see -- and
+        keying the decision on "the device set the backend enumerated" is no
+        escape here, because on this backend that set *is* the mount table.
+
+        The cost is a longer label in the single-filesystem case.  It buys a label
+        that means the same thing everywhere, and the device is not otherwise on
+        screen: no renderer carries it in a column of its own, so this is the only
+        place a reader learns which filesystem a row measures.
+
+        :attr:`fileset` stays the bare name because it is matched against things
+        that are names: a group, a probe's answer, a row selected by path.
+        """
+        if self.device and self.device != self.fileset:
+            return "{}:{}".format(self.device, self.fileset)
+        return self.fileset
 
     @property
     def limit(self) -> Optional[int]:
@@ -216,6 +272,22 @@ def _run(cmd: List[str], timeout: float) -> Tuple[int, str, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
+            # Slurm/GPFS output is UTF-8 in practice, and the bytes in it are not
+            # ours: a job name, a node's `Reason`, a fileset name and an account
+            # description are all free text a user or an admin typed. `text=True`
+            # alone decodes with the PARENT's locale, and under `LC_ALL=C` with
+            # coercion off that is `ANSI_X3.4-1968` -- pure ASCII -- so one
+            # accented character anywhere in the output killed the read.
+            #
+            # `_c_env()` above sets `LC_ALL=C` for the CHILD, which is about getting
+            # stable parseable output and does nothing for the parent's decode -- the
+            # two are independent, which is why this looked covered. Measured: a
+            # fileset named `caf\xc3\xa9` raised `UnicodeDecodeError` inside
+            # `p.communicate()`, and since that is a `ValueError` rather than an
+            # `OSError` it escaped every handler here and reached the user as a
+            # traceback.
+            encoding="utf-8",
+            errors="replace",
             env=_c_env(),
         )
         out, err = p.communicate(timeout=timeout)
@@ -794,6 +866,82 @@ def _mounts_for(
     return []
 
 
+def _mounts_for_fileset(fileset: str, device_mounts: List[str]) -> List[str]:
+    """Which of a device's mounts belong to ``fileset``, if that is decidable.
+
+    A GPFS filesystem is mounted in several places and cut into filesets, and the
+    two carve it up differently: ``midway2_perf2`` is mounted at ``/home`` and
+    ``/software``, and holds filesets ``home`` and ``software``.  Handing every
+    fileset the device's whole mount list -- first entry wins -- put a 12.8 GiB
+    figure that lives in ``/software`` on a row labelled ``/home``.
+
+    Three rules, in order, and every one of them is a *match against this
+    device's own mounts* rather than an inference:
+
+    1. A mount whose trailing path components spell the fileset name.  GPFS site
+       conventions turn ``-`` into ``/`` (``project-rcc`` for ``/project/rcc``),
+       which is the same normalisation :func:`_guess_mount` already applies.
+    2. A mount whose basename is the fileset name (``software`` for
+       ``/software``).
+    3. Failing both, the device mount that is the longest **prefix** of the path
+       the name spells -- ``/project`` for ``project-rcc``.  Not the fileset's own
+       directory, but the right branch of the filesystem, where the first entry
+       of an unordered device list was ``/home``.
+
+    **Every candidate must be one of ``device_mounts``.**  A rule between 2 and 3
+    tested the spelled path against the HOST's whole mount-point list instead, and
+    that is how a fileset came to be pinned to a mount belonging to a completely
+    different filesystem.  Measured on a midway3 login node, where ``midway3_cap``
+    is mounted at ``/home /project /programs /software /gpfs/midway3/cap``::
+
+        _mounts_for_fileset("beagle3",  _mounts_for("midway3_cap"), _mount_points())
+            -> ['/beagle3']
+        _mounts_for_fileset("project2", ...)
+            -> ['/project2']
+
+    :func:`_parse_mmlsquota` then wrote that onto ``row.mount``/``row.mounts``
+    with ``guessed=False``, so ``rows_for_path()`` matched it and a walk was
+    reconciled against another filesystem's quota with no caveat at all -- the
+    exact RD-3 mis-attribution this function's own docstring cites two paragraphs
+    down.  The rule is gone rather than intersected, because intersecting it with
+    ``device_mounts`` makes it rule 1 by another spelling.
+
+    **Only the mount table is evidence here.**  An earlier version returned the
+    fileset's spelled path when ``os.path.isdir`` found it -- and that made the
+    parser's output depend on the directories that happen to exist on the host
+    running it: the same recorded ``mmlsquota`` output produced ``/project2/rcc``
+    on a machine with such a directory and ``/project2`` on one without.
+    :func:`_guess_mount` settled this question already, at length: *a directory
+    that merely exists is not evidence of anything*, and a walk was reconciled
+    against another cluster's quota the last time that rule was bent.  The
+    fileset's own directory has a measured route -- :func:`read_path_fileset` --
+    and an inference must not impersonate it.
+
+    Returns ``[]`` when nothing matches, and the caller then keeps the device's
+    full list: an unmatched fileset is not evidence for any particular mount, and
+    a wrong one is what this function exists to stop.
+    """
+    name = fileset.strip().lower()
+    if not name:
+        return []
+    spelled = "/" + name.replace("-", "/").strip("/")
+    wanted = {spelled, "/" + name.strip("/")}
+    hit = [m for m in device_mounts if m.rstrip("/").lower() in wanted]
+    if hit:
+        return hit
+    hit = [m for m in device_mounts if os.path.basename(m.rstrip("/")).lower() == name]
+    if hit:
+        return hit
+    parents = [
+        m
+        for m in device_mounts
+        if spelled == m.rstrip("/") or spelled.startswith(m.rstrip("/") + "/")
+    ]
+    if parents:
+        return [max(parents, key=lambda m: len(m.rstrip("/")))]
+    return []
+
+
 def _header_mounts(
     header: str, table: Dict[str, List[str]], points: List[str]
 ) -> Tuple[List[str], bool]:
@@ -864,6 +1012,21 @@ def _name_matches_host(fileset: str, host_tokens: List[str]) -> bool:
     """
     tokens = [t for t in re.split(r"[^a-z0-9]+", fileset.lower()) if len(t) >= 4]
     return any(t in host_tokens for t in tokens)
+
+
+def _mark_ambiguous_filesets(rows: List[QuotaRow]) -> None:
+    """Flag every row whose fileset name is used on more than one filesystem.
+
+    A property of the row *set*, so it cannot be decided while parsing: the
+    second ``scratch`` is what makes the first one ambiguous.  See
+    :attr:`QuotaRow.label`.
+    """
+    devices = {}  # type: Dict[str, Set[str]]
+    for row in rows:
+        if row.fileset and row.device:
+            devices.setdefault(row.fileset.lower(), set()).add(row.device)
+    for row in rows:
+        row.ambiguous_fileset = len(devices.get((row.fileset or "").lower(), ())) > 1
 
 
 def _disambiguate_mounts(rows: List[QuotaRow]) -> None:
@@ -1344,13 +1507,35 @@ def _parse_mmlsquota(out: str, table: Dict[str, List[str]], points: List[str]) -
             file_hard = int(rec.get("fileslimit", "0"))
         except (TypeError, ValueError):
             continue
-        name = rec.get("filesystemname", "?")
+        device = rec.get("filesystemname", "?")
         scope = _norm_scope(rec.get("quotatype", ""))
-        # A fileset-scoped row is named by its fileset, not by the filesystem;
-        # the fileset name is what distinguishes two labs sharing one mount.
-        if scope == "fileset":
-            name = rec.get("filesetname", "") or name
-        mounts = _mounts_for(rec.get("filesystemname", "?"), table, points)
+        # A row that names a fileset is named by its fileset, whatever its SCOPE.
+        #
+        # This used to be gated on `scope == "fileset"`, and the gate meant the
+        # name was read only on rows this code never fetches: `read_mmlsquota`'s
+        # own docstring says the per-device fan-out asks for `-u <user>` because
+        # that is the query an unprivileged user can make, so every row is
+        # `quotaType:USR` and the branch never ran. The result was seven filesets
+        # on one device rendered as seven identical `midway3_cap` rows pointing
+        # at `/project`, and `-Q /home` and `-Q /software` returning byte-identical
+        # output for two different filesets.
+        #
+        # Scope and identity are orthogonal: `quotaType` says whose usage is
+        # being reported (this user's), `filesetName` says which slice of the
+        # filesystem it is reported against. A USR row scoped to a fileset is
+        # still a *fileset's* row.
+        fileset = rec.get("filesetname", "").strip()
+        name = fileset or device
+        mounts = _mounts_for(device, table, points)
+        # Where the row names a fileset, prefer a mount that is actually inside
+        # it. `/home` and `/software` are two filesets on one device, so the
+        # device's mount list holds both and the first of them is right for only
+        # one -- which is how the 12.8 GiB that lives in /software came to be
+        # displayed against /home.
+        if fileset:
+            narrowed = _mounts_for_fileset(fileset, mounts)
+            if narrowed:
+                mounts = narrowed
         mount = mounts[0] if mounts else None
         block_grace = _clean_grace(rec.get("blockgrace", ""))
         file_grace = _clean_grace(rec.get("filesgrace", ""))
@@ -1359,7 +1544,7 @@ def _parse_mmlsquota(out: str, table: Dict[str, List[str]], points: List[str]) -
             ("files", file_used, file_soft, file_hard, file_grace),
         ):
             # See the note in the mmlsquota parser: 0 is what the backend said.
-            row = QuotaRow(name, kind, scope, used, soft, hard, grace, mount)
+            row = QuotaRow(name, kind, scope, used, soft, hard, grace, mount, device=device)
             row.mounts = list(mounts)
             rows.append(row)
     return rows
@@ -1459,6 +1644,10 @@ def read_mmlsquota(
             # The site has a default filesystem and it answered. Asking every
             # device as well would re-read the same figures seven more times.
             break
+    # Once, over the whole row set: a fileset name is unique inside a filesystem
+    # and not across one, and the second `scratch` is what makes the first
+    # ambiguous. See `QuotaRow.label`.
+    _mark_ambiguous_filesets(snap.rows)
     snap.available = bool(snap.rows)
     # `mmlsquota` is a live query, not a cached report, so the figure is as
     # current as the filesystem's own accounting. Leaving `taken_at` unset made
@@ -1478,6 +1667,76 @@ def read_mmlsquota(
             tool_failure or _grouped_failures(failures) or "mmlsquota returned no parseable rows"
         )
     return snap
+
+
+#: The line ``mmlsattr -L`` prints the fileset on.  Case- and spacing-tolerant
+#: because the label is a vendor's prose, not a protocol: builds print
+#: ``fileset name:  home`` and ``Fileset Name: home``.
+_MMLSATTR_FILESET = re.compile(
+    r"^\s*fileset\s+name\s*:\s*(?P<name>\S+)", re.IGNORECASE | re.MULTILINE
+)
+
+
+#: ``mmlsattr -L <path>`` answers, memoized for the life of the process.
+#:
+#: `reconcile._pick_row` is called once per KIND inside cli's per-path loop, so an
+#: un-memoized probe ran the identical subprocess twice for every path -- two of
+#: them at the 45 s default, i.e. up to 90 s added per path on a hung GPFS, where
+#: before this probe existed there were none. A path does not move between
+#: filesets while rapidu is looking at it, so the second call could only ever
+#: return the first answer.
+#:
+#: ``None`` is cached with the rest of them on purpose: the common reason for one
+#: is that ``mmlsattr`` is not installed, and re-establishing that per kind buys
+#: nothing.
+_PATH_FILESET_CACHE = {}  # type: Dict[str, Optional[str]]
+
+
+def reset_path_fileset_cache() -> None:
+    """Forget the memoized ``mmlsattr`` answers.
+
+    For tests, and for anything that legitimately outlives one report -- the memo
+    is only sound because a rapidu run is short.
+    """
+    _PATH_FILESET_CACHE.clear()
+
+
+def read_path_fileset(
+    path: str, timeout: float = DEFAULT_TIMEOUT_S, deadline: Optional[float] = None
+) -> Optional[str]:
+    """Which GPFS fileset ``path`` is in, asked rather than inferred.
+
+    ``mmlsquota`` names a fileset in every row it returns and the mount table
+    cannot say which of a device's mounts each one covers, so a report on a
+    filesystem cut into filesets was reduced to a naming convention plus a hedge:
+    *"2 quota rows govern this path equally; reconciled against X because it is
+    the most narrowly scoped, not because it is known to be the right one --
+    confirm with `mmlsattr -L`"*.  That advice was sound and the command was one
+    rapidu could run itself.
+
+    Unprivileged and one call per walked path -- ``mmlsfileset``, which would
+    enumerate them, is root-only on the site this was measured on, so nothing
+    here builds on enumeration.
+
+    ``None`` when the command is absent, fails, or prints no fileset line, and
+    the caller keeps the inference it already had.  A confirmation that does not
+    arrive must not remove information.
+
+    Memoized per path -- see :data:`_PATH_FILESET_CACHE`.
+    """
+    if path in _PATH_FILESET_CACHE:
+        return _PATH_FILESET_CACHE[path]
+    rc, out, _err = _run(["mmlsattr", "-L", path], _budget(timeout, deadline))
+    # `rc` is not the signal on GPFS -- see `_mmlsquota_trouble` -- so the answer
+    # is asserted positively: the fileset line is present, or there is no answer.
+    found = _MMLSATTR_FILESET.search(out or "")
+    # GPFS spells "not in a named fileset" as `root`. That is a real fileset and
+    # `mmlsquota` reports it under that name, so it is returned as-is rather than
+    # discarded -- but a caller matching it against rows will simply not match
+    # where the site does not use it.
+    answer = (found.group("name").strip() or None) if found else None
+    _PATH_FILESET_CACHE[path] = answer
+    return answer
 
 
 def _lfs_project_id(path: str, timeout: float, deadline: Optional[float] = None) -> Optional[str]:
@@ -1521,8 +1780,19 @@ def _lfs_figure(token: str) -> str:
     point: ``int("[1048576]")`` raises, which dropped the row, which reported a
     *readable* quota as "could not parse `lfs quota` output". An uncertain figure
     carried with a caveat beats no figure at all; see :func:`_lfs_unverified`.
+
+    **The two marks are independent, so the removal cannot depend on their
+    order.** They are also the one combination that matters: a degraded OST is
+    what makes a figure unverifiable and being over quota is why anyone is
+    reading this, and :func:`_budget` already notes those are the same afternoon.
+    ``strip("[]").rstrip("*")`` handled ``[N*]`` and left ``[N]*`` as ``N]*``,
+    which ``int`` rejects and :func:`_parse_lfs_rows` turns into a dropped row --
+    the exact failure this function was written to stop, reappearing on the worse
+    of the two inputs. Stripping the whole mark set from both ends is
+    order-independent, so it does not matter which spelling a given ``lfs`` build
+    emits. ``0`` and ``-`` are untouched: neither is a mark.
     """
-    return token.strip().strip("[]").rstrip("*")
+    return token.strip().strip("[]*")
 
 
 def _parse_lfs_rows(out: str, scope: str, path: str) -> List[QuotaRow]:

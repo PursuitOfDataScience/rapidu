@@ -99,11 +99,21 @@ target-version = "py37"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "C4", "SIM"]
+select = ["E", "F", "W", "I", "B", "C4", "SIM", "T20"]
 
 [tool.ruff.lint.per-file-ignores]
+# These two entries pre-date `T20` being in `select` above, so for a while they
+# suppressed a rule that was not running: the config read as though prints were
+# policed everywhere except here, and in fact they were policed nowhere. Selecting
+# the rule cost nothing -- this package writes through `sys.stdout.write`, so there
+# were zero violations to fix -- and it now fails if a library module starts
+# printing instead of returning. The exemptions stay because these are the two
+# files where writing to a stream is the job.
 "src/rapidu/cli.py" = ["T201"]
-"src/rapidu/report.py" = ["T201"]
+# `report.py` had an entry here too and it fired zero times -- this package writes
+# through `sys.stdout.write`, not `print`. Dropped rather than kept as
+# pre-authorisation: a dead exemption reads as "this file prints" to anyone
+# working out the layering, and removing it means T20 now guards `report.py` too.
 # The deleted-fd tests must hold descriptors open across statements -- that is
 # precisely the condition under test -- so a context manager is not available.
 "tests/test_deleted.py" = ["SIM115"]
@@ -116,6 +126,13 @@ select = ["E", "F", "W", "I", "B", "C4", "SIM"]
 # Same for the demo renderer: its unlinked-but-open scene only exists while the
 # descriptor is still held, which a `with` block would close.
 "assets/render_demo.py" = ["SIM115"]
+# Developer scripts report progress on stdout -- that is what they are for, and
+# CI lints `.`, so `assets/` is in scope. Missed when `T20` was added to `select`
+# above: that change was verified against `src/` (zero violations, because this
+# package writes through `sys.stdout.write`) and `assets/` was not looked at, so
+# `ruff check .` has been failing on six prints in the two chart/GIF generators.
+# The sibling package with the same two-directory shape declares it identically.
+"assets/*" = ["T201"]
 
 [tool.ruff.format]
 quote-style = "double"

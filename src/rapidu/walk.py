@@ -210,6 +210,59 @@ _VANISHED_ERRNOS = frozenset(
 # tree where every stat fails.
 _UNSTAT_SAMPLE_CAP = 64
 
+# The same rule for unreadable directories, which had no cap while both of its
+# siblings did.  The COUNT is kept exactly (`unreadable_dir_count`); only the
+# paths are sampled, and the report never showed more than three of them plus an
+# "and N more" that reads off the count.
+_UNREADABLE_SAMPLE_CAP = 256
+
+# How many watched (cache-shaped) directories may be tracked individually.
+#
+# This is the one growing structure in this walk that grows per *entry* and had
+# no bound at all -- and it is the biggest of them on a real tree.  Walking a
+# conda installation, 1,180,882 files in 128,093 directories, `watched` held
+# **28,180 paths and 8.2 MB**, 36% of the walk's whole 35 MB of growth, because
+# `WATCHED_DIR_NAMES` contains `__pycache__` and a Python tree has one per
+# package.  Nothing downstream needs them individually: `reclaimable_groups`
+# sums each pattern and the report prints a handful of examples.
+#
+# 4096, matching `_RECENT_SAMPLE_CAP`: two orders of magnitude more rows than
+# any view shows, and a few hundred more than a home directory has cache
+# directories at all, so the ordinary target is unaffected.  The bytes and
+# inodes of what does not fit are NOT discarded -- they go to
+# `watched_overflow`, so a total stays a total.
+#
+# **Divided by the thread count, not applied per thread.**  A worker's tallies
+# live in a thread-local dict until it exits, so a per-thread cap of 4096 is
+# 32,768 paths at the default -t 8 -- and measured, that is the difference
+# between the cap saving 3.7 MB and saving 14 MB on the same tree.  A bound
+# that scales with a tuning flag is not a bound.
+_WATCHED_CAP = 4096
+
+# Never fewer than this per worker, however many workers there are: a cap of two
+# would make the reclaim section useless on a 64-thread host for the sake of a
+# few kilobytes.
+_WATCHED_CAP_MIN_PER_WORKER = 128
+
+# Entries after which the walk's own memory is worth mentioning.
+#
+# The remaining growth is the breadth-first frontier and the hard-link set, and
+# neither can be bounded without changing what the walk measures -- so the
+# honest move is the one this codebase already makes for every other bound it
+# cannot remove: publish it.  Measured **17-30 bytes of RSS per entry** across
+# trees of 23k to 1.3M entries (the spread is hard-link density and frontier
+# width, not inode count), so 10M entries is a few hundred MB and 100M is a few
+# GB -- and a production scratch filesystem is commonly 10-100M inodes, which is
+# exactly what a tool like this gets pointed at.
+#
+# 5,000,000: about 100-150 MB by the measured rate, which is where a reader
+# would want to know before the number gets interesting rather than after.
+_MEMORY_NOTE_ENTRIES = 5_000_000
+
+#: Bytes of resident memory per walked entry, measured.  Used only to put a
+#: figure on the note above; deliberately the top of the observed range.
+_BYTES_PER_ENTRY = 30
+
 AGE_BUCKET_DAYS = (7, 30, 90, 365)
 AGE_BUCKET_LABELS = ("< 7d", "7-30d", "30-90d", "90d-1y", "> 1y")
 
@@ -270,7 +323,13 @@ class _NoEntries:
 _NO_ENTRIES = _NoEntries()
 
 
-def _seed_watch(slots: Dict[str, List[int]], path: str, blocks: int) -> None:
+def _seed_watch(
+    slots: Dict[str, List[int]],
+    path: str,
+    blocks: int,
+    overflow: Optional[List[int]] = None,
+    cap: int = _WATCHED_CAP,
+) -> None:
     """Charge a watched directory's own inode to its own subtree total.
 
     A worker resolves the *watched ancestors* of every directory it scans, so a
@@ -281,9 +340,18 @@ def _seed_watch(slots: Dict[str, List[int]], path: str, blocks: int) -> None:
 
     ``slots`` is a thread-local dict merged under the lock at the end, so a
     directory discovered by one worker and scanned by another still sums.
+
+    ``overflow`` is where the charge goes once ``slots`` is full -- see
+    :data:`_WATCHED_CAP`.  It is a *slot*, not a flag, so the bytes and inodes
+    are still summed exactly; only the path is given up.  Passing ``None``
+    disables the cap, which is what the unit tests of this function want.
     """
     slot = slots.get(path)
     if slot is None:
+        if overflow is not None and len(slots) >= cap:
+            overflow[0] += blocks
+            overflow[1] += 1
+            return
         slot = slots[path] = [0, 0]
     slot[0] += blocks
     slot[1] += 1
@@ -491,8 +559,35 @@ class WalkResult:
         # those at zero (the report prints `n/a`), but its inode counts are exact
         # and are what that mode ranks on.
         self.watched = {}  # type: Dict[str, Tuple[int, int]]
+        # ``(blocks, inodes)`` charged to watched directories that did not fit
+        # `_WATCHED_CAP`, so no path could be attached to them.
+        #
+        # A bound that drops data silently is worse than no bound: a reclaim
+        # figure is acted on, and one that quietly excludes 24,000 directories
+        # is a wrong number rather than a partial one. The paths are what cost
+        # memory, so the paths are what is given up; the bytes and inodes are
+        # summed exactly and the report says so.
+        self.watched_overflow = (0, 0)  # type: Tuple[int, int]
+        # How many watched directories the cap gave up the path of.
+        #
+        # `watched_seen` is derived from this rather than stored, for the same
+        # reason as `unreadable_dirs_dropped`: a hand-built result -- a fixture,
+        # or a caller assembling one -- sets `watched` and nothing else, and a
+        # stored total would then contradict it.
+        self.watched_dropped = 0
         self.dir_agg = {}  # type: Dict[str, Entry]
+        # Sampled to `_UNREADABLE_SAMPLE_CAP`; `unreadable_dir_count` is exact.
         self.unreadable_dirs = []  # type: List[Tuple[str, str]]
+        # How many unreadable directories the sampling cap discarded the path of.
+        #
+        # The count is what is load-bearing -- `complete`, the `! this is a
+        # FLOOR, not a total: N dirs unreadable` line, the
+        # `refused = count - vanished` arithmetic and `--json` all read it -- so
+        # it is DERIVED from the list plus this, rather than being a second field
+        # to keep in step. A pair of fields that must agree is a pair that
+        # eventually does not: every caller that appends a path (including a
+        # test building a fixture) gets the right count for free this way.
+        self.unreadable_dirs_dropped = 0
         # How many of those were *gone* rather than refused. A directory deleted
         # between being listed and being opened is not a permissions problem, and
         # calling it one sends the reader to chase access they already have: on a
@@ -582,7 +677,17 @@ class WalkResult:
     @property
     def complete(self) -> bool:
         """False when anything was skipped, so the total is a floor not a total."""
-        return not self.unreadable_dirs and not self.unstatable and not self.partial
+        return not self.unreadable_dir_count and not self.unstatable and not self.partial
+
+    @property
+    def unreadable_dir_count(self) -> int:
+        """Every unreadable directory, counted -- paths sampled or not."""
+        return len(self.unreadable_dirs) + self.unreadable_dirs_dropped
+
+    @property
+    def watched_seen(self) -> int:
+        """Every watched directory the walk saw, tracked individually or not."""
+        return len(self.watched) + self.watched_dropped
 
     @property
     def alloc_unit(self) -> Optional[int]:
@@ -895,13 +1000,23 @@ def walk(
     Memory grows with the tree and is not bounded. Measured at 19-35 bytes of RSS
     per inode, but the spread is the point: the per-inode figure is a property of
     hard-link density and frontier width, not of inode count, so it does not
-    extrapolate. The three growing structures are the breadth-first ``queue``
+    extrapolate. The growing structures are the breadth-first ``queue``
     (which can hold one whole level of a wide tree), ``seen_links`` (one entry per
     multiply-linked inode -- 8.6% of a conda env, near zero for a checkpoint
     tree), and ``dir_agg``, which holds one :class:`Entry` per *reported* object:
     at the default depth that is one per top-level child, but a single directory
     holding a million files costs a million ``Entry`` objects, which is exactly
     the "too many inodes" case this tool is reached for.
+
+    ``watched`` used to be a fourth and this list did not mention it, which is
+    how it came to be the largest: 28,180 paths and 8.2 MB on a conda tree,
+    36% of that walk's growth, because `WATCHED_DIR_NAMES` holds ``__pycache__``
+    and a Python installation has one per package. It is now capped at
+    `_WATCHED_CAP` with the excess totalled in ``watched_overflow``, and
+    ``unreadable_dirs`` -- which had no cap while both its siblings did -- is
+    sampled to `_UNREADABLE_SAMPLE_CAP` behind an exact
+    ``unreadable_dir_count``. Both bounds are published in the report rather
+    than applied quietly: a truncation nobody is told about reads as a total.
     """
     root = os.path.abspath(root)
     # `None` means "choose": see `choose_threads`. An explicit count is honoured.
@@ -911,6 +1026,15 @@ def walk(
 
     res = WalkResult(root)
     res.threads = nthreads
+    # See `_WATCHED_CAP`: the bound is on the whole walk, so each of `nthreads`
+    # thread-local dicts gets a share of it rather than the whole thing.
+    watch_cap = max(_WATCHED_CAP_MIN_PER_WORKER, _WATCHED_CAP // max(1, nthreads))
+    # Distinct watched directories DISCOVERED, summed over the workers.  Exact:
+    # `_seed_watch` runs once per watched directory across the whole walk (from
+    # its parent's scan; the root is never watched, because ancestor resolution
+    # starts below it), whereas a path can be created in several workers'
+    # thread-local dicts and so cannot be counted there.
+    seen_box = [0]
     res.count_only = count_only
     res.one_file_system = one_file_system
     res.settle_window = settle_window
@@ -1018,6 +1142,19 @@ def walk(
         l_gid = {}  # type: Dict[int, List[int]]
         l_age = [[0, 0] for _ in AGE_BUCKET_LABELS]
         l_watch = {}  # type: Dict[str, List[int]]
+        # Where a watched directory's blocks go once `l_watch` is full. A slot
+        # rather than a counter pair so the same `[blocks, inodes]` writes that
+        # a real slot takes work unchanged -- `watch` below can hold it in place
+        # of a missing slot and the hot loop needs no branch.
+        l_watch_over = [0, 0]  # type: List[int]
+        # Every watched directory this worker DISCOVERED, tracked or not.
+        #
+        # Exact, and the only exact count available: `_seed_watch` runs once per
+        # watched directory across the whole walk (from its parent's scan, and
+        # the root is never watched because ancestor resolution starts below it),
+        # whereas a path can be created in several workers' `l_watch` and so
+        # cannot be counted there.
+        l_watch_seen = 0
         # key -> [bytes, files, dirs, is_dir]
         l_agg = {}  # type: Dict[str, List[int]]
         l_unreadable = []  # type: List[Tuple[str, str]]
@@ -1038,6 +1175,10 @@ def walk(
         # Cutoffs as absolute epoch seconds, computed once: comparing against
         # these is one float compare per file rather than an arithmetic per file.
         age_cutoffs = [now - days * 86400.0 for days in AGE_BUCKET_DAYS]
+        # Read again -- and only -- when a file's mtime is ahead of `now`. See the
+        # `l_future` branch below: the window's cutoffs must stay fixed for the
+        # whole walk, but "ahead of this node's clock" is a live question.
+        wall_clock = time.time
         n_buckets = len(l_age)
         watch_names = WATCHED_DIR_NAMES
         watch_get = l_watch.get
@@ -1113,7 +1254,16 @@ def walk(
                     if d_parts[i] in watch_names:
                         wslot = watch_get(wacc)
                         if wslot is None:
-                            wslot = l_watch[wacc] = [0, 0]
+                            # Over the cap: charge the shared overflow slot
+                            # instead of minting a new path. The subtree's bytes
+                            # and inodes are still counted -- what is lost is
+                            # which cache they belong to, and that is what the
+                            # report discloses.
+                            wslot = (
+                                l_watch_over
+                                if len(l_watch) >= watch_cap
+                                else l_watch.setdefault(wacc, [0, 0])
+                            )
                         watch.append(wslot)
             dsep = d if d.endswith(sep) else d + sep
 
@@ -1192,7 +1342,8 @@ def walk(
                                     for wslot in watch:
                                         wslot[1] += 1
                                 if name in watch_names:
-                                    _seed_watch(l_watch, dsep + name, 0)
+                                    l_watch_seen += 1
+                                    _seed_watch(l_watch, dsep + name, 0, l_watch_over, watch_cap)
                             else:
                                 l_files += 1
                                 if b0 is not None:
@@ -1271,7 +1422,8 @@ def walk(
                                 # The watched directory's own inode. Charged by the
                                 # parent's scan, because `watch` for a directory
                                 # holds its watched *ancestors* and never itself.
-                                _seed_watch(l_watch, dsep + name, blocks)
+                                l_watch_seen += 1
+                                _seed_watch(l_watch, dsep + name, blocks, l_watch_over, watch_cap)
                             l_size += blocks
                             l_app += st.st_size
                             l_dirs += 1
@@ -1445,7 +1597,27 @@ def walk(
                         if st.st_mtime >= recent_cutoff or st.st_ctime >= recent_cutoff:
                             if st.st_mtime >= recent_cutoff:
                                 l_recent += 1
-                                if st.st_mtime > now:
+                                # `now` is the walk's *start*, so a file written
+                                # while the walk was running is ahead of it -- and
+                                # the report names that "an mtime ahead of this
+                                # node's clock ... most likely a clock difference
+                                # between this node and the fileserver", which is
+                                # a false claim about a node whose clock is fine.
+                                # Measured on a 2.05s walk: one file written 1.5s
+                                # in, `future_files: 1`. This walk takes tens of
+                                # seconds on the trees it exists for, and an
+                                # actively written tree is exactly what it is
+                                # pointed at, so the count is not a rare edge --
+                                # it is one per file written during the run.
+                                #
+                                # Re-read the clock rather than move `now`: the
+                                # window's cutoffs must stay fixed for the whole
+                                # walk or the recent/age tallies stop being one
+                                # measurement. Only this branch is live, and it is
+                                # reached only for a file that already looks
+                                # future-dated, so the extra `time.time()` is off
+                                # the hot path.
+                                if st.st_mtime > now and st.st_mtime > wall_clock():
                                     l_future += 1
                             else:
                                 l_touched += 1
@@ -1455,6 +1627,23 @@ def walk(
                                 l_sample.append((dsep + entry.name, blocks))
             except OSError as exc:
                 l_unreadable.append((d, exc.strerror or "unreadable"))
+                # A scan that raised is the extreme case of the truncated scan
+                # `d_truncated` was introduced for: zero entries read, so the
+                # subtree is short by everything under this directory. Every other
+                # way a scan can stop early sets the flag -- the rate limiter, the
+                # stop check inside the entry loop, the non-OSError guard below --
+                # and this one did not, so the subtree's top-level ancestor still
+                # reached `outstanding[top] == 0` and was published in
+                # `finished_tops` as a completed measurement.
+                #
+                # Reproduced with one unreadable directory holding 20 files inside
+                # a depth-1 child holding 40: the interrupted walk ranked that
+                # child at 42 inodes against a true 62, in
+                # `top_dirs(finished_only=True)` -- the one table whose entire
+                # promise is that what it shows is exact. `res.complete` was
+                # already False, but that is a statement about the *total*; the
+                # per-subtree claim is what `finished_tops` makes and it was wrong.
+                d_truncated = True
                 # ENOENT: deleted under us. ESTALE: an NFS handle whose target was
                 # removed or replaced on the server -- the same event seen through
                 # a network filesystem. ENOTDIR: it was a directory when we listed
@@ -1550,7 +1739,9 @@ def walk(
             res.under_alloc += l_undb
             res.inline_files += l_inline
             res.alloc_bits |= l_bits
-            res.unreadable_dirs.extend(l_unreadable)
+            room = max(0, _UNREADABLE_SAMPLE_CAP - len(res.unreadable_dirs))
+            res.unreadable_dirs.extend(l_unreadable[:room])
+            res.unreadable_dirs_dropped += max(0, len(l_unreadable) - room)
             res.vanished_dirs += l_vanished
             room = _RECENT_SAMPLE_CAP - len(res.recent_sample)
             if room > 0:
@@ -1567,8 +1758,21 @@ def walk(
             for at, (b, f) in enumerate(l_age):
                 pb, pf = res.by_age[at]
                 res.by_age[at] = (pb + b, pf + f)
+            seen_box[0] += l_watch_seen
+            ob, oi = res.watched_overflow
+            res.watched_overflow = (ob + l_watch_over[0], oi + l_watch_over[1])
             for wpath, (b, f) in l_watch.items():
-                pb, pf = res.watched.get(wpath, (0, 0))
+                prior = res.watched.get(wpath)
+                if prior is None and len(res.watched) >= _WATCHED_CAP:
+                    # The same cap again, now across workers: each worker's dict
+                    # is bounded, and eight bounded dicts still merge to eight
+                    # times the bound. Adding to a path already tracked is always
+                    # allowed, so a directory whose contents arrive from several
+                    # workers is never half-counted once it is in.
+                    ob, oi = res.watched_overflow
+                    res.watched_overflow = (ob + b, oi + f)
+                    continue
+                pb, pf = prior or (0, 0)
                 res.watched[wpath] = (pb + b, pf + f)
             for kk, (b, f, dcount, dir_flag) in l_agg.items():
                 ent = res.dir_agg.get(kk)
@@ -1638,6 +1842,10 @@ def walk(
             root_stranded = True
         abandoned_tops |= inflight[i]
     res.abandoned_workers = door[1]
+    # Every watched directory seen, minus those whose path survived the cap.
+    # Recorded here, once, rather than incremented alongside `watched` -- a
+    # figure that has to be kept in step with a dict is a figure that drifts.
+    res.watched_dropped = max(0, seen_box[0] - len(res.watched))
     res.elapsed = time.perf_counter() - t0
     with links_lock:
         res.hardlinked_inodes = len(seen_links)
@@ -1690,6 +1898,17 @@ class SettleCheck:
         self.sampled_of = 0  # how many recent files existed, if we sampled
         self.drift = 0  # SIGNED change in allocated blocks since the walk
         self.gone = 0  # files that disappeared between walk and re-stat
+        # ...and what the walk had counted for them. The blocks are already in
+        # `recent_sample`, so this costs one addition, and it is the only figure
+        # in this class that says how *wrong* the total is rather than how far it
+        # moved. `drift` cannot say it by construction: a vanished file is left
+        # out of both sides of that subtraction so a deletion cannot masquerade
+        # as the tree shrinking -- correct for the drift, but it means the one
+        # change the re-stat positively observed is the one it reports as zero.
+        # Measured on eight 64 KiB files with seven unlinked during a 7s
+        # `--settle-wait`: the walk read 512.0 KiB, the tree held 64.0 KiB, and
+        # this held the 448.0 KiB difference exactly, at every ratio tried.
+        self.gone_bytes = 0
         # No `window` field. It was assigned here and again in
         # `recheck_settling`, and read nowhere: every consumer -- `render_settle`,
         # `to_json` -- reads `WalkResult.settle_window`, which is where the window
@@ -1703,14 +1922,42 @@ class SettleCheck:
         return self.drift != 0
 
     @property
+    def recheck_measured_nothing(self) -> bool:
+        """True when the re-stat had files to measure and measured none of them.
+
+        Every path in the sample was gone by the time the re-stat reached it, so
+        ``drift == 0`` is the *absence* of a reading, not a reading of zero. This
+        is the tree this tool is pointed at: checkpoint rotation deletes the old
+        ``.pt`` while the new one is written, and a ``--settle-wait`` long enough
+        to be believed is long enough for the whole sample to be unlinked.
+
+        Distinct from ``checked == 0`` on its own, which is also how "nothing was
+        written recently" arrives here -- an empty population has nothing to be
+        unsettled about and its null result is fine to believe.
+        """
+        return self.gone > 0 and self.checked == 0
+
+    @property
     def conclusive(self) -> bool:
         """Can a *null* result from this check be believed?
 
         Only if the check actually ran and had long enough to see the effect.
         Constraint 1: before believing a null result, ask whether the instrument
         can see the effect at all.
+
+        **A re-stat that re-stat'ed nothing is that instrument.** The gap test
+        alone said yes to a check whose whole sample had been deleted: measured
+        with eight recently written files removed between the walk and a 6s
+        re-check, ``checked=0 gone=8 drift=0`` reported *"a re-stat 6s later
+        found no change in 0 files; the figure looks settled"* and
+        ``"settled": true`` -- the strongest claim in this section, from a
+        reading that never happened. See :attr:`recheck_measured_nothing`.
         """
-        return self.ran and (self.moved or self.gap >= MIN_CONCLUSIVE_GAP_S)
+        if not self.ran:
+            return False
+        return self.moved or (
+            self.gap >= MIN_CONCLUSIVE_GAP_S and not self.recheck_measured_nothing
+        )
 
     @property
     def sampled(self) -> bool:
@@ -1762,6 +2009,7 @@ def recheck_settling(res: WalkResult, wait: float = 0.0) -> SettleCheck:
             st = os.lstat(path)
         except OSError:
             chk.gone += 1
+            chk.gone_bytes += blocks_then
             continue
         before += blocks_then
         after += st.st_blocks * 512

@@ -506,8 +506,19 @@ def render_quota(
                 "  ",
             )
         )
-    labels = {id(r): ui.printable(r.fileset) for r in rows}
-    width = max([16] + [len(labels[id(r)]) for r in rows]) if rows else 16
+    # `label`, not `fileset`: a row whose fileset name is shared with another
+    # filesystem's is qualified by its device, and one whose name is its own is
+    # not. See `QuotaRow.label`.
+    # Measured in COLUMNS, with `ui.visible_width`, because that is the unit the
+    # field is filled in (`ui.pad`, below) and the unit `ui.truncate` cuts to. It
+    # was `len`: a fileset named in Chinese is two columns per character, so the
+    # column was sized at half the space its own contents needed and then padded
+    # by character count on top of that -- three columns of drift for a
+    # three-glyph label, thirteen for one long enough to be truncated first, on
+    # that row alone, carrying the scope, kind, used/limit, bar, percentage and
+    # mount columns with it. See `ui.pad`.
+    labels = {id(r): ui.printable(r.label) for r in rows}
+    width = max([16] + [ui.visible_width(labels[id(r)]) for r in rows]) if rows else 16
     width = min(width, 40)
 
     def figure(value, kind):
@@ -577,7 +588,7 @@ def render_quota(
             # edge; the separator no longer depends on the value being short.
             "  {}  {}  {}  {}  {} {}  {}{}".format(
                 style.paint(
-                    "{:<{w}}".format(ui.truncate(labels[id(r)], width), w=width),
+                    ui.pad(ui.truncate(labels[id(r)], width), width),
                     "bold",
                 ),
                 style.paint("{:<7}".format((r.scope or "?")[:7]), "dim"),
@@ -968,7 +979,17 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
     its largest few examples, is the same information in the order it is useful.
     """
     grouped = reclaimable_groups(res)
-    if not grouped:
+    over_bytes, over_inodes = res.watched_overflow
+    # `watched_dropped` is the number whose PATH the cap gave up; `watched_seen`
+    # is derived from it, so subtracting is the same figure the long way round.
+    over_dirs = res.watched_dropped
+    # The overflow can be the ONLY thing there is to say. `grouped` is built from
+    # `res.watched`, and the cap's whole job is to stop filling `res.watched` --
+    # so a tree with more cache directories than the cap tracks can leave it empty
+    # while the overflow holds real bytes, and returning early then dropped those
+    # bytes out of the report entirely. That is the failure this disclosure exists
+    # to prevent, reintroduced one line above the disclosure itself.
+    if not grouped and not (over_dirs or over_inodes or over_bytes):
         return []
     counts = res.count_only
     commands = {pattern: command for pattern, command, _hits in grouped}
@@ -1075,6 +1096,41 @@ def render_reclaimable(res: WalkResult, style: ui.Style) -> List[str]:
                     else human_bytes(sum(sum(h[0] for h in v) for _p, v in rest)),
                 ),
                 "dim",
+            )
+        )
+    if over_dirs or over_inodes or over_bytes:
+        # The walk stopped tracking cache directories individually past its cap,
+        # and this section is the only place that shows.  Said, not swallowed: a
+        # bound the reader is not told about reads as a total, and this is a
+        # figure they act on.  The bytes ARE in the total below -- what was
+        # dropped is the paths, so these rows cannot be attributed to a kind.
+        total += over_bytes
+        total_inodes += over_inodes
+        # The directory count is only mentioned when there IS one. The two figures
+        # come from different places and do not have to agree: a worker gives up a
+        # path once its own thread-local cap is full and adds that path's bytes to
+        # `watched_overflow`, but `watched_dropped` is computed against the MERGED
+        # `watched`, so a path another worker happened to track leaves overflow
+        # bytes behind with no dropped directory to go with them. Formatted
+        # unconditionally, that printed "... and 0 further cache-shaped
+        # directories", which reads as a bug in the tool rather than as a bound.
+        if over_dirs:
+            what = "{} further cache-shaped {}".format(
+                over_dirs, "directory" if over_dirs == 1 else "directories"
+            )
+        else:
+            what = "further cache-shaped bytes"
+        out.extend(
+            _wrapped(
+                "... and {} beyond the walk's tracking cap ({} / {}), included in "
+                "the total below but not attributed to a kind -- a deeper `-d` or "
+                "a narrower path lists them".format(
+                    what,
+                    plural(over_inodes, "inode"),
+                    "n/a" if counts else human_bytes(over_bytes),
+                ),
+                style,
+                "  ",
             )
         )
     if counts:
@@ -1278,9 +1334,28 @@ def _entry_rows(
     # rest" -- and the rows missing from a density listing are mostly missing
     # because of the inode floor, not because of -n, so the row's "use -n 0 for
     # all" would be a false instruction.
+    #
+    # The row does have to carry a figure, but the gate was `rest_size > 0` --
+    # bytes only -- and that suppressed it in two cases where the *inodes* were
+    # the thing being hidden, leaving the listed rows and the summary unable to
+    # complete the total:
+    #
+    # * ``-c`` never stats, so every size is zero. The one mode whose only
+    #   measurement is inodes was also the one mode that never printed the
+    #   remainder: ``rdu -c -n 2`` on a 21-inode tree listed 11 inodes and then
+    #   said "3 more" with no figure at all.
+    # * A hidden sibling can hold many inodes and zero *allocated* bytes. On XFS a
+    #   small directory lives inside its own inode and `st_blocks` is 0 -- so a
+    #   root whose hidden children are directories has `rest_size == 0` on a
+    #   perfectly ordinary filesystem. `rdu -n 1` on a 19-inode tree of that shape
+    #   printed one row of 2 inodes, "4 more", and nothing about the other 16.
+    #
+    # Either figure being non-zero earns the row, and `_entry_line` already knows
+    # how to draw it in both modes -- `size_hidden` omits the byte column under
+    # ``-c``, and a true `0 B` beside a real inode count is what the other case is.
     show_rest = (
         hidden > 0
-        and rest_size > 0
+        and (rest_size > 0 or rest_inodes > 0)
         and not res.partial
         and not by_density
         and _entries_partition_tree(res)
@@ -2030,11 +2105,14 @@ def _hard_warnings(
             )
     elif not res.complete:
         detail = []
-        if res.unreadable_dirs:
+        if res.unreadable_dir_count:
             # Split by cause. "unreadable" about a directory that had been deleted
             # sends the reader after access they already have; on a shared
             # filesystem the usual cause is another job writing to the tree.
-            refused = len(res.unreadable_dirs) - res.vanished_dirs
+            #
+            # The COUNT, not the length of the path sample: the sample is capped
+            # and this figure is the finding.
+            refused = res.unreadable_dir_count - res.vanished_dirs
             if refused > 0:
                 detail.append("{} unreadable".format(plural(refused, "dir")))
             if res.vanished_dirs:
@@ -2091,6 +2169,27 @@ def _hard_warnings(
             # Listed + hidden == the headline count, always. The two halves of this
             # message are now arithmetic rather than two independent statements.
             out.append(style.paint("      ... and {} more".format(hidden), "dim"))
+    if res.inodes >= walkmod._MEMORY_NOTE_ENTRIES:
+        # rapidu holds state proportional to the tree it is measuring, and the
+        # trees worth pointing it at are the large ones. The two structures that
+        # can be bounded now are (`watched`, `unreadable_dirs`); the breadth-first
+        # frontier and the hard-link set cannot be, without changing what is
+        # measured. So this is said rather than left for the OOM killer to say --
+        # the same rule as `-x`, the unreadable count and the interrupt: every
+        # bound this walk works under is published.
+        out.extend(
+            _warn_wrapped(
+                "{} inodes walked, and rapidu holds roughly {} of memory for "
+                "each: this walk needed on the order of {}. A tree ten times "
+                "the size needs ten times that -- walk it in parts if that "
+                "matters here.".format(
+                    human_count(res.inodes),
+                    human_bytes(walkmod._BYTES_PER_ENTRY),
+                    human_bytes(res.inodes * walkmod._BYTES_PER_ENTRY),
+                ),
+                style,
+            )
+        )
     if settling and settle.moved:
         # With --settle-wait 0 the re-stat is immediate, so "0s later" would be a
         # fabricated precision: the real observation window is however long the
@@ -2218,41 +2317,63 @@ def render_walk(
     if not res.complete and res.unreadable_dirs:
         for path, why in res.unreadable_dirs[:3]:
             out.append(style.paint("      {} ({})".format(ui.printable(path), why), "dim"))
-        if len(res.unreadable_dirs) > 3:
+        if res.unreadable_dir_count > 3:
             out.append(
-                style.paint("      ... and {} more".format(len(res.unreadable_dirs) - 3), "dim")
+                style.paint("      ... and {} more".format(res.unreadable_dir_count - 3), "dim")
             )
 
-    if show_uids and len(res.by_uid) > 1:
+    def owner_rows(counts, name_of):
+        """The rows one block shows, biggest first, as ``(name, size, inodes)``."""
+        ranked = sorted(counts.items(), key=lambda kv: kv[1][0], reverse=True)
+        return [(name_of(k), size, inodes) for k, (size, inodes) in ranked[:_OWNER_SHOW]]
+
+    uid_rows = owner_rows(res.by_uid, _uname) if show_uids and len(res.by_uid) > 1 else []
+    gid_rows = owner_rows(res.by_gid, _gname) if show_uids and len(res.by_gid) > 1 else []
+    # The name column is measured from the rows, in COLUMNS. It was a hard-coded
+    # `{:<16}` filled by character count, for a string this tool does not choose:
+    # NSS hands back whatever the site's directory holds, and two names in this
+    # cluster's own passwd and group overflow sixteen today, in plain ASCII. The
+    # account `gnome-initial-setup` (19) pushes its row's bytes, inodes and noun
+    # three columns right of the column every other row keeps them in, and the
+    # group `caprioli-cattaneo-software` (26) pushes them ten. A name in Chinese
+    # is two columns per character on top of that, which `len` cannot see at all.
+    # Same defect and same fix as the fileset column in `render_quota` -- measure
+    # with `ui.visible_width`, fill with `ui.pad`, bound with `ui.truncate`.
+    #
+    # One width across both blocks rather than one each: they print as a single
+    # block under two captions, and the comparison those captions exist for --
+    # the same bytes attributed by uid and by gid -- is only legible if both name
+    # columns end in the same place. Floor and cap are the fileset column's, and
+    # 6 + 40 + 12 + 2 + 12 + " inodes" is still inside eighty columns.
+    name_w = max([16] + [ui.visible_width(n) for n, _s, _i in uid_rows + gid_rows])
+    name_w = min(name_w, 40)
+
+    def owner_row(row):
+        """One row of either block, in the shared name column."""
+        name, size, inodes = row
+        return "      {}{:>12}  {:>12} {}".format(
+            ui.pad(ui.truncate(name, name_w), name_w),
+            human_bytes(size),
+            human_count(inodes),
+            # See the reclaim rows: the count is right-aligned in its column and
+            # the noun agrees outside it, which is what `noun` is for. A home
+            # shared with one root-owned file printed `1 inodes` here.
+            noun(inodes, "inode"),
+        )
+
+    if uid_rows:
         out.append("")
         out.append(style.paint("  owners:", "dim"))
-        for uid, (size, inodes) in sorted(
-            res.by_uid.items(), key=lambda kv: kv[1][0], reverse=True
-        )[:_OWNER_SHOW]:
-            out.append(
-                # See the reclaim rows: the count is right-aligned in its column
-                # and the noun agrees outside it, which is what `noun` is for. A
-                # home shared with one root-owned file printed `1 inodes` here.
-                "      {:<16}{:>12}  {:>12} {}".format(
-                    _uname(uid), human_bytes(size), human_count(inodes), noun(inodes, "inode")
-                )
-            )
+        out.extend(owner_row(row) for row in uid_rows)
         out.extend(_and_more(len(res.by_uid), _OWNER_SHOW, "owners", style))
     # The uid table used to be captioned "a group quota charges all of these",
     # which is the wrong table: a group quota is charged by **gid**. The two
     # diverge exactly when it matters -- a file written into a shared project
     # directory whose setgid bit is missing is charged to the writer's personal
     # group, where nobody is looking for it.
-    if show_uids and len(res.by_gid) > 1:
+    if gid_rows:
         out.append(style.paint("  groups (a group quota charges these):", "dim"))
-        for gid, (size, inodes) in sorted(
-            res.by_gid.items(), key=lambda kv: kv[1][0], reverse=True
-        )[:_OWNER_SHOW]:
-            out.append(
-                "      {:<16}{:>12}  {:>12} {}".format(
-                    _gname(gid), human_bytes(size), human_count(inodes), noun(inodes, "inode")
-                )
-            )
+        out.extend(owner_row(row) for row in gid_rows)
         out.extend(_and_more(len(res.by_gid), _OWNER_SHOW, "groups", style))
 
     out.extend(_table(res, top, by_inodes, style, sort))
@@ -2306,6 +2427,34 @@ def _settle_subject(res: WalkResult) -> str:
     return " and ".join(parts) or "nothing changed"
 
 
+def _measured_nothing_clause(settle: SettleCheck) -> str:
+    """The verdict for a re-stat that had files to measure and measured none.
+
+    One sentence, two callers: the compact settling line embeds it after its
+    subject, and the ``SETTLING`` panel prints it on its own. It is a helper
+    rather than a string spelled twice because the two spellings had already
+    come apart -- the compact line said this, and the panel, for the same
+    ``SettleCheck``, said *"figure is PROVISIONAL -- use --settle-wait 60 to
+    measure the drift"*. That advice is wrong here twice over, and the two
+    faults are separate: the sample was deleted, so a longer wait deletes more
+    of it rather than measuring it; and ``gap`` is on the object, so the sixty
+    seconds offered may be *less* than the wait the reader already sat through
+    (measured: ``rdu -a --settle-wait 60`` printed it after 60s).
+
+    So what is said instead is what was observed -- the instrument took no
+    reading -- and no remedy is offered, because none of the knobs this tool has
+    is one. The count is the subject; the byte figure that says how wrong the
+    headline is stays where it already was, in ``render_compact``'s
+    :func:`_provisional_note` and in ``--json``'s ``vanished_allocated_bytes``.
+    Deliberately not repeated here: this clause is printed by both surfaces, and
+    only one of them is the one with room for the number.
+    """
+    return (
+        "a re-stat {:.0f}s later found {} already deleted and none left to"
+        " measure, so the figure is provisional".format(settle.gap, plural(settle.gone, "file"))
+    )
+
+
 def render_settle(
     res: WalkResult, settle: SettleCheck, style: Optional[ui.Style] = None
 ) -> List[str]:
@@ -2328,6 +2477,18 @@ def render_settle(
             if res.future_files
             else ""
         )
+        # Files deleted out from under the re-stat, which only the long form said.
+        # This compact form is the default for every tree whose recent files
+        # cannot move the headline -- the common case -- so on that run the
+        # terminal was the one view that did not mention that the population the
+        # drift was measured over had shrunk underneath it. `to_json` has
+        # published `vanished_files` from the start and its comment there claims
+        # "the terminal reports it", which was true of one branch of two.
+        vanished = (
+            " ({} disappeared between the walk and the re-stat)".format(human_count(settle.gone))
+            if settle.gone
+            else ""
+        )
         # A re-stat that ran long enough to see an effect and saw none has
         # *answered* this, and the long form below has always said so ("found no
         # change in N of them; the figure looks settled"). This line ignored
@@ -2339,15 +2500,44 @@ def render_settle(
         # got this right from the start (`settled` consults `conclusive`), so the
         # document and the terminal disagreed about the same check.
         if settle.conclusive:
+            # "The figure looks settled" is a claim about the figure, not about
+            # the sample, and the previous round left it standing over a partial
+            # vanishing on the grounds that the survivors genuinely had not
+            # moved. They had not -- but with seven of eight files unlinked the
+            # sentence read "found no change in 1 file (7 disappeared between the
+            # walk and the re-stat); the figure looks settled" above a 512.0 KiB
+            # headline for a tree holding 64.0 KiB. Disclosing the deletion does
+            # not repair a verdict that contradicts it, so above the factor bar
+            # the verdict is withdrawn and the error stated instead; below it the
+            # sentence is unchanged, which is the whole point of having a bar.
+            if _freed_since_walk_is_material(res, settle):
+                return _wrapped(
+                    "{:<22}{}{} in the last {} -- a re-stat {:.0f}s later found no"
+                    " change in the {} still there, but {} holding {} vanished in"
+                    " between, so the total above stays provisional: it counts"
+                    " blocks the filesystem already freed".format(
+                        "settling",
+                        _settle_subject(res),
+                        clock,
+                        human_duration(res.settle_window),
+                        settle.gap,
+                        plural(settle.checked, "file"),
+                        human_count(settle.gone),
+                        human_bytes(settle.gone_bytes),
+                    ),
+                    style,
+                    "  ",
+                )
             return _wrapped(
                 "{:<22}{}{} in the last {} -- a re-stat {:.0f}s later found no"
-                " change in {}; the figure looks settled".format(
+                " change in {}{}; the figure looks settled".format(
                     "settling",
                     _settle_subject(res),
                     clock,
                     human_duration(res.settle_window),
                     settle.gap,
                     plural(settle.checked, "file"),
+                    vanished,
                 ),
                 style,
                 "  ",
@@ -2360,22 +2550,48 @@ def render_settle(
         # are *unallocated*; whether they are still coming or were never going to
         # is what the sparse/compressed panel above answers, and this line used to
         # contradict it in the same report.
+        # Gated on the figure it prints, not only on the verdict: since
+        # `_headline_is_provisional` gained a second, unrelated reason to say yes
+        # (blocks freed by deletions, which are the opposite of unallocated), the
+        # verdict alone put ", holding 0 B unallocated" into the
+        # whole-sample-deleted sentence -- a clause asserting the reading it is
+        # made of was zero.
         held = (
             ", holding {} unallocated".format(human_bytes(_unlanded_bytes(res)))
-            if _headline_is_provisional(res, settle)
+            if _unlanded_bytes(res) and _headline_is_provisional(res, settle)
             else ""
         )
-        # Only reachable when the check did not run, or ran for less than
-        # `MIN_CONCLUSIVE_GAP_S`, so sixty seconds is always longer than whatever
-        # was already tried.
+        # A re-stat that ran long enough but re-stat'ed nothing -- see
+        # `SettleCheck.recheck_measured_nothing`. Waiting longer is not the
+        # remedy here and must not
+        # be offered as one: the sample was deleted, so a longer wait only deletes
+        # more of it, and the wait already performed may well have been longer
+        # than the sixty seconds the other branch suggests.
+        if settle.recheck_measured_nothing:
+            return _wrapped(
+                "{:<22}{}{} in the last {}{} -- {}".format(
+                    "settling",
+                    _settle_subject(res),
+                    clock,
+                    human_duration(res.settle_window),
+                    held,
+                    _measured_nothing_clause(settle),
+                ),
+                style,
+                "  ",
+            )
+        # Otherwise only reachable when the check did not run, or ran for less
+        # than `MIN_CONCLUSIVE_GAP_S`, so sixty seconds is always longer than
+        # whatever was already tried.
         return _wrapped(
-            "{:<22}{}{} in the last {}{} -- figure is provisional"
+            "{:<22}{}{} in the last {}{}{} -- figure is provisional"
             " (--settle-wait 60 to measure)".format(
                 "settling",
                 _settle_subject(res),
                 clock,
                 human_duration(res.settle_window),
                 held,
+                vanished,
             ),
             style,
             "  ",
@@ -2455,6 +2671,23 @@ def render_settle(
                     "dim",
                 )
             )
+    elif settle.conclusive and _freed_since_walk_is_material(res, settle):
+        # Same withdrawal as the compact form above, in the view that has room to
+        # name the number. The trailing "N of them disappeared" line below still
+        # prints, and carries the count this one leaves out.
+        out.extend(
+            _wrapped(
+                "re-stat {:.0f}s later found no change in the {} still there, but"
+                " at least {} of the total above belongs to files that no longer"
+                " exist -- the figure reads provisional, and high, not settled".format(
+                    settle.gap,
+                    plural(settle.checked, "file"),
+                    human_bytes(settle.gone_bytes),
+                ),
+                style,
+                "      ",
+            )
+        )
     elif settle.conclusive:
         out.append(
             style.paint(
@@ -2463,6 +2696,17 @@ def render_settle(
                 "dim",
             )
         )
+    elif settle.recheck_measured_nothing:
+        # The same withdrawal the compact form makes, in the same words -- see
+        # `_measured_nothing_clause`. This branch is why the clause is a helper:
+        # the panel used to fall through to the `else` below and print "use
+        # --settle-wait 60 to measure the drift" over a re-stat that had *nothing
+        # to measure*, so `rdu -a --settle-wait 60` on a tree whose whole recent
+        # sample was unlinked advised a sixty-second wait it had just performed,
+        # to measure a sample that no longer exists. Two surfaces of one check
+        # disagreeing about that check is the defect; sharing the sentence is what
+        # stops them drifting apart again.
+        out.extend(_wrapped(_measured_nothing_clause(settle), style, "      "))
     else:
         # A re-stat taken immediately cannot see an effect that takes tens of
         # seconds. Saying "looks settled" here would be a null result from a
@@ -2474,7 +2718,10 @@ def render_settle(
                 "      figure is PROVISIONAL -- use --settle-wait 60 to measure the drift", "dim"
             )
         )
-    if settle.gone:
+    # Not after the clause above, which already names the count as the subject of
+    # its own sentence ("found 60 files already deleted"). Every other branch
+    # leaves the deletion unmentioned, so there this line is the only disclosure.
+    if settle.gone and not settle.recheck_measured_nothing:
         out.append(
             style.paint(
                 "      {} of them disappeared between the walk and the re-stat".format(settle.gone),
@@ -2552,6 +2799,58 @@ def _packed(items: List[str], style: "ui.Style", indent: str, sep: str = "  ") -
     if current:
         lines.append(current)
     return [style.paint(indent + line, "dim") for line in lines]
+
+
+# The margin every continuation in the reconciliation section already uses: the
+# candidates, the notes, the blockers and the unlinked-but-open figure all hang
+# at six columns. A verdict's figures dropping to their own line join them there
+# rather than inventing a seventh alignment.
+_VERDICT_MARGIN = "      "
+
+
+def _verdict_headline(
+    label: str, headline: str, tone: str, figures: str, style: "ui.Style"
+) -> List[str]:
+    """A verdict's ``label  headline  figures`` line, figures dropped when short.
+
+    This is the first line of the RECONCILE section and the one a reader's eye
+    lands on, and it was built as a fixed three-part line with no width test at
+    all. Rendered it is 84 to 93 columns against a layout of 80 -- and, like the
+    blocker line fixed just before it, insensitive to the terminal, so a wider
+    one did not help and a narrower one only moved the damage. For ``blocks`` it
+    overflows on *every* realistic pair of figures: ``4.0 KiB`` against
+    ``8.0 KiB``, the smallest comparison the tool can report, already renders at
+    85. Only a degenerate all-zero triple fitted.
+
+    Soft-wrapping it with :func:`_wrapped` would be wrong, which is why it was
+    left alone twice. ``textwrap`` breaks on whitespace and every figure here
+    *contains* whitespace, so the break lands between ``47.7`` and ``MiB`` and
+    turns one number into two. The terminal's own hard wrap already does exactly
+    that -- an 87-column line at 80 leaves ``difference -82`` at the end of one
+    row and ``3.4 GiB`` alone at column zero of the next, level with the section
+    margin, where it reads as a separate statement.
+
+    So the figures move instead of being wrapped. They are a column, not prose:
+    kept whole, and dropped to the section's own six-column margin when the
+    label and the headline do not leave room for them -- the same "never split
+    one fact" rule :func:`_packed` is built on, applied to a line with exactly
+    two parts to choose between. The verdict word itself is never displaced,
+    because it is the one thing the line exists to say.
+
+    When all three parts fit, the single line is emitted unchanged, byte for
+    byte, including its painting. A short verdict -- ``files`` with four-digit
+    counts, which is the common case on an inode quota -- must not pay for the
+    byte-scale one.
+    """
+    head = "  {}  {}".format(label, style.paint(headline, tone))
+    # One column short of the layout, matching `_wrapped` and `_packed`: the last
+    # cell is left empty so a terminal at exactly this width does not wrap the
+    # line it was just told fits.
+    budget = _layout_width(style) - 1
+    plain = "  {}  {}  {}".format(label, headline, figures)
+    if ui.visible_width(plain) <= budget:
+        return ["{}  {}".format(head, style.paint(figures, "dim"))]
+    return [head, style.paint(_VERDICT_MARGIN + figures, "dim")]
 
 
 def _wrapped(text: str, style: ui.Style, indent: str, tone: str = "dim") -> List[str]:
@@ -2725,6 +3024,67 @@ def _unlanded_bytes(res: WalkResult) -> int:
     return max(0, res.recent_apparent - res.recent_size)
 
 
+def _freed_since_walk_is_material(res: WalkResult, settle: SettleCheck) -> bool:
+    """Has enough of the counted total been unlinked to move it by a factor?
+
+    Same shape and same bound as :func:`_headline_is_provisional`, read in the
+    other direction: *the headline is wrong by at least a factor* is a different
+    statement from *the headline is imprecise*, and only the first is worth
+    demoting the figure over. The error here is not even an estimate --
+    ``SettleCheck.gone_bytes`` is what the walk itself read for the paths the
+    re-stat found unlinked -- so the test is against what survived it. Half the
+    total gone means the reader is looking at a number twice the size of the
+    tree.
+
+    **Why a factor and not "any deletion at all".** Measured with eight 64 KiB
+    files and the re-stat given a believable 60s gap, the total overstates the
+    tree by 1.14x with one file unlinked, 2.00x with four and 8.00x with seven.
+
+    **Not identical at eighty, and this comment used to claim it was.** The
+    directory's own blocks are part of what survives, and they scale with the
+    entry count: measured here, an 8-entry directory adds 0 bytes to
+    ``res.size`` and an 80-entry one adds 4096. That decides the *exactly half*
+    case and nothing else, because at half the two sides of the comparison below
+    are equal to within precisely that overhead::
+
+        4  of 8    gone   262144   remainder   262144   1.0000x   fires
+        40 of 80   gone  2621440   remainder  2625536   0.9984x   does NOT fire
+        41 of 80   gone  2686976   remainder  2560000   1.0496x   fires
+        7  of 8    gone   458752   remainder    65536   7.0000x   fires
+        70 of 80   gone  4587520   remainder   659456   6.9565x   fires
+
+    The behaviour is right -- the tree really does still hold those 4096 bytes,
+    so eighty files with forty gone is a total overstated 1.998x rather than
+    2.000x, and it belongs on the quiet side of a bound that says *at least a
+    factor*. What was wrong was the claim of scale-invariance: one file in eight
+    is on the far side of the bound and half the files is ON it, so the ratio
+    table is exact only for the shape it was measured on. Anything within a
+    directory's worth of blocks of the bound is decided by that overhead, which
+    is why :func:`test_the_bound_is_exactly_gone_versus_remainder` pins the
+    comparison itself rather than a file count on some particular filesystem.
+
+    The 1.14x case is a 64 KiB error,
+    and on the tree this tool is pointed at -- eight files written into a
+    multi-terabyte scratch directory, one of them rotated away -- it is 64 KiB
+    against terabytes; qualifying that figure would put a caveat on every run of
+    every tree that rotates anything, which is how a caveat stops being read,
+    and ``SettleCheck.gone`` is disclosed there either way. 2.00x and 8.00x are
+    the same magnitude as the drift this whole check exists to catch (5.58x up,
+    3.3x down, measured -- see :class:`walk.SettleCheck`) and get the same
+    treatment.
+
+    So the bound is not invented for the occasion. It is the one the module
+    already applies to unlanded bytes -- *an error at least as large as what is
+    left over* -- and the ratio table above is what says one deletion in eight
+    falls on the other side of it.
+    """
+    if res.count_only:
+        return False  # no blocks were read, so none can be known to be freed
+    if not settle.gone_bytes:
+        return False
+    return settle.gone_bytes >= res.size - settle.gone_bytes
+
+
 def _headline_is_provisional(res: WalkResult, settle: Optional[SettleCheck] = None) -> bool:
     """Is there more unlanded data than the whole measured total?
 
@@ -2746,9 +3106,24 @@ def _headline_is_provisional(res: WalkResult, settle: Optional[SettleCheck] = No
     figure provisional. ``SettleCheck.conclusive`` is the codebase's own test for
     "can a null result from this check be believed"; this defers to it rather
     than inventing a second rule.
+
+    **But that null answers a question about the surviving files only.** This is
+    the consumer that turns *the sampled files stopped changing* into *the total
+    is the answer*, and the re-stat can come back conclusive having lost most of
+    the population it set out to measure: seven of eight files unlinked during a
+    7s ``--settle-wait`` left one survivor that had not moved, and on that
+    strength this returned ``False`` for a 512.0 KiB headline over a 64.0 KiB
+    tree -- 8.00x, larger than the drift the check exists to catch, and the
+    ``settling`` line said "the figure looks settled" above a table still
+    listing the seven deleted files. A null result cannot outrank a *measured*
+    error, so the deletion is tested first; see
+    :func:`_freed_since_walk_is_material` for why it is a factor and not any
+    deletion at all.
     """
     if res.count_only:
         return False  # no sizes were taken, so there is no headline to qualify
+    if settle is not None and _freed_since_walk_is_material(res, settle):
+        return True
     if settle is not None and settle.conclusive and not settle.moved:
         return False
     unlanded = _unlanded_bytes(res)
@@ -2791,7 +3166,23 @@ def _provisional_note(res: WalkResult, settle: SettleCheck, style: ui.Style) -> 
     if settle.moved:
         return []
 
-    if _headline_is_provisional(res, settle):
+    if _freed_since_walk_is_material(res, settle):
+        # The default view is the one with no ``SETTLING`` block to fall back on,
+        # so before this it was the *quietest* rendering of the worst case:
+        # `rdu` on a tree that lost seven of its eight recent files during the
+        # re-stat printed "512.0 KiB . 9 inodes . 0.00s", a table of eight
+        # entries of which one still existed, and not one word of qualification.
+        note = (
+            "{} in the last {}, of which {} holding {} vanished between the walk"
+            " and the re-stat -- the total above still counts those blocks, so it"
+            " reads high by at least that much and stays provisional".format(
+                _settle_subject(res),
+                human_duration(res.settle_window),
+                human_count(settle.gone),
+                human_bytes(settle.gone_bytes),
+            )
+        )
+    elif _headline_is_provisional(res, settle):
         note = (
             "{} in the last {}, holding {} unallocated -- more than this whole"
             " total, so the figure above is provisional. Blocks still to land and"
@@ -3040,16 +3431,15 @@ def render_reconcile(recs: List[rc.Reconciliation], style: Optional[ui.Style] = 
             continue
 
         if r.verdict == rc.CLOSES:
-            out.append(
-                "  {}  {}  {}".format(
+            out.extend(
+                _verdict_headline(
                     label,
-                    style.paint("reconciles", "green"),
-                    style.paint(
-                        "{} vs quota {}, difference {} (within {})".format(
-                            show(r.accounted), show(r.quota_value), show(r.gap), show(r.tolerance)
-                        ),
-                        "dim",
+                    "reconciles",
+                    "green",
+                    "{} vs quota {}, difference {} (within {})".format(
+                        show(r.accounted), show(r.quota_value), show(r.gap), show(r.tolerance)
                     ),
+                    style,
                 )
             )
             for b in r.blockers:
@@ -3076,16 +3466,15 @@ def render_reconcile(recs: List[rc.Reconciliation], style: Optional[ui.Style] = 
 
         tone = "yellow" if r.verdict == rc.INCONCLUSIVE else "red"
         headline = "INCONCLUSIVE" if r.verdict == rc.INCONCLUSIVE else "UNEXPLAINED GAP"
-        out.append(
-            "  {}  {}  {}".format(
+        out.extend(
+            _verdict_headline(
                 label,
-                style.paint(headline, tone),
-                style.paint(
-                    "{} accounted for vs quota {}, difference {}".format(
-                        show(r.accounted), show(r.quota_value), show(r.gap)
-                    ),
-                    "dim",
+                headline,
+                tone,
+                "{} accounted for vs quota {}, difference {}".format(
+                    show(r.accounted), show(r.quota_value), show(r.gap)
                 ),
+                style,
             )
         )
         if r.deleted_value:
@@ -3095,7 +3484,16 @@ def render_reconcile(recs: List[rc.Reconciliation], style: Optional[ui.Style] = 
                 )
             )
         for b in r.blockers:
-            out.append(style.paint("      cannot call this a finding: " + b, "dim"))
+            # Wrapped, and at the same indent as the candidates and notes below.
+            # This was the one `out.append` left in the branch, so the single
+            # longest sentence the package writes -- the snapshot-age blocker,
+            # which now names the walk's own duration as well as the read
+            # staleness, 187 columns rendered -- was the one line that set the
+            # width of the whole report on its own. The prefix stays inside the
+            # wrapped text rather than becoming the indent, so continuations
+            # align under it in the same column as every other prose line here
+            # instead of hanging off the end of "cannot call this a finding: ".
+            out.extend(_wrapped("cannot call this a finding: " + b, style, "      "))
         for c in r.candidates:
             out.extend(_wrapped("possible cause (not asserted): " + c, style, "      "))
         for n in r.notes:
@@ -3229,6 +3627,11 @@ def to_json(
             "rows": [
                 {
                     "fileset": r.fileset,
+                    # The filesystem the fileset is on, which used to BE the
+                    # `fileset` value on every `mmlsquota` row -- so seven
+                    # filesets on one device rendered as seven identical labels.
+                    "device": r.device,
+                    "label": r.label,
                     "kind": r.kind,
                     "scope": r.scope,
                     "used": r.used,
@@ -3279,12 +3682,29 @@ def to_json(
             "inodes": res.inodes,
             "symlinks": res.symlinks,
             "specials": res.specials,
-            "hardlinked_inodes": res.hardlinked_inodes,
-            "hardlink_extra_refs": res.hardlink_extra_refs,
+            # Both need `st_nlink`/`st_ino`, so under `-c` they are structurally
+            # zero rather than measured: dedup never runs, `seen_links` stays
+            # empty. Emitted raw, the document asserted "0 hard-linked files, 0
+            # extra names" about a walk that never looked -- on a tree where the
+            # full walk reports 1 and 2. That is the exact claim `_unmeasured`
+            # exists to stop, and every sibling stat-derived count here
+            # (`inline_files`, `recent_files`, `touched_files`, `padded_files`)
+            # already goes through it; these two were missed.
+            "hardlinked_inodes": _unmeasured(res, res.hardlinked_inodes),
+            "hardlink_extra_refs": _unmeasured(res, res.hardlink_extra_refs),
             "elapsed_seconds": round(res.elapsed, 3),
             "threads": res.threads,
             "complete": res.complete,
-            "unreadable_dirs": len(res.unreadable_dirs),
+            "unreadable_dirs": res.unreadable_dir_count,
+            # What the two sampling caps in `walk` dropped, so a consumer can see
+            # that a figure is bounded rather than inferring it from a list
+            # length that happens to be round.
+            "unreadable_dir_paths_dropped": res.unreadable_dirs_dropped,
+            "watched_dirs_seen": res.watched_seen,
+            "watched_dirs_untracked": res.watched_dropped,
+            "watched_dirs_tracked": len(res.watched),
+            "watched_bytes_over_cap": res.watched_overflow[0],
+            "watched_inodes_over_cap": res.watched_overflow[1],
             # How many of `unreadable_dirs` were gone rather than refused. A
             # consumer alerting on permission problems was counting concurrent
             # deletions among them, and the two want different responses.
@@ -3418,13 +3838,26 @@ def to_json(
             # expression turned that into an affirmative `settled: true`. That is
             # the strongest claim in this section, made by an instrument that was
             # switched off.
+            # `_freed_since_walk_is_material` is consulted here for the reason the
+            # terminal consults it: `settled` is read as "the total stands", and
+            # `not settle.moved` answered only "the allocation is not drifting".
+            # With seven of eight recent files unlinked, this published
+            # `settled: true` beside `vanished_files: 7` for a total 8.00x the
+            # size of the tree -- the document's strongest claim, contradicted by
+            # the field next to it. No schema bump: `settled` still means what it
+            # meant and its value domain is unchanged, this is the same class of
+            # correction as the whole-sample-deleted case that took it to `null`.
             "settled": (
                 None
                 if res.count_only
                 else (
                     True
                     if not (res.recent_files or res.touched_files)
-                    else (not settle.moved if settle.conclusive else None)
+                    else (
+                        (not settle.moved and not _freed_since_walk_is_material(res, settle))
+                        if settle.conclusive
+                        else None
+                    )
                 )
             ),
             "conclusive": settle.conclusive,
@@ -3438,6 +3871,19 @@ def to_json(
             # The terminal reports it ("N of them disappeared between the walk
             # and the re-stat") and the document did not.
             "vanished_files": settle.gone,
+            # The same caveat in the units the headline is in, so a consumer can
+            # weigh it instead of counting files: this is what the walk read for
+            # those paths, i.e. the amount by which `walk.size_bytes` above is
+            # already known to be high. A count cannot carry that -- one file of
+            # eight is 64 KiB or a terabyte -- and it is what decides `settled`.
+            "vanished_allocated_bytes": settle.gone_bytes,
+            # The limit case of the line above, and the reason `settled` is null
+            # rather than true when it fires: every sampled file was deleted, so
+            # `drift_bytes: 0` is an absent reading and not a settled tree.
+            # Derived, like `moved` / `sampled` / `conclusive`, and published for
+            # the same reason -- a consumer should not have to know that
+            # `rechecked == 0 and vanished_files > 0` means the check was blind.
+            "recheck_measured_nothing": settle.recheck_measured_nothing,
             # Both halves, unambiguously named, so the subtraction below is
             # checkable and a consumer can do its own arithmetic on either.
             "recent_allocated_bytes": _unmeasured(res, res.recent_size),

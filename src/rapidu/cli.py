@@ -364,12 +364,7 @@ def _resolve_paths(raw: List[str]) -> Tuple[List[str], int]:
     for p in requested:
         expanded, why = _expand(p)
         if why:
-            sys.stderr.write(
-                ui.encode_safe(
-                    "rapidu: {}: cannot expand `~` -- {}\n".format(ui.printable(p), why),
-                    sys.stderr,
-                )
-            )
+            _say_cannot_expand(p, why)
             refused += 1
             continue
         ap = os.path.abspath(expanded)
@@ -524,6 +519,30 @@ def _box_style(color: str, ascii_only: bool, boxed: bool) -> "ui.Style":
     return style
 
 
+def _say_cannot_expand(raw: str, why: str) -> None:
+    """The one place the `~`-expansion refusal is spelled.
+
+    It was written twice, and the two copies did not protect the stream the same
+    way: one routed the sentence through `ui.encode_safe`, the other wrote it
+    raw. `ui.printable` escapes control bytes but deliberately does NOT escape
+    ordinary non-ASCII -- `cafe\u0301` and a CJK directory come through intact --
+    so the two differed on exactly the input this package sanitises filenames
+    for. Nothing crashed, because Python gives `stderr` a `backslashreplace`
+    handler by default; that is the interpreter saving one of the two, not the
+    code agreeing with itself, and it would stop saving anything the moment this
+    sentence went anywhere but stderr.
+
+    Control flow stays with the caller: `cmd_quota` needs every path it was
+    given, and the walk path counts a refusal and carries on.
+    """
+    sys.stderr.write(
+        ui.encode_safe(
+            "rapidu: {}: cannot expand `~` -- {}\n".format(ui.printable(raw), why),
+            sys.stderr,
+        )
+    )
+
+
 def cmd_quota(args: argparse.Namespace) -> int:
     paths = []  # type: List[str]
     for raw in args.paths:
@@ -531,7 +550,7 @@ def cmd_quota(args: argparse.Namespace) -> int:
         if why:
             # The quota reader maps rows to a path, so an unexpanded `~` here
             # would silently ask about a relative directory named `~`.
-            sys.stderr.write("rapidu: {}: cannot expand `~` -- {}\n".format(ui.printable(raw), why))
+            _say_cannot_expand(raw, why)
             return EXIT_ERROR
         paths.append(os.path.abspath(expanded))
     if not paths:
@@ -742,7 +761,23 @@ def cmd_walk(args: argparse.Namespace) -> int:
         recs = []  # type: List[rc.Reconciliation]
         if snap is not None:
             for kind in ("blocks", "files"):
-                recs.append(rc.reconcile(res, settle, snap, path_scan, kind, args.max_snapshot_age))
+                # `--quota-timeout` passed through, not left to the module
+                # default. `reconcile`'s docstring asserts the probe runs under
+                # "the same budget the backend query ran under", and omitting it
+                # here made that false: the `mmlsattr -L` call fell back to the
+                # 45 s default, so `rdu -a --quota-timeout 3 p1 ... pN` could
+                # block 45 s per path past the budget it was given.
+                recs.append(
+                    rc.reconcile(
+                        res,
+                        settle,
+                        snap,
+                        path_scan,
+                        kind,
+                        args.max_snapshot_age,
+                        probe_timeout=args.quota_timeout,
+                    )
+                )
 
         if args.as_json:
             docs.append(report.to_json(res, settle, snap, path_scan, recs, args.top))
@@ -827,6 +862,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.quota_only and args.deleted_only:
         parser.error("--quota-only and --deleted-only ask for different reports")
 
+    # The same shape, and the one that was silent: `--quota-only --no-quota`
+    # produced output byte-identical to `--quota-only` alone, so `--no-quota` was
+    # discarded without a word. That is the wrong flag to drop -- a user passes it
+    # precisely when the backend is slow, hanging or absent, and dropping it means
+    # the thing they asked to avoid is queried anyway.
+    if args.quota_only and args.no_quota:
+        parser.error(
+            "--quota-only asks for the quota report and --no-quota skips "
+            "reading the quota; together they ask for an empty report"
+        )
+
     # Four values were accepted and silently did something other than what they
     # look like. Each one disables a feature rather than adjusting it, and each
     # did so without a word: `-d 0` printed "0 entries" and exited 0, as though
@@ -880,6 +926,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.error("--max-dirs-per-sec cannot be negative; 0 disables the rate limit")
     if args.quota_timeout <= 0:
         parser.error("--quota-timeout must be positive; use --no-quota to skip the backend")
+    if args.settle_wait < 0:
+        parser.error(
+            "--settle-wait cannot be negative: it is how long to wait before "
+            "re-stat'ing; 0 skips the wait"
+        )
+    # NOT `< 0`, and this one is a trap rather than merely nonsense. The cap is
+    # compared with `age > max_snapshot_age`, so a cap of 0 makes every snapshot
+    # that is not exactly 0.00s old too stale to support a finding, and a negative
+    # cap makes even a snapshot taken this instant too stale -- in both cases
+    # every quota comparison is silently blockered out and the run still exits 0.
+    #
+    # Worth refusing rather than documenting, because this tool's own convention
+    # points the other way: `--max-dirs-per-sec 0` disables the rate limit and
+    # `--top 0` means every entry, so 0 here reads as "do not check the age" and
+    # does the exact opposite.
+    if args.max_snapshot_age <= 0:
+        parser.error(
+            "--max-snapshot-age must be positive: it is the oldest snapshot "
+            "that can still support a finding, so 0 or less makes every "
+            "snapshot too old and suppresses all of them; pass --no-quota "
+            "to skip the quota comparison instead"
+        )
 
     try:
         if args.quota_only:
@@ -898,7 +966,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         # and exited **120**, which is not one of this tool's three codes. A full
         # filesystem is the condition a quota tool is run in, so that is the one
         # write failure it must report properly.
-        sys.stdout.flush()
+        #
+        # Guarded, because `sys.stdout` is **None** when fd 1 is CLOSED rather
+        # than redirected -- `rdu . >&-`, and what a daemon or a cron job with
+        # closed descriptors gives. CPython makes `print()` a silent no-op in that
+        # state, so the whole run succeeded and then this line raised
+        # `AttributeError: 'NoneType' object has no attribute 'flush'` out of
+        # `main`. Nothing to flush is not a failure: the caller asked for the
+        # report to go nowhere and it went nowhere.
+        if sys.stdout is not None:
+            sys.stdout.flush()
         return code
     except KeyboardInterrupt:
         sys.stderr.write("\nrapidu: interrupted\n")

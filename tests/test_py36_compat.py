@@ -13,6 +13,7 @@ down every import of the package. These tests fail when it happens again.
 import ast
 import os
 import pathlib
+import re
 import sys
 
 import pytest
@@ -126,3 +127,125 @@ def test_imports_under_the_system_interpreter():
     assert proc.returncode == 0, "import failed under /usr/bin/python3:\n{}".format(
         proc.stdout.decode("utf-8", "replace")
     )
+
+
+# --------------------------------------------------------------------------
+# The other half of the deployability claim: stdlib only
+# --------------------------------------------------------------------------
+#: Modules that are part of the package, so importing them is not a dependency.
+#:
+#: Read from the tree rather than listed, because a hardcoded list is how this
+#: kind of guard comes to pass vacuously after a module is added.
+def _local_module_names():
+    return {p.stem for p in SRC.rglob("*.py")} | {"rapidu"}
+
+
+#: Stdlib modules that did NOT exist at this package's floor, and when they landed.
+#:
+#: `sys.stdlib_module_names` is the RUNNING interpreter's, so it answers "is this
+#: stdlib in 3.11" and cannot answer "was it stdlib in 3.6". Importing `tomllib`
+#: would therefore pass the third-party guard below while raising
+#: `ModuleNotFoundError` on the login-node interpreter the whole deployability
+#: claim is about. Deliberately small: the stdlib additions between 3.6 and the
+#: newest version this is run on. A module missing from the table is not a false
+#: pass -- `test_imports_under_the_system_interpreter` still runs the real 3.6-era
+#: interpreter where one exists -- it is a slower way to find out.
+TOO_NEW_FOR_THE_FLOOR = {
+    "dataclasses": (3, 7),
+    "contextvars": (3, 7),
+    "importlib.resources": (3, 7),
+    "zoneinfo": (3, 9),
+    "graphlib": (3, 9),
+    "tomllib": (3, 11),
+}
+
+
+def _third_party_imports(path):
+    """Top-level modules ``path`` imports that are neither stdlib nor local."""
+    local = _local_module_names()
+    stdlib = set(sys.stdlib_module_names)
+    found = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        roots = []
+        if isinstance(node, ast.Import):
+            roots = [a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            roots = [node.module.split(".")[0]]
+        found |= {r for r in roots if r not in stdlib and r not in local}
+    return found
+
+
+@pytest.mark.parametrize("path", _sources(), ids=lambda p: p.name)
+def test_no_third_party_import(path):
+    """`pip install rapidu` must pull in nothing, and neither must running it.
+
+    The syntax floor above is only half the deployability argument. The other
+    half is that the tool runs on a login node's bare `/usr/bin/python3` during a
+    storage emergency, before any conda env is activated -- and one `import rich`
+    would end that, on an interpreter where the user cannot install anything and
+    would not want to.
+
+    Asserted here rather than left to the `zero-install` CI job, because a CI-only
+    check cannot fail during the local gate run that introduces it: the four gates
+    would all pass and the breakage would surface on push.
+    """
+    found = sorted(_third_party_imports(path))
+    assert not found, (
+        f"{path.name} imports {found}; rapidu declares no dependencies and its "
+        f"deployability rests on that"
+    )
+
+
+@pytest.mark.parametrize("path", _sources(), ids=lambda p: p.name)
+def test_no_stdlib_module_newer_than_the_floor(path):
+    """A module that is stdlib *now* may not have been at 3.6.
+
+    See `TOO_NEW_FOR_THE_FLOOR`: the third-party guard above cannot catch these,
+    because the running interpreter reports them as stdlib and they are.
+    """
+    imported = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            imported |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported.add(node.module)
+    offenders = {
+        name: version
+        for name, version in TOO_NEW_FOR_THE_FLOOR.items()
+        if name in imported or any(i.split(".")[0] == name for i in imported)
+    }
+    assert not offenders, (
+        f"{path.name} imports {offenders}, which post-date the "
+        f"{MIN_FEATURE_VERSION} floor this package claims"
+    )
+
+
+def test_the_declared_dependency_list_is_actually_empty():
+    """The claim from the other direction, so the two cannot disagree.
+
+    A dependency added to `pyproject.toml` but not yet imported would pass every
+    test above while already breaking `pip install` on an air-gapped node.
+    """
+    root = SRC.parent.parent
+    text = (root / "pyproject.toml").read_text()
+    block = re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.S | re.M)
+    declared = (
+        []
+        if block is None
+        else [d for d in (x.strip().strip('",') for x in block.group(1).split("\n")) if d]
+    )
+    assert not declared, f"pyproject declares dependencies: {declared}"
+
+
+def test_the_guard_would_notice_a_real_import():
+    """The control: a guard that cannot fail is not a guard.
+
+    `test_there_are_sources_to_check` covers the glob going empty; this covers
+    the detector itself returning nothing for input it should flag.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = pathlib.Path(tmp) / "probe.py"
+        probe.write_text("import rich\nfrom textual.app import App\n")
+        assert _third_party_imports(probe) == {"rich", "textual"}
