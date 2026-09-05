@@ -199,6 +199,10 @@ _MUTED_256 = "c256:247"
 _BAR_FULL, _BAR_EMPTY = "█", "░"
 _BAR_PARTIALS = ("", "▏", "▎", "▍", "▌", "▋", "▊", "▉")
 _BAR_FULL_ASCII, _BAR_EMPTY_ASCII = "#", "-"
+#: The horizontal rule, in the two glyph sets. Named beside the bar glyphs
+#: because it is the same kind of decision, and `Style.rule` is the one place
+#: it gets made -- see that property for what two copies of it cost.
+_RULE, _RULE_ASCII = "\u2500", "-"
 # The remainder row's fill: medium shade, so it reads as "many things" against
 # the solid slab of a single directory. Partials are dropped with it -- a
 # sub-cell tail on a hatched bar is invisible and only costs alignment.
@@ -283,6 +287,23 @@ class Style:
     @property
     def partials(self):
         return _BAR_PARTIALS if self.unicode else ("",)
+
+    @property
+    def rule(self) -> str:
+        """The horizontal-rule glyph for this run's glyph set.
+
+        A property for the same reason :attr:`bar_chars` is one, and with a
+        history: `_section_rule`'s docstring records that it once hard-coded 78
+        ASCII dashes while the table drew a unicode rule, so "a unicode report
+        carried one unicode rule and one ASCII one". That was fixed by giving
+        each site the conditional -- which left the *decision* written twice, in
+        two files, which is the same shape one step back.
+
+        `box` deliberately keeps its own ``horiz``: its six border glyphs are
+        resolved together as a set, and lifting one out of that tuple would make
+        it harder to read, not easier.
+        """
+        return _RULE if self.unicode else _RULE_ASCII
 
 
 def _supports_unicode(stream) -> bool:
@@ -385,6 +406,25 @@ def color_depth() -> int:
 
 
 def terminal_width(default: int = 100) -> int:
+    """The width to lay out for: the terminal's, clamped to ``[60, 160]``.
+
+    **The floor is not cosmetic and it is not free.** Below 60 columns the ranking
+    table has no readable form -- a size, a bar, a percentage and an inode count
+    do not fit -- so the layout stops shrinking and the frame overruns the
+    terminal instead. Measured: at ``COLUMNS`` of 30, 40, 45, 50 and 55 the box is
+    60 cells wide either way, so ten of its lines are wider than a 40-column
+    terminal. That is the deliberate trade named below, chosen over a table that
+    fits and cannot be read.
+
+    It is documented here because it is the *only* place the floor exists, and
+    because ``report._layout_width`` used to describe the pair as a cap that
+    "only bites upwards" -- true of its own 60-column example, which sits exactly
+    on the floor, and false of every narrower terminal.
+
+    The ceiling is the readable-prose bound: past ~160 columns a wrapped sentence
+    becomes hard to track back to the next line, and ``report._LAYOUT_COLUMNS``
+    narrows elastic content further still.
+    """
     try:
         import shutil
 

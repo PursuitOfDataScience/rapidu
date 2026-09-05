@@ -85,6 +85,27 @@ def plural(n: Optional[int], word: str, suffix: str = "s", irregular: Optional[s
     return "{} {}".format(human_count(n), noun(n, word, suffix, irregular))
 
 
+def inode_change_clause(touched_files: Optional[int]) -> str:
+    """``4 inodes changed without being written`` -- the ctime half of a settle.
+
+    One home because `reconcile._changed_phrase` and `report._settle_subject`
+    built this expression *identically*, down to the `plural` call, in two
+    modules -- so the wording could only be changed in both or drift. It is load
+    bearing: `st_ctime` moves for a permission change, an ownership change, a
+    rename or a hard link, none of which touch a block, and calling those a write
+    "stated something false about the tree, in the section whose whole job is to
+    say how much the headline number can be trusted".
+
+    The SENTENCES around it stay in their own modules and deliberately differ:
+    `report`'s reads "N files written and this in the last 5s" (a noun phrase its
+    eight call sites supply the tense for) while `reconcile`'s reads "N files were
+    written within the last 5s" -- and that verb is pinned by
+    `test_subject_verb_agreement_on_one_file` as "the agreement rule this package
+    states once". Only the identical clause is shared.
+    """
+    return "{} changed without being written".format(plural(touched_files, "inode"))
+
+
 def human_duration(seconds: Optional[float]) -> str:
     """Coarse human duration used for snapshot ages. ``None`` -> ``unknown``."""
     if seconds is None:
@@ -147,7 +168,37 @@ def files_per_gib(size_bytes: int, files: int) -> Optional[float]:
 
 
 def pct(part: Optional[float], whole: Optional[float]) -> str:
-    """Percentage, or ``n/a`` when the denominator is missing or zero."""
+    """Percentage, or ``n/a`` when the denominator is missing or zero.
+
+    **The same rule :func:`ratio_x` states twenty lines up, which this did not
+    follow.** That docstring settles it: "an inequality is still a measurement,
+    where ``0.00x`` reads as one that failed", and "a ratio of exactly zero is not
+    that case ... it prints ``0x``". ``{:.1f}`` rounds to ``0.0`` anywhere below
+    0.05 and to ``100.0`` from 99.95 up, so both ends of the range were reported
+    as a value the measurement had not reached.
+
+    Both ends are reachable and both mislead in the direction that matters:
+
+    * The quota line prints the bytes AND the percentage in one sentence --
+      "the mount at X reports 31.9 GiB of 32.0 GiB used (100.0%)". The reader is
+      told they are full by the figure they act on, and told there is room by the
+      figure beside it, in the same breath. 99.95% of a 32 GiB home is 16 MiB
+      still free.
+    * ``"({} of the tree)"`` (``report.py:1145``) is where the other end bites: a
+      subtree holding one inode of 13,051 printed ``0.0% of the tree``, which
+      reads as holding none of it -- and "which directory holds this" is the
+      question the tree report exists to answer.
+
+    So an interior value gets an inequality, exactly as ``ratio_x`` does, and the
+    exact boundaries keep printing as themselves: 0 of anything is a fact and
+    stays ``0.0%``, part == whole stays ``100.0%``. Over 100% is untouched -- a
+    quota can be over its limit, and ``102.0%`` is the measurement.
+    """
     if part is None or not whole:
         return "n/a"
-    return "{:.1f}%".format(100.0 * part / whole)
+    value = 100.0 * part / whole
+    if 0.0 < value < 0.05:
+        return "<0.1%"
+    if 99.95 <= value < 100.0:
+        return ">99.9%"
+    return "{:.1f}%".format(value)

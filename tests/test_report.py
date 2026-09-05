@@ -596,6 +596,50 @@ class TestCountOnlyDoesNotPublishAZeroItNeverMeasured:
         assert doc["hardlinked_inodes"] is None
         assert doc["hardlink_extra_refs"] is None
 
+    # The one key in this document that is a reading of the *clock* rather than a
+    # figure read off the tree, and the reason the scan below cannot simply take
+    # every numeric key. `-c` measures elapsed time exactly as honestly as a full
+    # walk does; what differs is how long the two take. On this five-entry fixture
+    # the full walk stats every entry and lands near 0.00013 s while the stat-free
+    # walk lands near 0.00010 s -- both `0.0` once `round(..., 3)` has had them,
+    # until the full walk's tail crosses 0.0005 s and rounds to 0.001 instead.
+    # Then the fast path's `0.0` reads as a fabricated zero and this test fails on
+    # a timing rather than on a claim: 3 of 300 in-process repetitions on an idle
+    # login node, 4 of 25 full-suite runs on a loaded one, and 8 of 8 once the
+    # fixture is widened to 128 files, which is the same crossing made reliable.
+    #
+    # The same call is already made one file over and for the same reason:
+    # `test_walk_throttles._snapshot` compares every attribute of `WalkResult` and
+    # skips `elapsed` because it "is the thing being varied". The alternative -- a
+    # fixture big enough for both walks to take a measurable time -- is the one
+    # this suite has already refused in so many words: "an upper bound on elapsed
+    # time would be a coin flip on a shared login node."
+    #
+    # Named, not inferred from a type or a `_seconds` suffix, and pinned by
+    # `test_the_timing_exclusion_covers_only_the_timing` below, so this cannot
+    # become a list that quietly grows over a real fabricated zero. What makes the
+    # exclusion honest rather than a cover-up is that `-c` genuinely takes this
+    # measurement -- `test_the_excluded_timing_is_a_reading_and_not_an_absence`.
+    _CLOCK_NOT_TREE = ("elapsed_seconds",)
+
+    @classmethod
+    def _false_zeroes(cls, full, lean):
+        """Keys the full walk gives a nonzero number and `-c` gives exactly 0.
+
+        Factored out of the test below so the control can exercise this scan
+        rather than a second copy of it.
+        """
+        return [
+            k
+            for k, v in full.items()
+            if k not in cls._CLOCK_NOT_TREE
+            and isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and v
+            and lean.get(k) == 0
+            and not isinstance(lean.get(k), bool)
+        ]
+
     def test_no_field_reports_zero_where_the_full_walk_reports_a_number(self, tmp_path):
         """The general invariant, so a future missed site is caught too.
 
@@ -605,22 +649,97 @@ class TestCountOnlyDoesNotPublishAZeroItNeverMeasured:
         the correct answer and passes; a different nonzero number passes too
         (`inodes` legitimately differs, 5 against 4, because a hard link is
         counted once per name without stat -- which the help states).
+
+        `_CLOCK_NOT_TREE` is out of scope, for the reason given there.
         """
         root = self._tree(tmp_path, hardlink=True)
         full = self._walk_doc(root, count_only=False)
         lean = self._walk_doc(root, count_only=True)
-        false_zeroes = [
-            k
-            for k, v in full.items()
-            if isinstance(v, (int, float))
-            and not isinstance(v, bool)
-            and v
-            and lean.get(k) == 0
-            and not isinstance(lean.get(k), bool)
-        ]
+        false_zeroes = self._false_zeroes(full, lean)
         assert false_zeroes == [], (
             "these fields publish a measured-looking 0 under -c: %s" % false_zeroes
         )
+
+    def test_the_timing_exclusion_covers_only_the_timing(self, tmp_path):
+        """CONTROL -- what stops `_CLOCK_NOT_TREE` growing to hide a defect.
+
+        Every other numeric key at this level is a count of bytes or of entries,
+        i.e. a figure read off the tree, and belongs in the scan. Checked against
+        both real documents rather than as a bare literal, so an exclusion that no
+        longer names a live key -- silently skipping nothing, or skipping a key
+        that has since become an integer count -- is caught here.
+        """
+        root = self._tree(tmp_path, hardlink=True)
+        full = self._walk_doc(root, count_only=False)
+        lean = self._walk_doc(root, count_only=True)
+        assert self._CLOCK_NOT_TREE == ("elapsed_seconds",)
+        for key in self._CLOCK_NOT_TREE:
+            assert key in full and key in lean, key
+            # A duration, in both documents. Every figure the scan does cover is
+            # an `int`, so a count arriving in this tuple would fail here.
+            assert isinstance(full[key], float), key
+            assert isinstance(lean[key], float), key
+
+    def test_the_excluded_timing_is_a_reading_and_not_an_absence(self, tmp_path):
+        """CONTROL -- passes before and after; the exclusion is not a cover-up.
+
+        What separates `elapsed_seconds` from every key the scan covers is whether
+        `-c` measures the quantity at all. `size_bytes` is structurally absent
+        there: no tree makes the stat-free walk read `st_blocks`, which is why it
+        has to be `null`. The clock is not absent -- `perf_counter` ran across the
+        stat-free walk and returned a positive interval, and the published `0.0` is
+        that interval rounded to milliseconds rather than the lack of one.
+
+        Asserted on the raw `elapsed`, so this is a floor at zero and not a bound
+        on how fast the machine is.
+        """
+        from rapidu import report
+        from rapidu.walk import walk
+
+        root = self._tree(tmp_path, hardlink=True)
+        res = walk(root, threads=1, depth=1, count_only=True)
+        doc = report.to_json(res, None, None, None, None, 10)["walk"]
+        assert res.elapsed > 0.0, "the clock ran across the stat-free walk"
+        assert doc["elapsed_seconds"] == round(res.elapsed, 3), "published as read"
+        assert res.size == 0 and doc["size_bytes"] is None, (
+            "st_blocks was never read, so the 0 behind it is not a reading"
+        )
+
+    def test_the_scan_still_catches_a_fabricated_zero(self, tmp_path):
+        """CONTROL -- passes before and after, and the one that matters most.
+
+        Excluding a key from a scan sits one keystroke away from excluding the
+        defect, so the scan is run over the real pair of documents with real
+        fabrications put back into the `-c` one: the two hard-link fields
+        unwrapped, as they were before `_unmeasured` reached them, plus a byte
+        figure. The full walk reports 1, 1 and 16384 on this tree, so all three
+        have to come back -- skipping `elapsed_seconds` must not cost the scan its
+        teeth.
+        """
+        root = self._tree(tmp_path, hardlink=True)
+        full = self._walk_doc(root, count_only=False)
+        lean = self._walk_doc(root, count_only=True)
+        # The baseline is stated rather than inherited: the timing pinned to the
+        # full walk's reading, and the three subject keys pinned to the `null` the
+        # schema asks for. So this measures the scan's sensitivity and nothing
+        # else -- not the machine's clock, and not what `to_json` currently does
+        # with those keys, which is the invariant test's job one method up. It
+        # holds with `_CLOCK_NOT_TREE` in force and with it emptied, which is what
+        # makes it a control.
+        clean = dict(
+            lean,
+            elapsed_seconds=full["elapsed_seconds"],
+            hardlinked_inodes=None,
+            hardlink_extra_refs=None,
+            size_bytes=None,
+        )
+        assert self._false_zeroes(full, clean) == []
+        regressed = dict(clean, hardlinked_inodes=0, hardlink_extra_refs=0, size_bytes=0)
+        assert sorted(self._false_zeroes(full, regressed)) == [
+            "hardlink_extra_refs",
+            "hardlinked_inodes",
+            "size_bytes",
+        ]
 
     def test_the_full_walk_still_reports_the_real_figures(self, tmp_path):
         """CONTROL -- passes before and after; the fix must not null everything."""

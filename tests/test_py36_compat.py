@@ -160,10 +160,27 @@ TOO_NEW_FOR_THE_FLOOR = {
 }
 
 
+#: ``sys.stdlib_module_names`` arrived in **3.10**. Without it every import looks
+#: third-party, so the audit cannot run and must SKIP rather than invent findings.
+#: ``ci.yml`` guards the same API deliberately -- ``getattr(sys,
+#: "stdlib_module_names", ())`` then ``assert stdlib, "need Python 3.10+"`` -- and
+#: this file called it bare, which failed the ``Test (py3.9)`` job while every
+#: other job passed. The package supports 3.6 and the matrix tests 3.9, so the
+#: interpreter running the suite is NOT guaranteed to have it.
+_NEEDS_STDLIB_NAMES = pytest.mark.skipif(
+    not hasattr(sys, "stdlib_module_names"),
+    reason="sys.stdlib_module_names is 3.10+; the import audit cannot run without it",
+)
+
+
 def _third_party_imports(path):
     """Top-level modules ``path`` imports that are neither stdlib nor local."""
     local = _local_module_names()
-    stdlib = set(sys.stdlib_module_names)
+    stdlib = set(getattr(sys, "stdlib_module_names", ()))
+    # Same assert ci.yml makes: an empty set here would make every stdlib
+    # import look like a dependency, so callers must carry
+    # `_NEEDS_STDLIB_NAMES` rather than reach a wrong answer.
+    assert stdlib, "sys.stdlib_module_names is 3.10+; caller must skip"
     found = set()
     for node in ast.walk(ast.parse(path.read_text())):
         roots = []
@@ -175,6 +192,7 @@ def _third_party_imports(path):
     return found
 
 
+@_NEEDS_STDLIB_NAMES
 @pytest.mark.parametrize("path", _sources(), ids=lambda p: p.name)
 def test_no_third_party_import(path):
     """`pip install rapidu` must pull in nothing, and neither must running it.
@@ -237,6 +255,7 @@ def test_the_declared_dependency_list_is_actually_empty():
     assert not declared, f"pyproject declares dependencies: {declared}"
 
 
+@_NEEDS_STDLIB_NAMES
 def test_the_guard_would_notice_a_real_import():
     """The control: a guard that cannot fail is not a guard.
 
@@ -249,3 +268,36 @@ def test_the_guard_would_notice_a_real_import():
         probe = pathlib.Path(tmp) / "probe.py"
         probe.write_text("import rich\nfrom textual.app import App\n")
         assert _third_party_imports(probe) == {"rich", "textual"}
+
+
+def test_the_audit_refuses_to_run_without_the_stdlib_list(tmp_path, monkeypatch):
+    """Without ``sys.stdlib_module_names`` the audit must stop, not answer wrongly.
+
+    The set is what tells a stdlib import from a dependency. Empty, every ``import
+    os`` reads as a third-party package and ``test_no_third_party_import`` fails
+    every source file for the wrong reason -- which is worse than not running,
+    because the message names dependencies that do not exist.
+
+    This is the API the ``Test (py3.9)`` job tripped over: 3.10+ only, called bare
+    here while ``ci.yml`` guarded the same call with ``getattr`` and an assert.
+    """
+    monkeypatch.delattr(sys, "stdlib_module_names", raising=False)
+    probe = tmp_path / "probe.py"
+    probe.write_text("import os\nimport sys\n")
+    with pytest.raises(AssertionError) as caught:
+        _third_party_imports(probe)
+    assert "3.10" in str(caught.value), caught.value
+
+
+def test_control_the_audit_still_works_where_the_list_exists(tmp_path):
+    """CONTROL, passing with the guard present or absent.
+
+    On any interpreter that has the set, a stdlib import is still not a finding
+    and a real dependency still is. A guard that skipped unconditionally would
+    pass the test above and fail this one.
+    """
+    if not hasattr(sys, "stdlib_module_names"):
+        pytest.skip("this interpreter predates the API; nothing to control against")
+    probe = tmp_path / "probe.py"
+    probe.write_text("import os\nimport sys\nimport rich\nfrom textual import App\n")
+    assert _third_party_imports(probe) == {"rich", "textual"}

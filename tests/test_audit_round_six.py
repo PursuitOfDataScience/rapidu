@@ -2433,6 +2433,7 @@ def test_no_message_pairs_a_count_with_a_fixed_verb():
     import ast
     import glob
     import re
+    import textwrap
 
     safe = (
         # The interpolated value cannot be 1, or the word agrees with something
@@ -2516,13 +2517,43 @@ def test_no_message_pairs_a_count_with_a_fixed_verb():
         # `each` is invariant, and this fires only above 5,000,000 inodes.
         "and rapidu holds roughly",
     )
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    offenders = []
-    for path in sorted(glob.glob(os.path.join(root, "src", "rapidu", "*.py"))):
-        with open(path, "rb") as handle:
-            tree = ast.parse(handle.read().decode("utf-8"))
+
+    def offenders_in(source, name="<source>"):
+        """Agreement-sensitive interpolations in one module's MESSAGES.
+
+        **Docstrings are excluded, and that is not a convenience.** This sweep
+        reads every string constant, and a docstring is where the *reason* a
+        format is written a certain way gets explained -- so a docstring quoting
+        `{:.1f}` beside the word "is" was reported as a message with a
+        number-agreement bug. It happened on this very check: `fmt.pct` grew a
+        docstring citing the format spec it had been getting wrong, and the sweep
+        failed on the fix rather than on any message. slurmpast's equivalent
+        sweep records the same lesson -- "a check that cannot tell the code from
+        the note about the code fails on its own fix" -- and excludes them for
+        exactly this reason.
+
+        Only the FIRST statement of a module, function or class is a docstring,
+        so a real message that happens to lead a function body is still seen.
+        Skipped by node identity, not by value, so a message that merely repeats
+        a docstring's words is still checked.
+        """
+        tree = ast.parse(source)
+        docstrings = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(
+                    node,
+                    (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                )
+                and node.body
+                and ast.get_docstring(node, clean=False) is not None
+            ):
+                docstrings.add(id(node.body[0].value))
+        found = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if id(node) in docstrings:
                 continue
             text = node.value
             if "{}" not in text and "{:" not in text:
@@ -2531,8 +2562,30 @@ def test_no_message_pairs_a_count_with_a_fixed_verb():
                 continue
             if any(fragment in text for fragment in safe):
                 continue
-            offenders.append((os.path.basename(path), " ".join(text.split())[:96]))
+            found.append((name, " ".join(text.split())[:96]))
+        return found
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sources = sorted(glob.glob(os.path.join(root, "src", "rapidu", "*.py")))
+    assert sources, "the glob went empty; this check would pass vacuously"
+    offenders = []
+    for path in sources:
+        with open(path, "rb") as handle:
+            offenders.extend(offenders_in(handle.read().decode("utf-8"), os.path.basename(path)))
     assert not offenders, offenders
+
+    # Both directions of the exclusion, against a line of source rather than
+    # against whatever the package happens to contain today -- a sweep that reads
+    # its expectation out of the file it guards proves nothing.
+    planted = textwrap.dedent(
+        '''
+        def f():
+            """A docstring quoting {:.1f} where the value is rounded."""
+            return "there are {} of them"
+        '''
+    )
+    caught = offenders_in(planted, "planted.py")
+    assert [text for _n, text in caught] == ["there are {} of them"], caught
 
 
 # --- `shutil.which` is not a runnability test --------------------------------

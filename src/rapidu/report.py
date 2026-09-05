@@ -23,6 +23,7 @@ from .fmt import (
     human_bytes,
     human_count,
     human_duration,
+    inode_change_clause,
     noun,
     pct,
     plural,
@@ -58,8 +59,16 @@ _LAYOUT_COLUMNS = _RULE_COLUMNS + 2
 def _layout_width(style: "ui.Style") -> int:
     """Columns available to elastic content: the layout, bounded by the terminal.
 
-    Bounded rather than fixed -- on a 60-column terminal the layout *is* 60 and
-    prose still has to fit inside it. The cap only bites upwards.
+    Bounded rather than fixed -- on a 70-column terminal the layout *is* 70 and
+    prose still has to fit inside it.
+
+    **Down to 60, and no further.** ``ui.terminal_width`` clamps to ``[60, 160]``,
+    so this returns 60 for every terminal narrower than that and the frame
+    overruns rather than shrinking: measured at ``COLUMNS=40``, ten lines of a
+    60-cell box. That is a deliberate trade -- below 60 the ranking table has no
+    readable form -- but it means this cap is not the only one in play, and the
+    example above used to be 60, which sits exactly on the floor and so read as
+    though nothing clamped downwards.
     """
     return min(style.width, _LAYOUT_COLUMNS)
 
@@ -93,8 +102,7 @@ def _section_rule(style: "ui.Style") -> str:
     the ``--ascii`` glyph decision -- so a unicode report carried one unicode rule
     and one ASCII one.
     """
-    glyph = "\u2500" if style.unicode else "-"
-    return style.paint(glyph * max(20, min(_RULE_COLUMNS, style.width - 1)), style.track)
+    return style.paint(style.rule * max(20, min(_RULE_COLUMNS, style.width - 1)), style.track)
 
 
 def _uname(uid: int) -> str:
@@ -810,12 +818,25 @@ def _reclaimable_match(path: str) -> Optional[Tuple[str, Optional[str], bool]]:
 def _modulefile_for(tool: str) -> str:
     """``tool`` if a modulefile of that name is on ``MODULEPATH``, else ``""``.
 
-    Evidence rather than a guess: both Lmod and environment-modules lay
-    ``MODULEPATH`` out as one entry per package, so an entry named ``uv`` means
-    ``module load uv`` resolves. Measured on both clusters in this campaign: `uv`,
-    `apptainer` and `singularity` are absent from ``PATH`` and present as
-    modulefiles, which is exactly the case where the bare command fails and
+    Evidence rather than a guess: a ``MODULEPATH`` entry is a search ROOT, and
+    both Lmod and environment-modules put one file or directory per package
+    *inside* it -- so ``uv`` under a root means ``module load uv`` resolves.
+    Measured here: ``MODULEPATH`` is the single entry ``/software/modulefiles``,
+    holding ``afni``, ``ai-session``, ``alphafold`` … one per package. `uv`,
+    `apptainer` and `singularity` are absent from ``PATH`` and present there,
+    which is exactly the case where the bare command fails and
     ``module load uv && uv cache clean`` works.
+
+    **This used to say the entries themselves are the packages** ("one entry per
+    package, so an entry named ``uv`` means ``module load uv`` resolves"), which
+    describes the lookup backwards -- and the code has always joined the root to
+    the tool name, so under the layout that sentence described it finds nothing.
+    Provable in one line: with ``MODULEPATH=/software/modulefiles/uv``, an entry
+    that *is* the package, this returns ``""``. Left as it is rather than made to
+    accept both, because no site is known to lay it out that way and the failure
+    there is safe -- the caller falls through to the quoted ``rm -rf``, which
+    works regardless. The wording is the defect: a reader trusting it would
+    "correct" the join and break the layout every cluster actually uses.
 
     Anywhere without modules the environment variable is unset and this returns
     ``""``, so the caller falls through to its next option.
@@ -1672,12 +1693,11 @@ def _entries_rule(style: ui.Style, rows: List[str], indent: str = "  ") -> str:
     ``ui.visible_width`` is what does the work: escapes are free and a wide glyph
     costs two columns.
     """
-    glyph = "\u2500" if style.unicode else "-"
     widest = max([ui.visible_width(r) for r in rows] or [len(indent) + 8])
     span = min(style.width - 1, widest) - len(indent)
     # The same near-background grey the bar tracks use, so the rule and the
     # eighteen boxes below it read as one frame rather than two greys.
-    return style.paint(indent + glyph * max(20, span), style.track)
+    return style.paint(indent + style.rule * max(20, span), style.track)
 
 
 def _entries_header(
@@ -2423,7 +2443,7 @@ def _settle_subject(res: WalkResult) -> str:
     if res.recent_files:
         parts.append("{} written".format(plural(res.recent_files, "file")))
     if res.touched_files:
-        parts.append("{} changed without being written".format(plural(res.touched_files, "inode")))
+        parts.append(inode_change_clause(res.touched_files))
     return " and ".join(parts) or "nothing changed"
 
 
@@ -3119,9 +3139,34 @@ def _headline_is_provisional(res: WalkResult, settle: Optional[SettleCheck] = No
     error, so the deletion is tested first; see
     :func:`_freed_since_walk_is_material` for why it is a factor and not any
     deletion at all.
+
+    **A re-stat that positively saw the tree move outranks everything below.**
+    Every branch after this one weighs *estimates* -- unlanded bytes, freed
+    blocks -- against the total; ``settle.moved`` is the check having watched
+    the allocation change between two readings, which is the strongest evidence
+    this module has that the headline is not the answer. Both terminal views
+    already say so in those words: :func:`_hard_warnings` prints "still
+    settling: a re-stat 6s later found 1.5 MiB more allocated" and the
+    ``SETTLING`` panel adds "Any size you read right now -- from this tool or
+    from du -- is provisional." This returned ``False`` there, because a growing
+    tree whose blocks land as fast as they are written has *nothing* unlanded --
+    so ``--json`` published ``headline_provisional: false`` beside
+    ``drift_bytes: 1605632`` and ``moved: true``, measured on eight files grown
+    by 200 KB each during a 6s ``--settle-wait``. The suite's own parity test
+    (``test_the_document_and_the_terminal_agree_about_the_check``) asserts
+    exactly this invariant and passed only because its fixture always carries
+    unlanded bytes, which make the estimate fire for an unrelated reason.
+
+    Terminal-neutral by construction: the two rendering call sites are both
+    already inside ``not settle.moved`` branches -- :func:`_provisional_note`
+    returns early on drift and :func:`render_settle` reaches its ``held`` clause
+    only in the compact form, which is chosen when the re-stat found nothing.
+    So this changes what the document says and nothing about what is printed.
     """
     if res.count_only:
         return False  # no sizes were taken, so there is no headline to qualify
+    if settle is not None and settle.moved:
+        return True
     if settle is not None and _freed_since_walk_is_material(res, settle):
         return True
     if settle is not None and settle.conclusive and not settle.moved:
@@ -3416,7 +3461,7 @@ def render_reconcile(recs: List[rc.Reconciliation], style: Optional[ui.Style] = 
             # for the comparison.
             out.extend(
                 _wrapped(
-                    "{}  {}".format(label, r.notes[0] if r.notes else "not compared"),
+                    "{}  {}".format(label, r.notes[0] if r.notes else rc.NOT_COMPARED_LABEL),
                     style,
                     "  ",
                 )
@@ -3465,7 +3510,7 @@ def render_reconcile(recs: List[rc.Reconciliation], style: Optional[ui.Style] = 
             continue
 
         tone = "yellow" if r.verdict == rc.INCONCLUSIVE else "red"
-        headline = "INCONCLUSIVE" if r.verdict == rc.INCONCLUSIVE else "UNEXPLAINED GAP"
+        headline = "INCONCLUSIVE" if r.verdict == rc.INCONCLUSIVE else rc.GAP_HEADLINE
         out.extend(
             _verdict_headline(
                 label,
@@ -3677,11 +3722,28 @@ def to_json(
                 # `-c` the honest answer is that it was never measured.
                 "material": _unmeasured(res, allocation_is_material(res)),
             },
+            # These three are counted from `getdents` alone, so `-c` measures
+            # them as honestly as a full walk does: `d_type` separates a
+            # directory from everything else and that is all they need.
             "files": res.files,
             "dirs": res.dirs,
             "inodes": res.inodes,
-            "symlinks": res.symlinks,
-            "specials": res.specials,
+            # These two do not. Both come off `st_mode`, which `-c` never reads,
+            # so they are structurally zero there -- and the terminal says so:
+            # `_inode_breakdown` prints "4 non-dirs + 1 dir" under `-c` rather
+            # than the three-way split, because "that mode gets one honest term
+            # ... rather than a three-way split it never measured". The document
+            # published the split anyway. On one tree holding a file, a symlink,
+            # a fifo and a socket the full walk emits `symlinks: 1, specials: 2`
+            # and `-c` emitted `symlinks: 0, specials: 0` -- the same
+            # fabrication as the hard-link pair below, and the comment there
+            # listing "every sibling stat-derived count" missed these two.
+            #
+            # No schema bump: schema 4 already declares that under `-c` every
+            # figure derived from `stat` is `null` rather than `0`. These were
+            # meant to be inside it.
+            "symlinks": _unmeasured(res, res.symlinks),
+            "specials": _unmeasured(res, res.specials),
             # Both need `st_nlink`/`st_ino`, so under `-c` they are structurally
             # zero rather than measured: dedup never runs, `seen_links` stays
             # empty. Emitted raw, the document asserted "0 hard-linked files, 0
@@ -3896,7 +3958,12 @@ def to_json(
             # has to be able to reach the reader's conclusion, not a weaker one.
             "unlanded_bytes": _unmeasured(res, _unlanded_bytes(res)),
             # Passed the check, so this agrees with `settled` above rather than
-            # contradicting it: a conclusive null re-stat means the figure stands.
+            # contradicting it: a conclusive null re-stat means the figure
+            # stands, and a re-stat that *saw* the tree move says the opposite.
+            # The second half of that was missing -- `settled: false` sat beside
+            # `headline_provisional: false` on a measured 1.5 MiB of drift,
+            # while both terminal views called the figure provisional in so many
+            # words. See `_headline_is_provisional`.
             "headline_provisional": _unmeasured(res, _headline_is_provisional(res, settle)),
         }
 

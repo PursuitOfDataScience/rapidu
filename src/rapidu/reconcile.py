@@ -24,7 +24,7 @@ from typing import List, Optional, Tuple
 from . import quota as quotamod
 from . import walk as walkmod
 from .deleted import DeletedScan
-from .fmt import human_bytes, human_count, plural
+from .fmt import human_bytes, human_count, inode_change_clause, plural
 from .quota import QuotaRow, QuotaSnapshot
 
 # Comparison verdicts.
@@ -33,6 +33,16 @@ SUBTREE = "subtree"
 INCONCLUSIVE = "inconclusive"
 CLOSES = "closes"
 GAP = "gap"
+
+# The words each verdict is announced with. Here beside the verdicts rather than
+# in the renderer, because `report` announced two of them in its own literals --
+# `"UNEXPLAINED GAP"` and `"not compared"` -- while `verdict_line` announced the
+# same two here, so the label a reader saw depended on which path drew it and a
+# reword could only be done in both. `report` renders `CLOSES` and `SUBTREE` with
+# its own richer wording on purpose (a headline plus a detail line), and those
+# are not duplicated.
+GAP_HEADLINE = "UNEXPLAINED GAP"
+NOT_COMPARED_LABEL = "not compared"
 
 # A quota snapshot older than this cannot support a finding about a live tree.
 DEFAULT_MAX_SNAPSHOT_AGE_S = 300.0
@@ -187,7 +197,7 @@ def _changed_phrase(res: "walkmod.WalkResult") -> str:
             )
         )
     if res.touched_files:
-        parts.append("{} changed without being written".format(plural(res.touched_files, "inode")))
+        parts.append(inode_change_clause(res.touched_files))
     return " and ".join(parts)
 
 
@@ -947,7 +957,7 @@ def _candidates(
 def verdict_line(rec: Reconciliation) -> str:
     """One-line human summary of a reconciliation."""
     if rec.verdict == NOT_COMPARED:
-        return "not compared"
+        return NOT_COMPARED_LABEL
     if rec.verdict == SUBTREE:
         share = rec.share
         if share is None:
@@ -971,4 +981,4 @@ def verdict_line(rec: Reconciliation) -> str:
             # all-clear this verdict exists to withhold.
             return "INCONCLUSIVE -- the figures agree, but not soundly: {}".format(why)
         return "INCONCLUSIVE -- {}".format(why)
-    return "UNEXPLAINED GAP"
+    return GAP_HEADLINE

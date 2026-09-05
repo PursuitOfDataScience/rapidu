@@ -1978,8 +1978,27 @@ def recheck_settling(res: WalkResult, wait: float = 0.0) -> SettleCheck:
     the tree is. With ``wait=0`` the caller gets ``conclusive == False`` and must
     report the recent-write warning on its own; pass a real delay to measure the
     drift instead of merely suspecting it.
+
+    A ``count_only`` result gets a check that did not run (``ran == False``),
+    because there is nothing to re-stat and no population to have been empty.
     """
     chk = SettleCheck()
+    if res.count_only:
+        # A stat-free walk read no mtime, so its empty `recent_sample` is the
+        # *absence* of a measurement, not an empty population -- exactly the
+        # distinction `_unmeasured` draws for every other figure `-c` does not
+        # collect. Returning `ran = True` here dressed that absence as a reading,
+        # and with a wait long enough the gap test then believed it: measured
+        # before this guard, on a five-file tree walked with `count_only=True`,
+        # `recheck_settling(res, 6.0)` returned `checked=0 gone=0 ran=True
+        # gap=6.0 conclusive=True` -- "believe this null" from a walk that never
+        # read an mtime and could not have seen drift at all.
+        #
+        # `cmd_walk` forces `--no-settle-check` under `-c`, which is why the
+        # document never showed it -- the honesty of the `-c` settling block
+        # rested on that one line in the CLI rather than on anything here. A
+        # check that did not run is what this mode has to hand back, whoever asks.
+        return chk
     # The population the sample was actually drawn from, which is the *union* of
     # written-recently and inode-touched-recently -- `recent_sample` is filled in
     # that branch. Setting it from `recent_files` alone was correct while the two
@@ -1990,9 +2009,61 @@ def recheck_settling(res: WalkResult, wait: float = 0.0) -> SettleCheck:
     # filed twice already.
     chk.sampled_of = res.recent_files + res.touched_files
     if not res.recent_sample:
-        # Nothing was written recently, so there is nothing to be unsettled.
+        # Nothing was written recently, so there is nothing to be unsettled --
+        # and nothing to wait for either: this branch does not sleep. `gap` stays
+        # 0.0 because it is documented as "seconds between the walk reading and
+        # the re-stat", and assigning `wait` here published a duration that had
+        # not elapsed. Measured with `--settle-window 1 --settle-wait 30` over a
+        # five-file tree: the command returned in 0.08s and `--json` reported
+        # `rechecked: 0, recheck_gap_seconds: 30.0`, which reads as "waited 30s,
+        # re-stat'ed nothing" rather than "there was nothing to wait for". The
+        # terminal never showed it -- `render_settle` returns [] for an empty
+        # population -- so the fabrication was visible only to a machine
+        # consumer, in the one field it would use to weigh the result.
+        #
+        # `conclusive` reads the gap, so it stops moving with the wait too: the
+        # same tree published `conclusive: false` at `--settle-wait 0` and
+        # `conclusive: true` at 30, from two runs that observed exactly nothing.
+        # It is now `false` for every wait, which is what the check earned -- it
+        # measured nothing, so there is no null result of *its* to believe. The
+        # verdict a reader wants is `settled`, and `to_json` takes that from the
+        # walk's own `recent_files`/`touched_files` being zero rather than from
+        # this check, so it stays `true` and stays right for the stated reason.
+        #
+        # No `sampled_of == 0` branch in `conclusive`, and that is now settled by
+        # measurement rather than left open. Adding one (`sampled_of == 0 ->
+        # True`) fails nine tests, which reads like a semantic obstacle and is
+        # not one: those fixtures set `checked` to 5 or 60 while leaving
+        # `sampled_of` at 0, and this function cannot produce that pairing. The
+        # sample is appended in the same branch that increments
+        # `recent_files`/`touched_files` and the loop below visits each entry
+        # once, so `checked + gone == len(recent_sample) <= sampled_of` always,
+        # and `sampled_of == 0` holds exactly when `recent_sample` is empty. Give
+        # those fixtures the `sampled_of` this function would have set and all
+        # nine pass with the branch installed -- they pin a state the walk cannot
+        # reach, not a premise about what the property means.
+        #
+        # The branch is unnecessary regardless. Swept across every reachable
+        # state -- no check asked for, `count_only`, this empty population, a
+        # full re-stat at gap 0 and at 60, measured drift, the whole sample
+        # deleted, a partial vanishing, and a 5,000-file sample truncated to the
+        # 4,096 cap -- it moves exactly one published value: `settling.conclusive`
+        # for this branch. Both terminal renderings, `_headline_is_provisional`,
+        # `_provisional_note`, `settled`, and every `reconcile` verdict, blocker
+        # and line are byte-identical in all nine. `reconcile` cannot reach it
+        # here at all: its read sits inside `elif res.recent_files or
+        # res.touched_files`, which an empty population does not enter.
+        #
+        # And `false` is the better of the two values for that one field, because
+        # this branch does not sleep. `conclusive: true` beside
+        # `recheck_gap_seconds: 0.0` would assert a believable null from a
+        # zero-gap re-stat, which is the single claim this class exists to refuse
+        # -- see the RD-16 note declining a 0.5s default for the same reason. The
+        # belief an empty population does license is about the tree, not about
+        # this check, and the document already publishes it as `settled: true`
+        # from the walk's own counters. Pinned in
+        # `tests/test_settle_population_invariant.py`.
         chk.ran = True
-        chk.gap = wait
         return chk
 
     if wait > 0:
