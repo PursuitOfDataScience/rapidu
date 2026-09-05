@@ -35,6 +35,7 @@ walk, whose two surfaces are pinned line for line and key for key.
 
 import io
 import os
+import re
 import socket
 
 from rapidu import report, ui
@@ -270,6 +271,60 @@ def test_the_two_surfaces_agree_about_the_word_on_a_grown_tree(tmp_path):
 # CONTROL: the clean, settled, fully readable walk neither fix may move
 
 
+def _stats(path):
+    """Every inode in the tree at ``path``, root included, via ``os.lstat``."""
+    yield os.lstat(path)
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            yield os.lstat(os.path.join(dirpath, name))
+
+
+def _du(path):
+    """``(allocated, apparent)`` bytes for one tree, from ``os.lstat`` alone.
+
+    An INDEPENDENT oracle, which is what lets the control below keep pinning a
+    measurement now that three of its literals have come out. It is `du`'s
+    arithmetic -- sum ``st_blocks * 512``, sum ``st_size`` -- reached without
+    touching :mod:`rapidu.walk`, so agreement is still evidence and not the
+    report agreeing with itself.
+    """
+    allocated = apparent = 0
+    for st in _stats(path):
+        allocated += st.st_blocks * 512
+        apparent += st.st_size
+    return allocated, apparent
+
+
+#: The cells the FILESYSTEM decides, tokenised out of the pinned lines below.
+#:
+#: These literals were recorded on a ``/tmp`` where a directory costs no block
+#: and the allocation unit is 8 KiB. On the CI runner each of the three
+#: directories costs 4096 and the unit is 4 KiB, so the same ten files rendered
+#: ``284.0 KiB ... 85.9%`` against the recorded ``272.0 KiB ... 88.2%`` -- three
+#: red tests that said nothing at all about the report, because what they had
+#: pinned was the mount.
+#:
+#: Tokenised rather than dropped, and this is still a line-for-line control: the
+#: column order, the header, the rule width, the entry names, their ORDER, the
+#: inode counts, the blank lines and the ``9 more`` footer all stay byte-exact,
+#: and every number that moved is compared against :func:`_du` in the document
+#: test -- a stronger check than a literal transcribed from one host.
+_BYTES = re.compile(r"\d+(?:\.\d+)? (?:B|KiB|MiB|GiB|TiB)")
+_SHARE = re.compile("[\u2588-\u258f\u2591\u2592]+ +" + r"(?:\d+\.\d%|<0\.1%|>99\.9%)")
+_RATIO = re.compile(r"(?:\d+(?:\.\d+)?|<0\.1|>99\.9)x")
+
+
+def _pinned(lines, root):
+    """``lines`` with the path and every filesystem-chosen cell tokenised."""
+    out = []
+    for line in lines:
+        line = line.replace(root, "ROOT")
+        line = _SHARE.sub("SHARE", line)
+        line = _RATIO.sub("RATIO", line)
+        out.append(_BYTES.sub("SIZE", line))
+    return out
+
+
 def _control_tree(root):
     """Ten files in two directories, all outside the settle window."""
     os.makedirs(root)
@@ -297,22 +352,25 @@ def test_the_control_walk_renders_exactly_as_it_did(tmp_path):
     """Byte-identical text on a clean settled walk, in both text surfaces.
 
     Pinned against literals rather than against a recomputation, because a
-    recomputation of the report by the report is not a control. Paths are the one
-    thing that has to be substituted, since ``tmp_path`` moves.
+    recomputation of the report by the report is not a control. Two things get
+    substituted rather than pinned: the path, since ``tmp_path`` moves, and the
+    cells the filesystem decides -- see :data:`_BYTES` for what those cost when
+    they are written into the literals, and :func:`_du` for the oracle that
+    checks them instead.
     """
     root = str(tmp_path / "control")
     res, settle = _control(root)
 
     compact = report.render_compact(res, settle, 3, False, PLAIN)
-    assert [ln.replace(root, "ROOT") for ln in compact] == [
+    assert _pinned(compact, root) == [
         "ROOT",
-        "272.0 KiB  ·  13 inodes  ·  0.50s",
+        "SIZE  ·  13 inodes  ·  0.50s",
         "",
         "  " + "─" * 55,
         "        size  share                          inodes  entry",
-        "   240.0 KiB  ███████████████▉░░   88.2%          7  a/",
-        "    40.0 KiB  ██▋░░░░░░░░░░░░░░░   14.7%          1  a/f0",
-        "    40.0 KiB  ██▋░░░░░░░░░░░░░░░   14.7%          1  a/f1",
+        "   SIZE  SHARE          7  a/",
+        "    SIZE  SHARE          1  a/f0",
+        "    SIZE  SHARE          1  a/f1",
         "  9 more — use -n 0 for all",
     ], compact
 
@@ -321,10 +379,12 @@ def test_the_control_walk_renders_exactly_as_it_did(tmp_path):
     # the frame, and a `tmp_path` is long enough to be truncated, so it is the one
     # line whose text a literal cannot own.
     assert full[0] == ""
-    assert full[1].startswith("WALK  ") and full[1].endswith("   272.0 KiB"), full[1]
-    assert full[2:5] == [
+    allocated, _apparent_unused = _du(root)
+    assert full[1].startswith("WALK  "), full[1]
+    assert full[1].endswith("   " + report.human_bytes(allocated)), full[1]
+    assert _pinned(full[2:5], root) == [
         "  13 inodes (10 files + 3 dirs)  0.50s at 2 threads (26 inodes/s)",
-        "  apparent 265.8 KiB (1.0x allocated)  8.0 KiB allocation unit",
+        "  apparent SIZE (RATIO allocated)  SIZE allocation unit",
         "  " + "─" * 55,
     ], full[2:5]
 
@@ -341,8 +401,18 @@ def test_the_control_document_is_unchanged(tmp_path):
 
     assert doc["tool"] == "rapidu" and doc["schema"] == 5
     walk_doc = doc["walk"]
-    assert walk_doc["size_bytes"] == 278528
-    assert walk_doc["apparent_bytes"] == 272136
+    # Both totals are the filesystem's accounting rather than the tool's, so
+    # both are compared against `_du`'s independent `os.lstat` reading.
+    # `apparent_bytes` moves too, and less obviously than the allocation: a
+    # directory's own `st_size` is ~45 bytes here and 4096 on ext4.
+    allocated, apparent = _du(root)
+    assert walk_doc["size_bytes"] == allocated
+    assert walk_doc["apparent_bytes"] == apparent
+    # The bytes this tree was BUILT to hold -- 6 x 40000 + 4 x 8000 -- which is
+    # the one size figure no mount gets a vote on, and so the literal that can
+    # stay a literal.
+    dir_bytes = sum(os.lstat(os.path.join(root, name)).st_size for name in (".", "a", "b"))
+    assert apparent - dir_bytes == 272000
     assert walk_doc["files"] == 10
     assert walk_doc["dirs"] == 3
     assert walk_doc["inodes"] == 13
@@ -355,9 +425,24 @@ def test_the_control_document_is_unchanged(tmp_path):
     assert walk_doc["interrupted"] is False
     assert walk_doc["unreadable_dirs"] == 0
     assert walk_doc["elapsed_seconds"] == 0.5
-    assert walk_doc["allocation"]["unit_bytes"] == 8192
+    # The unit belongs to the mount -- 8 KiB where this was recorded, 4 KiB on
+    # the runner -- so what is pinned is the claim `alloc_unit` makes about it:
+    # a real power of two, measured from the padded files and never guessed.
+    unit = walk_doc["allocation"]["unit_bytes"]
+    assert unit and unit >= 512 and unit & (unit - 1) == 0, unit
     assert walk_doc["allocation"]["material"] is False
-    assert [row["bytes"] for row in walk_doc["top_by_size"]] == [245760, 40960, 40960]
+    assert [row["bytes"] for row in walk_doc["top_by_size"]] == [
+        _du(os.path.join(root, "a"))[0],
+        _du(os.path.join(root, "a", "f0"))[0],
+        _du(os.path.join(root, "a", "f1"))[0],
+    ]
+    # The ranking itself, which no filesystem decides: the subtree first, then
+    # two of its files.
+    assert [row["path"].replace(root, "ROOT") for row in walk_doc["top_by_size"]] == [
+        os.path.join("ROOT", "a"),
+        os.path.join("ROOT", "a", "f0"),
+        os.path.join("ROOT", "a", "f1"),
+    ]
 
     settling = doc["settling"]
     assert settling["recent_files"] == 0
@@ -380,6 +465,9 @@ def test_the_control_headline_is_the_same_number_in_both_surfaces(tmp_path):
     res, settle = _control(root)
     doc = report.to_json(res, settle, None, None, None, 3)
 
-    assert report.human_bytes(doc["walk"]["size_bytes"]) == "272.0 KiB"
-    assert "272.0 KiB" in _flat(report.render_compact(res, settle, 3, False, PLAIN))
-    assert "272.0 KiB" in _flat(report.render_walk(res, settle, 3, style=PLAIN))
+    # The oracle names the figure and then all three surfaces have to say it.
+    # A literal here only ever named it for one mount.
+    headline = report.human_bytes(_du(root)[0])
+    assert report.human_bytes(doc["walk"]["size_bytes"]) == headline
+    assert headline in _flat(report.render_compact(res, settle, 3, False, PLAIN))
+    assert headline in _flat(report.render_walk(res, settle, 3, style=PLAIN))

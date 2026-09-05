@@ -266,20 +266,24 @@ def test_the_bar_is_placed_where_the_ratios_say(tmp_path):
         factor = (float(res.size) / after.size) if after.size else None
         seen.append((ngone, factor, report._freed_since_walk_is_material(res, chk)))
 
-    assert [(g, fired) for g, _, fired in seen] == [
-        (0, False),  # 1.00x
-        (1, False),  # 1.14x
-        (2, False),  # 1.33x
-        (3, False),  # 1.60x -- the ratio the previous round's own test uses
-        (4, True),  # 2.00x
-        (5, True),  # 2.67x
-        (6, True),  # 4.00x
-        (7, True),  # 8.00x
-        (8, True),  # the whole sample; `conclusive` is already False here
-    ], seen
+    # The rule, read off each row's OWN measured ratio. A table of ratios is not
+    # portable and this one was not: `(4, True)  # 2.00x` holds where deleting
+    # four of eight files halves the tree exactly, and on the CI runner the three
+    # directories cost a block each, so the same row measured 1.98x and correctly
+    # did not fire. Pinning which row fires was pinning the host's block
+    # accounting; the ratios are carried in `seen` so a failure still prints them.
     for ngone, factor, fired in seen:
         if factor is not None:
             assert fired == (factor >= 2.0), (ngone, factor)
+    # The endpoints, which no per-directory overhead can move: an untouched tree
+    # is not material, and losing seven or eight of eight files is.
+    assert seen[0][2] is False, seen
+    assert seen[7][2] is True and seen[8][2] is True, seen
+    # And it is a threshold rather than a pattern -- once it fires it keeps
+    # firing, which is the shape the table was really there to show.
+    fired_at = [g for g, _, fired in seen if fired]
+    assert fired_at, seen
+    assert fired_at == list(range(fired_at[0], 9)), seen
 
 
 def test_control_d_count_only_publishes_no_verdict_it_could_not_reach():

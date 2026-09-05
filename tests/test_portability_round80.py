@@ -1006,5 +1006,18 @@ class TestANonPositiveSnapshotAgeIsRefused:
 
     @pytest.mark.parametrize("flag", ["--quota-only", "--no-quota"])
     def test_either_flag_alone_still_works(self, flag):
-        # The control: this refuses a combination, not either flag.
-        assert self._run(flag).returncode == 0
+        """The control: this refuses a combination, not either flag.
+
+        The claim is about the REFUSAL, so it is written as one. `returncode == 0`
+        is not a property of the flag: `cmd_quota` returns `EXIT_ATTENTION` when
+        `not snap.available`, which is the honest answer on a host with no quota
+        backend at all, and again when a row is at the line -- "the two states that
+        mean writes are about to stop", per `_quota_needs_attention`. So the literal
+        0 was testing the disk this happened to run on, and `--quota-only` exited 1
+        on the CI runner for exactly the reason the tool documents. What must not
+        happen is `EXIT_ERROR` with the "empty report" sentence, which is what the
+        combined form above asserts and this control denies.
+        """
+        done = self._run(flag)
+        assert done.returncode != 2, done.stdout + done.stderr
+        assert "empty report" not in done.stderr, done.stderr
