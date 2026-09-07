@@ -150,6 +150,26 @@ def ratio_x(r: Optional[float]) -> str:
         return "0x"
     if r >= 1.0:
         return "{:.1f}x".format(r)
+    if round(r, 2) >= 1.0:
+        # The top end, which this function guarded at the bottom only. `{:.2f}`
+        # takes a value just under parity and rounds it *across*: 0.9999 printed
+        # `1.00x`, i.e. "allocated equals apparent" about a tree where it does
+        # not -- and parity is the reading the ALLOCATION panel is scanned for.
+        # `human_bytes` records the identical defect ("took a value just under a
+        # boundary through and then rounded it *up* across it ... which no
+        # formatter should ever emit") and `pct`, twenty lines down, already
+        # carries this exact guard as `>99.9%`; its docstring says an interior
+        # value gets an inequality "exactly as ``ratio_x`` does", which was true
+        # of one end.
+        #
+        # It also resurrected the disagreement this helper exists to prevent:
+        # `1.00x` from here against `1.0x` for a real 1.0 -- two precisions for
+        # the same quantity, five lines apart, which is what the two call sites
+        # used to do before they were folded into one function.
+        #
+        # Rounded at the precision the format string will use, so the guard and
+        # the output cannot disagree -- the same way `human_bytes` states it.
+        return "<1.00x"
     if r >= 0.01:
         return "{:.2f}x".format(r)
     return "<0.01x"

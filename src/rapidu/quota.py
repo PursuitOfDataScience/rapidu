@@ -266,6 +266,17 @@ def _c_env() -> Dict[str, str]:
 
 
 def _run(cmd: List[str], timeout: float) -> Tuple[int, str, str]:
+    # A budget that is not positive means the caller's DEADLINE is already spent,
+    # not that this command is slow. `_budget` returns exactly 0.0 once the
+    # deadline has passed, and none of the four call sites checks that before
+    # calling here -- so spawning would start a process purely to kill it on the
+    # next line, and the reader would be told "timed out after 0s" about a command
+    # that was never given a turn. The two want different remedies: a spent budget
+    # says narrow the scope or raise the timeout, while a timeout says the quota
+    # server is slow. Reported as 124 so `read_quota_command`'s `rc == 124` branch still
+    # fires and the reason still reaches the panel.
+    if timeout <= 0:
+        return 124, "", "no time left in the budget to run `{}`".format(cmd[0])
     try:
         p = subprocess.Popen(
             cmd,
@@ -297,7 +308,16 @@ def _run(cmd: List[str], timeout: float) -> Tuple[int, str, str]:
     except subprocess.TimeoutExpired:
         p.kill()
         p.communicate()
-        return 124, "", "timed out after {:.0f}s".format(timeout)
+        # `{:g}`, not `{:.0f}`: a sub-second budget printed as "timed out after
+        # 0s", which reads as this tool having used a zero timeout -- its own bug
+        # -- rather than as the 400 ms it actually allowed. Measured: a 0.4s
+        # budget reported "0s". This string becomes the quota panel's `reason`
+        # (see the `rc == 124` branch in `read_quota_command`), so it is what the reader
+        # is given for a missing reading. A sibling package records the identical
+        # `%.0f` defect and the identical fix: "a sub-second budget printed as
+        # `within 0s` ... reads as this tool having used a zero timeout".
+        # Integer budgets are unchanged -- `{:g}` renders 3 and 45 as before.
+        return 124, "", "timed out after {:g}s".format(timeout)
     except OSError as exc:
         return 1, "", str(exc)
 

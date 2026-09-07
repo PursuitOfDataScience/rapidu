@@ -527,6 +527,20 @@ class WalkResult:
         # "files" quota charges.
         self.by_uid = {}  # type: Dict[int, Tuple[int, int]]
         self.by_dev = {}  # type: Dict[int, Tuple[int, int]]
+        # Which key of `by_dev` is the root's own filesystem, so that table can be
+        # split into what a per-filesystem quota governs and what it does not.
+        #
+        # Stored rather than inferred, because an `st_dev` number is opaque and
+        # nothing in the table says which of them the walk was pointed at. Without
+        # it every consumer could count the filesystems and none could weigh them:
+        # `reconcile` told the reader to re-run the whole walk with
+        # `--one-file-system` while holding, unread, the exact figure that decides
+        # whether re-running would change anything.
+        #
+        # `None` on a hand-assembled result -- a fixture, or a caller filling in
+        # `by_dev` alone -- which is why `other_fs_size` refuses the split there
+        # rather than declaring the whole tree foreign.
+        self.root_dev = None  # type: Optional[int]
         # A group quota is charged by gid, not uid, and the two diverge exactly
         # when it matters: a file written into a shared project directory whose
         # setgid bit is missing lands in the writer's personal group, so it is
@@ -688,6 +702,57 @@ class WalkResult:
     def watched_seen(self) -> int:
         """Every watched directory the walk saw, tracked individually or not."""
         return len(self.watched) + self.watched_dropped
+
+    def _off_root(self, index: int) -> Optional[int]:
+        """One half of ``by_dev``'s total, less the root filesystem's share.
+
+        ``None`` where the split cannot be made honestly, for two separate
+        reasons. A ``count_only`` walk never reads ``st_dev`` for an entry -- only
+        `-x` makes it stat directories, and even then it records nothing per
+        device -- so a zero there is the *absence* of a reading rather than a
+        reading of zero, which is the distinction `_unmeasured` draws for every
+        other figure that mode does not collect. And a result whose
+        :attr:`root_dev` is unset, or whose root device never made it into the
+        table, cannot say which share is the root's; calling all of it foreign
+        would be a fabrication in the other direction.
+        """
+        if self.count_only or self.root_dev is None or self.root_dev not in self.by_dev:
+            return None
+        mine = self.by_dev[self.root_dev][index]
+        return sum(v[index] for v in self.by_dev.values()) - mine
+
+    @property
+    def other_fs_size(self) -> Optional[int]:
+        """Allocated bytes counted on a filesystem other than the root's.
+
+        This is exactly what ``--one-file-system`` would have left out, measured
+        on the run that did not pass it: ``-x`` skips an entry when
+        ``st.st_dev != root_dev``, and this is the same partition of the same
+        table by the same key.
+
+        It exists because the cross-filesystem blocker asks the reader to answer
+        a question the walk had already answered. *"The walk crossed 3
+        filesystems but the quota governs one; re-run with --one-file-system"* is
+        a request to spend the whole walk again -- minutes to hours on the trees
+        this tool is pointed at -- and whether that is worth doing depends
+        entirely on how much of the total is out there. Measured on two 14.0 TiB
+        fixtures over the same two devices, one holding 58.0 GiB off-root and the
+        other 14.0 TiB, the RECONCILE section and the whole ``--json`` document
+        were byte-identical: a 246x difference in the one figure that decides it,
+        rendered the same both times, beside a difference of -9.0 TiB the section
+        exists to explain.
+        """
+        return self._off_root(0)
+
+    @property
+    def other_fs_inodes(self) -> Optional[int]:
+        """Inodes counted on a filesystem other than the root's.
+
+        The files half of :attr:`other_fs_size`, because the blocker is raised
+        against a files quota on the same evidence and an inode count is not
+        derivable from a byte count.
+        """
+        return self._off_root(1)
 
     @property
     def alloc_unit(self) -> Optional[int]:
@@ -1047,6 +1112,11 @@ def walk(
         raise NotADirectoryError("{} is not a directory".format(root))
 
     root_dev = root_st.st_dev
+    # Published, not just used. `-x` decides every skip against this number, so it
+    # is also the only key that turns `by_dev` from a count of filesystems into a
+    # split between the one a quota governs and the rest. See
+    # `WalkResult.other_fs_size`.
+    res.root_dev = root_dev
     now = time.time()
     recent_cutoff = now - settle_window
 

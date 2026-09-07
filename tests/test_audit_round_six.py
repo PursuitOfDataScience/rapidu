@@ -916,6 +916,8 @@ def test_no_walk_or_settle_measurement_is_left_unpublished():
         "unreadable_dirs_dropped": "unreadable_dir_paths_dropped",
         "watched_seen": "watched_dirs_seen",
         "watched_dropped": "watched_dirs_untracked",
+        "other_fs_size": "other_filesystem_bytes",
+        "other_fs_inodes": "other_filesystem_inodes",
         "drift": "drift_bytes",
         "gap": "recheck_gap_seconds",
         "gone": "vanished_files",
@@ -929,7 +931,15 @@ def test_no_walk_or_settle_measurement_is_left_unpublished():
         "watched",
         "finished_tops",
         "recent_sample",
+        # The raw table behind `other_filesystem_bytes` /
+        # `other_filesystem_inodes` and the key those are computed against. This
+        # entry used to cover `by_dev` alone, on the grounds that it was "already
+        # carried by the figure computed from them" -- and the figure computed
+        # from it was `len()`, which carries the device *count* and neither of the
+        # magnitudes. Both halves are published now, so the justification is true
+        # for the first time.
         "by_dev",
+        "root_dev",
         "root",
         "density_floor",
         "alloc_bits",

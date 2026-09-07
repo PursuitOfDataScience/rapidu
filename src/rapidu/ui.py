@@ -473,6 +473,26 @@ def bar(
     measures *several* things at once -- the everything-else remainder row -- so
     that a quarter of the tree collapsed into one line is still drawn at its
     real length, but cannot be misread as a single directory that size.
+
+    **A bar filled to its last cell must mean the fraction really reached 1.0.**
+    The partial-block path gets that for free: ``filled`` floors, so short of
+    1.0 the final cell is always a partial glyph. The two paths that have NO
+    partials do not -- ASCII (:attr:`Style.partials` is ``("",)``) and
+    ``hatched``, which discards them by design -- and both rounded the last cell
+    up instead. Measured before this fix, at the widths the report actually
+    uses: ``--ascii`` drew ``########`` for 93.8% of 8 cells and
+    ``##################`` for 97.2% of 18, and the hatched remainder row did
+    the same in Unicode, each beside its own honest label. ``rdu --ascii`` on a
+    97.5%-full quota therefore said "full" in the picture and "97.5%" in the
+    number, in one row.
+
+    Keyed on the unrounded ``f`` against 1.0, because that is precisely what
+    :func:`fmt.pct` prints beside it: ``pct`` already returns ``>99.9%``
+    throughout 99.95-99.99, so ``100.0%`` appears only when part really equals
+    whole and a solid bar may only appear there too. Same invariant, same
+    reserve, as ``slurmpast.render.bar_cells`` (which keys on
+    ``round(percent, 1)``, the precision of *its* labels) and
+    ``slurmwatch.tui._bar_cells``.
     """
     if width <= 0:
         return ""
@@ -494,6 +514,18 @@ def bar(
 
     if min_tick and filled == 0 and not tail and f > 0:
         tail = partials[1] if len(partials) > 1 else full_ch
+    # Hold the final cell back until the fraction reaches the whole. Counted in
+    # cells of `full_ch` rather than in `used`, so a partial-glyph tip -- which
+    # is not a claim of fullness -- still gets to occupy the last cell.
+    if f < 1.0 and filled + (1 if tail == full_ch else 0) >= width:
+        if tail == full_ch:
+            # Only reachable at width 1, where the reserve and `min_tick` want
+            # the same single cell. The reserve wins: a one-cell gauge cannot
+            # say "nearly full" and "not full" at once, and claiming the
+            # boundary is the worse of the two errors.
+            tail = ""
+        else:
+            filled = width - 1
     used = filled + (1 if tail else 0)
     rest = max(0, width - used)
     return style.paint(full_ch * filled + tail, *style.translucent(accent)) + (

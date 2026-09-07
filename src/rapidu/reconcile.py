@@ -787,9 +787,31 @@ def reconcile(
         rec.blockers.append("the walk was interrupted before it finished")
 
     if len(res.by_dev) > 1:
+        # ...and say how much is out there, because this blocker is the only one
+        # whose remedy is *do the whole measurement again*. The walk already knows
+        # what `--one-file-system` would have left out -- `-x` skips on
+        # `st_dev != root_dev` and `by_dev` is keyed by exactly that -- so the
+        # figure that decides whether re-running changes the comparison was summed
+        # per device and then reduced to `len()`. Without it the sentence reads
+        # identically over 58.0 GiB off-root and over 14.0 TiB off-root, and in
+        # the second case it is the whole difference this section is trying to
+        # explain. Stated in the units of *this* comparison, so it can be held
+        # against `gap` on the line above it rather than converted by the reader.
+        off = res.other_fs_inodes if rec.kind == "files" else res.other_fs_size
+        share = ""
+        if off is not None:
+            # "of the walked total", not "of what was counted": the second reads
+            # better and pairs `was` with an interpolated count, which
+            # `test_no_message_pairs_a_count_with_a_fixed_verb` refuses on sight.
+            # The verb agrees with "what" and not with the figure, so the sweep is
+            # wrong here -- and rewording costs a word where an allow-list entry
+            # would cost the next reader a judgement call about a rule.
+            share = " -- that would leave out {} of the walked total".format(
+                human_count(off) if rec.kind == "files" else human_bytes(off)
+            )
         rec.blockers.append(
             "the walk crossed {} filesystems but the quota governs one; re-run "
-            "with --one-file-system to compare like with like".format(len(res.by_dev))
+            "with --one-file-system to compare like with like{}".format(len(res.by_dev), share)
         )
 
     if row.guessed:

@@ -167,6 +167,39 @@ def _unmeasured(res: WalkResult, value: "Any") -> "Any":
     return None if res.count_only else value
 
 
+def _unscanned(scan: DeletedScan, value: "Any") -> "Any":
+    """``value``, or ``None`` when ``/proc`` could not be read at all.
+
+    :func:`_unmeasured` for the deleted-but-open sweep: same rule, different
+    reason for having no measurement. ``-c`` skips the stat; an unavailable
+    ``/proc`` means the sweep never ran, and the two surfaces disagreed about
+    what that means. The terminal refuses to name a figure --
+
+        UNLINKED BUT STILL OPEN
+        n/a - /proc is not available on this platform
+
+    -- while the document published ``total_bytes: 0`` and ``inodes: 0`` beside
+    it, which is a *measurement* of the node: no deleted-but-open files here.
+    Nothing was looked at. A consumer cannot tell that from a clean node, and
+    "unlinked but still open" is the one figure in this report a reader goes
+    looking for precisely because no walk can see it -- a false zero says the
+    space is not there to reclaim.
+
+    Applied to the six figures that are claims about the node. ``available``,
+    ``reason``, ``complete``, ``timed_out`` and ``node_local_only`` stay as they
+    are: they describe the sweep rather than the node, and they are how a
+    consumer learns to expect the nulls. ``pid_namespaced`` stays too -- it is
+    ``_in_pid_namespace``'s deliberate default, which that function documents as
+    "report the wider view rather than claiming a restriction we could not
+    observe", not a reading taken from a ``/proc`` that was there.
+
+    ``files`` keeps its ``[]``: it is a container a consumer iterates, where an
+    empty iteration and no iteration reach the same place, unlike a scalar the
+    consumer reads and believes.
+    """
+    return None if not scan.available else value
+
+
 def _owner_json(
     table: "Dict[int, Tuple[int, int]]",
     resolve: "Any",
@@ -1801,6 +1834,32 @@ def _entry_total(res: WalkResult) -> int:
     return len([e for e in res.dir_agg.values() if e.path != res.root])
 
 
+def _density_floor_counts(res: WalkResult, limit: int) -> Tuple[int, int, int]:
+    """``(entries, above the floor, listed)`` for a density ranking.
+
+    The two reasons a density listing is short are different questions with
+    different remedies, so they have to be counted separately: an entry below
+    :attr:`WalkResult.density_floor` was never rankable and ``-n`` will not bring
+    it back, while an entry that cleared the floor and was cut by the limit comes
+    back at ``-n 0``. :func:`_density_floor_note` learned that the hard way --
+    with all four entries of a tree above the floor, ``-n 1`` printed "3 of 4
+    entries hold fewer than 100 files", because one number was doing both jobs.
+
+    Extracted so the table and the document cannot answer it differently. The
+    text surface has disclosed the floor since that fix and ``--json`` did not,
+    which is the text-versus-document split this module has closed several times;
+    a second copy of ``total - qualifying`` would have been the next one. Both
+    ``top_dirs`` calls pass ``finished_only=res.partial``, exactly as
+    :func:`render_entries` does, so an interrupted walk does not rank a
+    half-counted subtree here either.
+    """
+    return (
+        _entry_total(res),
+        len(res.top_dirs(_ALL, "density", finished_only=res.partial)),
+        len(res.top_dirs(limit, "density", finished_only=res.partial)),
+    )
+
+
 def _facts(style: ui.Style, pairs: List[Any]) -> str:
     """``21,829 files  ·  94 entries  ·  0.17s`` -- three numbers, three roles.
 
@@ -1897,7 +1956,17 @@ def render_compact(
     # It used to sit on the byte total unconditionally, so under `-i` the report
     # accented the size while sorting on the file count -- pointing at one number
     # and ordering by another.
-    ranked_by_files = bool(by_inodes or res.count_only)
+    #
+    # That fix keyed on `-i` alone and so it missed `--sort`, which moves the
+    # ranking just as `-i` does -- the rule stated with the tones themselves says
+    # the accent "moves when `-i` or `--sort` moves the ranking". Measured on one
+    # tree: `--sort files` accented `4.8 MiB` while ranking by the file count, and
+    # `-i --sort size` accented `204` files while the table beside it accented the
+    # size column, putting TWO accents in a report whose rule is "exactly one".
+    # `_sort_key` is the one resolver and its docstring already records this class
+    # ("`_entry_names` recomputed a *different* one from `by_inodes` alone"); the
+    # header was the last consumer of a listing that had not asked it.
+    ranked_by_files = _sort_key(sort, by_inodes, res) == "files"
     size_tone = VALUE if ranked_by_files else ACCENT
     files_tone = ACCENT if ranked_by_files else VALUE
 
@@ -1981,9 +2050,10 @@ def _table(
         # which is measured off the widest row it is drawn over.
         # Both counts come from `top_dirs`, one limited and one not, so the note
         # can separate "below the floor" from "cut by -n" instead of charging the
-        # floor for both.
-        qualifying = len(res.top_dirs(_ALL, key, finished_only=res.partial))
-        shown = len(res.top_dirs(_limit(top), key, finished_only=res.partial))
+        # floor for both. Counted by `_density_floor_counts`, which `--json`'s
+        # `top_density_hidden` reads as well: two surfaces disclosing one filter
+        # must not compute it twice.
+        _total, qualifying, shown = _density_floor_counts(res, _limit(top))
         note = _density_floor_note(res, style, indent, shown, qualifying)
     if not body:
         # No rows at all: either the floor took everything, which is worth
@@ -2335,17 +2405,19 @@ def render_walk(
     out.extend(render_settle(res, settle, style))
 
     if not res.complete and res.unreadable_dirs:
-        for path, why in res.unreadable_dirs[:3]:
+        bound = _show_bound(res.unreadable_dir_count, len(res.unreadable_dirs), 3)
+        for path, why in res.unreadable_dirs[:bound]:
             out.append(style.paint("      {} ({})".format(ui.printable(path), why), "dim"))
-        if res.unreadable_dir_count > 3:
+        if res.unreadable_dir_count > bound:
             out.append(
-                style.paint("      ... and {} more".format(res.unreadable_dir_count - 3), "dim")
+                style.paint("      ... and {} more".format(res.unreadable_dir_count - bound), "dim")
             )
 
     def owner_rows(counts, name_of):
         """The rows one block shows, biggest first, as ``(name, size, inodes)``."""
         ranked = sorted(counts.items(), key=lambda kv: kv[1][0], reverse=True)
-        return [(name_of(k), size, inodes) for k, (size, inodes) in ranked[:_OWNER_SHOW]]
+        bound = _show_bound(len(ranked), len(ranked), _OWNER_SHOW)
+        return [(name_of(k), size, inodes) for k, (size, inodes) in ranked[:bound]]
 
     uid_rows = owner_rows(res.by_uid, _uname) if show_uids and len(res.by_uid) > 1 else []
     gid_rows = owner_rows(res.by_gid, _gname) if show_uids and len(res.by_gid) > 1 else []
@@ -2385,7 +2457,7 @@ def render_walk(
         out.append("")
         out.append(style.paint("  owners:", "dim"))
         out.extend(owner_row(row) for row in uid_rows)
-        out.extend(_and_more(len(res.by_uid), _OWNER_SHOW, "owners", style))
+        out.extend(_and_more(len(res.by_uid), len(uid_rows), "owner", style))
     # The uid table used to be captioned "a group quota charges all of these",
     # which is the wrong table: a group quota is charged by **gid**. The two
     # diverge exactly when it matters -- a file written into a shared project
@@ -2394,7 +2466,7 @@ def render_walk(
     if gid_rows:
         out.append(style.paint("  groups (a group quota charges these):", "dim"))
         out.extend(owner_row(row) for row in gid_rows)
-        out.extend(_and_more(len(res.by_gid), _OWNER_SHOW, "groups", style))
+        out.extend(_and_more(len(res.by_gid), len(gid_rows), "group", style))
 
     out.extend(_table(res, top, by_inodes, style, sort))
     # Only in the full report. `rdu .` is asked how big a tree is, not for an
@@ -2417,7 +2489,33 @@ _OWNER_SHOW = 6
 _HOLDER_SHOW = 3
 
 
-def _and_more(total: int, shown: int, noun: str, style: ui.Style) -> List[str]:
+def _show_bound(total: int, available: int, cap: int) -> int:
+    """How many items to LIST, applying the remainder-of-one rule.
+
+    :func:`_hard_warnings` states the rule and, until now, was the only place
+    that kept it: "``... and 1 more`` costs the same line as the path itself and
+    leaves the count unverifiable: on a /scratch with four mounts it showed
+    three paths and hid the fourth, and the correct 4 was read as a
+    double-counted 3. So one hidden entry is never hidden; two or more earn the
+    summary."  ``_CROSSED_SHOW``'s own comment points here for it.
+
+    ``render_walk`` broke it twice -- the unreadable-directory list and the
+    owners/groups tables each hid a single remainder behind a line that costs as
+    much as showing it. One home for the rule rather than three copies that
+    agree today.
+
+    ``available`` is why this takes three arguments and not two: some of these
+    lists are BOUNDED while their count is not (``unreadable_dirs`` is, and
+    ``walk`` says so), and showing an item that was never recorded is not
+    possible. Same guard ``_hard_warnings`` writes inline as
+    ``res.crossed == len(res.crossed_paths)``.
+    """
+    if total == cap + 1 and available >= cap + 1:
+        return cap + 1
+    return cap
+
+
+def _and_more(total: int, shown: int, noun_word: str, style: ui.Style) -> List[str]:
     """A line naming what a cap left out, or nothing when it left out nothing.
 
     Every bound in this report is supposed to publish itself -- unreadable
@@ -2429,7 +2527,11 @@ def _and_more(total: int, shown: int, noun: str, style: ui.Style) -> List[str]:
     hidden = total - shown
     if hidden <= 0:
         return []
-    return [style.paint("      ... and {} more {}".format(hidden, noun), "dim")]
+    # `noun`, for the reason the row above it already states: "the count is
+    # right-aligned in its column and the noun agrees outside it". This line
+    # wrote a bare plural, so a single hidden owner read `1 more owners` --
+    # the same disagreement `noun` was split out of `plural` to prevent.
+    return [style.paint("      ... and {} more {}".format(hidden, noun(hidden, noun_word)), "dim")]
 
 
 def _settle_subject(res: WalkResult) -> str:
@@ -3591,6 +3693,139 @@ def _mount_json(
     }
 
 
+def _hidden_figures(res: WalkResult, limit: int, key: str, known: bool) -> "Dict[str, Any]":
+    """The remainder of ONE ranking -- what that ranking's ``-n`` cut left out.
+
+    Computed from the entries *that* ranking listed, which is the only way a
+    remainder can complete it. The terminal has always done this (its row is built
+    from the ``ranked`` list it is printing); the document published one remainder
+    for two rankings, which is :func:`_top_hidden`'s whole subject.
+
+    ``None`` figures rather than a missing key, under the same conditions that
+    suppress the table's remainder row: see :func:`_top_hidden`.
+    """
+    ranked = res.top_dirs(limit, key, finished_only=res.partial)
+    if not known:
+        return {"bytes": None, "inodes": None}
+    return {
+        "bytes": _unmeasured(res, max(0, res.size - sum(e.size for e in ranked))),
+        "inodes": max(0, res.inodes - sum(e.inodes for e in ranked)),
+    }
+
+
+def _top_hidden(res: WalkResult, limit: int) -> "Dict[str, Any]":
+    """What ``-n`` left out of the rankings, said the way the table says it.
+
+    The table states the rule and obeys it: *"A truncated listing that does not
+    tell you it is truncated, or how to expand it, is just missing data."* The
+    document truncated ``top_by_size`` and ``top_by_inodes`` to the same ``-n``
+    and said nothing at all -- ``rdu --json -n 5`` on a fourteen-entry tree
+    published five rows, leaving a consumer no way to tell that from a tree with
+    five children. Measured on the parity module's own control walk: the terminal
+    prints ``9 more -- use -n 0 for all`` while the document lists three and
+    carries no key a reader could find the nine in. That is the drift this module
+    exists to prevent -- "one result object must not have two honesty policies",
+    as the ranking keys' own comment puts it.
+
+    **The COUNT is shared; the FIGURES belong to a ranking.** Both rankings rank
+    the same set of sibling entries and cut it to the same ``-n``, so exactly the
+    same number of entries is missing from each -- ``count`` is one figure because
+    there is one answer. The remainder is not: the two rankings select *different*
+    entries, so they leave different things out. Publishing one ``bytes``/
+    ``inodes`` pair beside both made the document state a total that is false on
+    one of them. Measured on six 5 MiB directories plus six directories of ~40
+    tiny files, ``--json -n 5``: ``top_by_size`` lists ``big00..big04`` and
+    ``top_by_inodes`` lists ``many01..many05`` -- disjoint -- and a single
+    ``inodes: 264`` sat against both, so a consumer completing the inode ranking
+    computed ``220 + 264 = 484`` inodes on a 274-inode tree. The terminal never
+    had that bug, because its remainder row is computed from the ranking it is
+    printing: on that tree ``rdu -n 5`` and ``rdu -i -n 5`` print ``264`` and
+    ``54`` inodes for the same ``-n``. So each ranking carries its own remainder
+    under ``by_size`` / ``by_inodes``, and either one completes to ``size_bytes``
+    and ``inodes`` exactly.
+
+    ``count`` is stated at any depth, and on an interrupted walk too -- which is
+    *more* than the table says, not the same thing. ``say_hidden`` and the
+    remainder row both require ``not res.partial``, so after an interrupt the
+    table prints no truncation row at all while this key still answers; the same
+    asymmetry is why ``count`` reads ``0`` here where the table simply omits its
+    row. A document is not a table: a consumer cannot see the absence of a key it
+    did not know to look for, and "the rankings are complete" is a claim worth
+    being able to read.
+
+    ``bytes`` and ``inodes`` are the remainder the table's remainder row carries,
+    and are ``None`` under precisely the conditions that suppress that row: an
+    interrupted walk has no known remainder, and at depth > 1 the entries nest, so
+    a leftover would double-count. Under ``-c`` no size was measured, so ``bytes``
+    goes through :func:`_unmeasured` like every sibling byte figure -- ``None`` is
+    not zero -- and the two remainders coincide, because ``top_dirs`` coerces a
+    ``size`` request to ``files`` when there is no size to rank on.
+
+    It describes the ``-n`` truncation of the two sibling rankings.
+    ``top_by_density`` is ranked over an inode floor, so what is missing there is
+    mostly below the floor and ``-n`` would not bring it back -- the same reason
+    the table refuses to print "use -n 0 for all" on a density listing.
+    """
+    # Either ranking answers this: both cut the same sibling set to the same
+    # `-n`, so `len(ranked)` -- all `_other_count` reads -- is the same for both.
+    ranked = res.top_dirs(limit, "size", finished_only=res.partial)
+    hidden = _other_count(res, ranked)
+    known = hidden > 0 and not res.partial and _entries_partition_tree(res)
+    return {
+        "count": hidden,
+        "by_size": _hidden_figures(res, limit, "size", known),
+        # "files" is `top_dirs`'s spelling of the inode key, and the spelling
+        # `top_by_inodes` itself passes -- the two rankings have to be requested
+        # identically or the remainder completes the wrong listing.
+        "by_inodes": _hidden_figures(res, limit, "files", known),
+    }
+
+
+def _top_density_hidden(res: WalkResult, limit: int) -> "Optional[Dict[str, Any]]":
+    """Why ``top_by_density`` is short -- the floor, and separately ``-n``.
+
+    :func:`_top_hidden` deliberately does not speak for the density ranking, and
+    that left the document with nothing that did. Measured on this repository's
+    sibling tree, ``rdu /home/youzhi/nodetop -d 1 -n 0 --json``: ``top_by_size``
+    and ``top_by_inodes`` publish 14 entries, ``top_by_density`` publishes 2, and
+    ``top_hidden.count`` is ``0`` -- correctly, because ``-n 0`` cut nothing. So
+    every truncation key in the document read "complete" beside a ranking missing
+    twelve of its fourteen entries. The terminal printed the reason on the same
+    walk: *"12 of 14 entries hold fewer than 100 inodes and cannot be ranked by
+    density"*.
+
+    Nor was it derivable. ``density_floor`` is ``max(100, inodes // 100)``, a rule
+    published nowhere -- the same reason ``rows[].limit`` exists rather than
+    leaving a consumer to reimplement soft-or-hard -- and ``top_dirs`` drops a
+    zero-byte subtree as well, which no inode figure can predict. At any ``-n``
+    but 0 the per-row ``inodes`` needed to count it are themselves truncated.
+
+    **Two reasons, two figures**, which is :func:`_density_floor_note`'s policy and
+    not a new one: ``below_floor`` was never rankable and ``-n`` will not bring it
+    back, while ``truncated_by_limit`` cleared the floor and ``-n 0`` will. Naming
+    one number for both is exactly the false statement that note was fixed for, and
+    the table's refusal to print "use -n 0 for all" under a density listing is the
+    same refusal this key makes by keeping the two apart. ``inode_floor`` is the
+    threshold the sentence quotes, so a consumer can say *which* entries went.
+
+    Both come from :func:`_density_floor_counts`, the counter the table uses, so
+    the document cannot disagree with the sentence printed beside it.
+
+    ``null`` under ``-c``, like ``top_by_density`` itself: no size was measured, so
+    ``top_dirs`` coerces the request to ``files`` and no density ranking exists to
+    be short. Emitted raw it would have published ``below_floor: 0`` -- a filter
+    that never ran, reported as a filter that dropped nothing.
+    """
+    if res.count_only:
+        return None
+    total, qualifying, shown = _density_floor_counts(res, limit)
+    return {
+        "inode_floor": res.density_floor,
+        "below_floor": max(0, total - qualifying),
+        "truncated_by_limit": max(0, qualifying - shown),
+    }
+
+
 def to_json(
     res: Optional[WalkResult],
     settle: Optional[SettleCheck],
@@ -3830,7 +4065,28 @@ def to_json(
                 }
                 for pattern, command, hits in reclaimable_groups(res)
             ],
-            "filesystems": len(res.by_dev),
+            # How many devices the walk *visited* -- a question `-c` never asks.
+            # That mode reads `st_dev` for no entry (only `-x` stats directories,
+            # and it records nothing per device), so `by_dev` holds the root's own
+            # key alone and `len()` is 1: the figure a single-filesystem tree
+            # reports, published about a walk that never looked. Measured on one
+            # tree spanning two devices -- the full walk says 2, `-c` said 1 --
+            # and three `-c` documents of that tree (foreign subtree big, foreign
+            # subtree small, no foreign subtree) came out byte-identical. Same
+            # helper and same reason as `symlinks`, `specials` and
+            # `hardlinked_inodes`, and the same line the two keys below draw for
+            # the magnitudes this count cannot carry.
+            "filesystems": _unmeasured(res, len(res.by_dev)),
+            # ...and how the total divides across them, which the count above
+            # cannot say. `by_dev` holds `(bytes, inodes)` per device and this
+            # document published `len()` of it, so two walks of the same total
+            # over the same two devices -- one with 58.0 GiB off-root, one with
+            # 14.0 TiB -- emitted byte-identical documents. `null` under `-c`,
+            # which never reads `st_dev` for an entry: see
+            # `WalkResult.other_fs_size`, which draws that line itself rather
+            # than leaving it to each consumer.
+            "other_filesystem_bytes": res.other_fs_size,
+            "other_filesystem_inodes": res.other_fs_inodes,
             # `finished_only=res.partial`, exactly as `render_entries` does. One
             # result object must not have two honesty policies: these three keys
             # exist to be ranked on, and on an interrupted walk they published
@@ -3878,6 +4134,19 @@ def to_json(
                     for a in res.top_dirs(limit, "density", finished_only=res.partial)
                 ]
             ),
+            # The rankings above are cut to `-n` and used to say nothing about it.
+            # See `_top_hidden`: the table's own rule is that a truncated listing
+            # which does not say it is truncated is missing data. The count is
+            # shared -- both rankings cut the same sibling set -- while the
+            # remainder is per ranking, because the two select different entries
+            # and one pair of figures beside both completed only one of them.
+            "top_hidden": _top_hidden(res, limit),
+            # ...and the key above stops at the two sibling rankings, because
+            # `top_by_density` is short for a different reason: an inode floor,
+            # which `-n` cannot undo. See `_top_density_hidden` -- the table has
+            # disclosed that floor in prose since round five and the document
+            # published 2 rows of 14 with `top_hidden.count: 0` beside them.
+            "top_density_hidden": _top_density_hidden(res, limit),
         }
 
     if res is not None and settle is not None:
@@ -3971,18 +4240,18 @@ def to_json(
         doc["deleted_but_open"] = {
             "available": scan.available,
             "reason": scan.reason or None,
-            "total_bytes": scan.total_size,
-            "inodes": len(scan.files),
+            "total_bytes": _unscanned(scan, scan.total_size),
+            "inodes": _unscanned(scan, len(scan.files)),
             # The NFS form of the same event, kept in its own pair of fields for
             # the reason `deleted._SILLY_RENAME_RE` gives: `total_bytes` is
             # documented as space no walk can see, and these bytes are visible.
             # A consumer adding them together would be summing two different
             # claims; one that wants "space held by a deleted file" can add them
             # itself, knowing which is which.
-            "nfs_silly_renamed_bytes": scan.silly_renamed_size,
-            "nfs_silly_renamed_inodes": len(scan.silly_renamed),
-            "scanned_pids": scan.scanned_pids,
-            "unreadable_pids": scan.unreadable_pids,
+            "nfs_silly_renamed_bytes": _unscanned(scan, scan.silly_renamed_size),
+            "nfs_silly_renamed_inodes": _unscanned(scan, len(scan.silly_renamed)),
+            "scanned_pids": _unscanned(scan, scan.scanned_pids),
+            "unreadable_pids": _unscanned(scan, scan.unreadable_pids),
             "complete": scan.complete,
             "node_local_only": True,
             # A consumer computing coverage from scanned_pids needs to know the
