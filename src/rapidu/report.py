@@ -4160,7 +4160,12 @@ def to_json(
             "future_mtime_files": _unmeasured(res, res.future_files),
             "rechecked": settle.checked,
             "recheck_gap_seconds": settle.gap,
-            "drift_bytes": settle.drift,  # signed: GPFS moves both ways
+            # `_unmeasured` for the same reason `settled` is null above: under
+            # `-c` the re-stat never ran, so 0 here is "an absent reading" --
+            # the words this block already uses for it, twelve lines down --
+            # and not a tree that held still. Signed when it is real: GPFS
+            # moves both ways.
+            "drift_bytes": _unmeasured(res, settle.drift),
             "moved": settle.moved,
             # null when the check could not have seen drift, rather than a
             # reassuring false.
@@ -4201,13 +4206,13 @@ def to_json(
             # drift was measured over a population that changed underneath it.
             # The terminal reports it ("N of them disappeared between the walk
             # and the re-stat") and the document did not.
-            "vanished_files": settle.gone,
+            "vanished_files": _unmeasured(res, settle.gone),
             # The same caveat in the units the headline is in, so a consumer can
             # weigh it instead of counting files: this is what the walk read for
             # those paths, i.e. the amount by which `walk.size_bytes` above is
             # already known to be high. A count cannot carry that -- one file of
             # eight is 64 KiB or a terabyte -- and it is what decides `settled`.
-            "vanished_allocated_bytes": settle.gone_bytes,
+            "vanished_allocated_bytes": _unmeasured(res, settle.gone_bytes),
             # The limit case of the line above, and the reason `settled` is null
             # rather than true when it fires: every sampled file was deleted, so
             # `drift_bytes: 0` is an absent reading and not a settled tree.
@@ -4287,11 +4292,24 @@ def to_json(
                 "fileset": r.row.fileset if r.row else None,
                 "scope": r.row.scope if r.row else None,
                 "walked": r.walk_value,
-                "deleted_but_open": r.deleted_value,
+                # Both null on the same condition their sibling already uses.
+                # `deleted_but_open` is an addend to `walked`, and `accounted`
+                # itself returns None when `walk_value is None`; publishing 0
+                # beside a null `walked` claims nothing was folded in, when in
+                # fact no folding happened. Measured on a full walk with no
+                # matching quota row: `walked`, `accounted`, `quota`,
+                # `difference` and `share_of_quota` all null, these two 0.
+                "deleted_but_open": None if r.walk_value is None else r.deleted_value,
                 "accounted": r.accounted,
                 "quota": r.quota_value,
                 "difference": r.gap,
-                "tolerance": r.tolerance,
+                # `tolerance` is the threshold `difference` is measured against,
+                # and `within_tolerance` only ever consults it when `gap is not
+                # None`. With no gap there is no threshold -- and none was
+                # computed: `_tolerance()` needs a `quota_value` there is not
+                # one of. The object keeps its 0 default, which no decision
+                # reads; only the published figure changes.
+                "tolerance": None if r.gap is None else r.tolerance,
                 "share_of_quota": r.share,
                 "blockers": r.blockers,
                 "candidates": r.candidates,

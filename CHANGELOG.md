@@ -71,6 +71,39 @@ test and a control verified in both states.
 
 ### Fixed
 
+- **Two figures the document published as zero without having measured them.**
+  Constraint 10 is that `None` is not zero — a caller with no measurement passes
+  `None` and gets `n/a` — and both of these were that rule missed in a branch
+  where a sibling field already obeyed it.
+
+  Under `-c` no stat is taken, so the re-stat has nothing to compare and
+  `recheck_ran` reads `false`. `recent_files`, `touched_files` and
+  `future_mtime_files` were already nulled, and `settled` is explicitly `None`
+  there — the comment calls it "the strongest claim in this section, made by an
+  instrument that was switched off". But `drift_bytes`, `vanished_files` and
+  `vanished_allocated_bytes` went out raw, so a walk that read no sizes reported
+  that nothing had changed size. Twelve lines below where it was emitted, the same
+  block already says what that value is: "`drift_bytes: 0` is an absent reading and
+  not a settled tree". All three now go through `_unmeasured` like their siblings;
+  `rechecked`, `recheck_gap_seconds` and `recheck_ran` keep their numbers, because
+  those describe the check rather than the tree and are how a consumer learns to
+  expect the nulls.
+
+  The second is not about `-c` at all. With a quota backend that answered and no
+  row mapping to the path, `reconcile` returns `verdict: not-compared` and every
+  figure describing the comparison is null — `walked`, `accounted`, `quota`,
+  `difference`, `share_of_quota`. `deleted_but_open` and `tolerance` read `0`,
+  being the only two fields `Reconciliation.__init__` starts at a number instead of
+  at `None`. Measured on a **full** walk: `walked: null` beside `tolerance: 0`, a
+  threshold for a comparison that never happened — and none was computed, since
+  `_tolerance()` needs a `quota_value` there is not one of. Both are now null on
+  the same condition their siblings already use: `accounted` returns `None` when
+  `walk_value is None`, and `within_tolerance` only ever consults `tolerance` when
+  `gap is not None`. The object keeps its numeric defaults, which no decision
+  reads; only the published figure changed. No `schema` bump either way — a field
+  narrowing from a false zero to `null` is the same class of correction as the
+  whole-sample-deleted case that took `settled` to `null`.
+
 - **A bar filled to its last cell did not mean full, on the two paths that have no
   partial blocks.** `fmt.pct` goes to some trouble to keep the label honest —
   `>99.9%` throughout 99.95–99.99, so `100.0%` appears only when part really equals
