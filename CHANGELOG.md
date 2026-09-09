@@ -5,10 +5,10 @@ All notable changes to rapidu are documented here, newest first.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+## [0.5.0] — 2026-09-09
 
-Covers the working tree since 0.4.0. Every entry below shipped with a regression
-test and a control verified in both states.
+Covers the work since 0.4.0. New `--json` keys, so a minor bump. Every entry
+below shipped with a regression test and a control verified in both states.
 
 ### Added
 
