@@ -2452,6 +2452,8 @@ def test_no_message_pairs_a_count_with_a_fixed_verb():
         "rows govern {} equally",  # guarded by `len(named) > 1`
         "GPFS filesystems were asked",  # only fires above the cap of 8
         "threads is not a walk",  # "is" agrees with the rejected value
+        "must be a finite number",  # a flag name, always singular
+        "is not a duration",  # the rejected value, which "is" agrees with
         "clamped to",  # advisory prose about the cap
         "is not on PATH",  # a command name
         "is on PATH but exited",  # a command name

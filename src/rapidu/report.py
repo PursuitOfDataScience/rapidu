@@ -3886,6 +3886,16 @@ def to_json(
 
     if snap is not None:
         doc["quota"] = {
+            # WHICH path this quota was read for. `-Q` has no walk section, so
+            # `walk.root` -- the only place a path was recorded -- is absent
+            # there, and a multi-path `rdu -Q --json a b` produced documents
+            # that named neither path and were identical apart from the
+            # snapshot age. Inside this section rather than at the top level,
+            # because the four always-present top-level keys are a pinned
+            # contract ("a section must not start appearing unbidden"); adding
+            # a field to a section that is already conditional is the additive
+            # change the schema rule allows without moving the counter.
+            "path": path,
             "source": snap.source,
             "available": snap.available,
             "reason": snap.reason or None,

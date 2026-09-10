@@ -20,6 +20,7 @@ for tooling and for ``--support-bundle`` style composition.
 import argparse
 import contextlib
 import json
+import math
 import os
 import sys
 import threading
@@ -544,36 +545,43 @@ def _say_cannot_expand(raw: str, why: str) -> None:
 
 
 def cmd_quota(args: argparse.Namespace) -> int:
-    paths = []  # type: List[str]
-    for raw in args.paths:
-        expanded, why = _expand(raw)
-        if why:
-            # The quota reader maps rows to a path, so an unexpanded `~` here
-            # would silently ask about a relative directory named `~`.
-            _say_cannot_expand(raw, why)
-            return EXIT_ERROR
-        paths.append(os.path.abspath(expanded))
+    # `_resolve_paths`, the same contract walk and `-D` use, rather than a
+    # local loop. Three defects came out of the difference:
+    #
+    # * it never checked `exists`, so `rdu -Q /definitely/not/here` printed a
+    #   quota table and exited **0** while the same path through walk or `-D`
+    #   exited 2. A script branching on the exit code read a typo as success.
+    # * one unexpandable `~` returned `EXIT_ERROR` with zero bytes on stdout,
+    #   discarding the paths that were fine -- while walk and `-D` report the
+    #   valid ones, count the refusals and still exit 2. That partial-failure
+    #   contract is documented in `_resolve_paths` itself.
+    # * only `paths[0]` was ever probed, so `rdu -Q ~ /scratch/lustre`
+    #   reconciled Lustre against `$HOME`'s backend.
+    paths, refused = _resolve_paths(args.paths)
     if not paths:
-        here = _default_path()
-        if here is None:
-            sys.stderr.write(
-                "rapidu: the current directory no longer exists, so there is no "
-                "path to look a quota up for -- name one explicitly\n"
-            )
-            return EXIT_ERROR
-        paths = [here]
-    snap = quotamod.read_best(paths[0], args.quota_timeout)
+        return EXIT_ERROR
+    boxed = not args.no_box
+    style = _box_style(args.color, args.ascii, boxed)
+    docs = []  # type: List[object]
+    rcode = EXIT_OK
+    for path in paths:
+        # Per path, not `paths[0]`: two paths can live on different backends.
+        snap = quotamod.read_best(path, args.quota_timeout)
+        if args.as_json:
+            docs.append(report.to_json(None, None, snap, None, None, path=path))
+        else:
+            print(_framed(report.render_quota(snap, [path], style), style, boxed))
+        if not snap.available or _quota_needs_attention(snap, [path]):
+            rcode = EXIT_ATTENTION
     if args.as_json:
-        # `paths[0]` explicitly: there is no walk in `-Q` mode, so the document
-        # has no other way to know which filesystem it is describing.
-        print(json.dumps(report.to_json(None, None, snap, None, None, path=paths[0]), indent=2))
-    else:
-        boxed = not args.no_box
-        style = _box_style(args.color, args.ascii, boxed)
-        print(_framed(report.render_quota(snap, paths or None, style), style, boxed))
-    if not snap.available:
-        return EXIT_ATTENTION
-    return EXIT_ATTENTION if _quota_needs_attention(snap, paths) else EXIT_OK
+        # One document for one path, a list for several -- what `--help`
+        # promises, and what walk already did.
+        print(json.dumps(docs[0] if len(docs) == 1 else docs, indent=2))
+    if refused:
+        # Some of what the caller named could not be read. Reporting on the
+        # rest is right; reporting success for it is not.
+        return EXIT_ERROR
+    return rcode
 
 
 def cmd_deleted(args: argparse.Namespace) -> int:
@@ -595,16 +603,24 @@ def cmd_deleted(args: argparse.Namespace) -> int:
             # disagree.
             return EXIT_ERROR
     rcode = EXIT_OK
+    # Collected, not printed per iteration: printing inside the loop emitted
+    # two concatenated objects for two paths, which is NDJSON and not what
+    # `json.load` accepts -- measured `JSONDecodeError: Extra data`. `--help`
+    # promises "one document per PATH, or a list of them when several are
+    # given", which was true of walk only.
+    docs = []  # type: List[object]
     for target in targets:
         scan = deletedmod.scan(target)
         if args.as_json:
-            print(json.dumps(report.to_json(None, None, None, scan, None, args.top), indent=2))
+            docs.append(report.to_json(None, None, None, scan, None, args.top))
         else:
             boxed = not args.no_box
             style = _box_style(args.color, args.ascii, boxed)
             print(_framed(report.render_deleted(scan, args.top, style), style, boxed))
         if scan.files:
             rcode = EXIT_ATTENTION
+    if args.as_json:
+        print(json.dumps(docs[0] if len(docs) == 1 else docs, indent=2))
     if refused:
         # Some of what the caller named could not be scanned. Reporting on the
         # rest is right; reporting success for it is not.
@@ -920,6 +936,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     if args.top < 0:
         parser.error("-n must be 0 or more; 0 means every entry")
+    # Finiteness FIRST, because every guard below is a comparison and NaN
+    # fails all of them: `nan < 0` and `nan <= 0` are both False, so
+    # `--settle-window nan`, `--max-dirs-per-sec nan`, `--quota-timeout nan`,
+    # `--settle-wait nan` and `--max-snapshot-age nan` all passed validation
+    # and exited 0 while `-5` and `0` were correctly refused. `nan` then
+    # reached the token bucket, `communicate(timeout=nan)`, and
+    # `age > max_snapshot_age` -- which is always False, silently disabling
+    # the staleness gate the `<= 0` guard below exists to protect.
+    for flag, value in (
+        ("--settle-window", args.settle_window),
+        ("--max-dirs-per-sec", args.max_dirs_per_sec),
+        ("--quota-timeout", args.quota_timeout),
+        ("--settle-wait", args.settle_wait),
+        ("--max-snapshot-age", args.max_snapshot_age),
+    ):
+        if not math.isfinite(value):
+            parser.error("{} must be a finite number; {!r} is not a duration".format(flag, value))
     if args.settle_window < 0:
         parser.error("--settle-window cannot be negative: it is a window into the past")
     if args.max_dirs_per_sec < 0:
