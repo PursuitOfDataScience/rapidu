@@ -5,6 +5,67 @@ All notable changes to rapidu are documented here, newest first.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [0.6.0] — 2026-09-10
+
+Five High findings from an audit, each reproduced before being fixed. A new
+`--json` key and a changed exit code, so a minor bump. Every entry below shipped
+with a regression test and a control verified in both states.
+
+Four of the five are the same defect: **`-Q` and `-D` did not obey the contract
+walk obeys**, each having grown its own local path handling.
+
+### Fixed
+
+- **`rdu -Q /definitely/not/here` printed a quota table and exited 0.** The same
+  path through walk or `-D` exited 2 — `cmd_quota` never checked `exists`. A
+  script branching on the exit code read a typo as success. `cmd_quota` now uses
+  `_resolve_paths`, the function that documents this contract, so the two close
+  together and cannot drift apart again.
+
+- **One unexpandable `~` threw away the paths that were fine.** `-Q` returned
+  exit 2 with **zero bytes on stdout**, while walk and `-D` report the readable
+  paths, count the refusals and still exit 2. That partial-failure behaviour is
+  the documented contract; `-Q` is now part of it.
+
+- **`rdu -Q --json a b` probed only the first path.** So
+  `rdu -Q ~ /scratch/lustre` reconciled Lustre against `$HOME`'s backend, and
+  the document named neither path. Each path now gets its own probe and its own
+  document.
+
+- **`rdu -D --json a b` emitted output `json.load` cannot read.** One document
+  was printed per loop iteration, which is NDJSON — measured
+  `JSONDecodeError: Extra data`. `--help` promises "one document per PATH, or a
+  list of them when several are given", which was true of walk only. Both `-D`
+  and `-Q` now batch the same way walk does: one object for one path, a list for
+  several.
+
+- **`--settle-window nan` passed validation and exited 0.** Every guard on the
+  five float flags is a comparison, and `nan < 0` and `nan <= 0` are both False,
+  so `nan` and `inf` sailed through the checks that correctly refused `-5` and
+  `0`. `nan` then reached the token bucket, `communicate(timeout=nan)`, and
+  `age > max_snapshot_age` — always False, which silently disabled the very
+  staleness gate the `<= 0` guard exists to protect. Finiteness is checked
+  first now, on `--settle-window`, `--max-dirs-per-sec`, `--quota-timeout`,
+  `--settle-wait` and `--max-snapshot-age`.
+
+### Added
+
+- **`quota.path` in `--json`** — which path this quota was read for. `-Q` has no
+  walk section, so `walk.root`, the only place a path was recorded, is absent
+  there; a multi-path `-Q --json` produced documents that named neither path and
+  were identical apart from the snapshot age. It sits inside the `quota` section
+  rather than at the top level, because the four always-present top-level keys
+  are a pinned contract — a section must not start appearing unbidden, and
+  adding a field to an already-conditional section is the additive change the
+  schema rule allows.
+
+### Changed
+
+- **`rdu -Q` on a path that does not exist now exits 2, not 0**, and a
+  multi-path `-Q`/`-D --json` now emits a JSON list where it previously emitted
+  concatenated objects. Both are the documented behaviour finally being
+  followed, but a consumer that had adapted to either will see the difference.
+
 ## [0.5.0] — 2026-09-09
 
 Covers the work since 0.4.0. New `--json` keys, so a minor bump. Every entry
