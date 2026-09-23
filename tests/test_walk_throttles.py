@@ -23,6 +23,7 @@ import subprocess
 import threading
 
 import pytest
+from conftest import write_landed
 
 from rapidu import report, ui
 from rapidu import walk as walkmod
@@ -375,8 +376,7 @@ def test_a_symlink_to_another_filesystem_is_not_a_crossing(tmp_path):
 def _recent_tree(root, nfiles=8, payload=65536):
     os.makedirs(root)
     for i in range(nfiles):
-        with open(os.path.join(root, "f%02d" % i), "wb") as handle:
-            handle.write(b"q" * payload)
+        write_landed(os.path.join(root, "f%02d" % i), b"q" * payload)
     return root
 
 
@@ -402,8 +402,7 @@ def test_drift_is_signed_and_survives_a_file_disappearing(tmp_path):
     """
     grew = walk(_recent_tree(str(tmp_path / "grew")), threads=2, depth=1)
     for name in os.listdir(grew.root):
-        with open(os.path.join(grew.root, name), "ab") as handle:
-            handle.write(b"g" * 65536)
+        write_landed(os.path.join(grew.root, name), b"g" * 65536, mode="ab")
     up = recheck_settling(grew, 0.0)
     assert up.drift > 0 and up.moved and up.gone == 0
 
@@ -411,6 +410,7 @@ def test_drift_is_signed_and_survives_a_file_disappearing(tmp_path):
     for name in os.listdir(shrank.root):
         with open(os.path.join(shrank.root, name), "r+b") as handle:
             handle.truncate(4096)
+            os.fsync(handle.fileno())
     down = recheck_settling(shrank, 0.0)
     assert down.drift < 0 and down.moved and down.gone == 0
 

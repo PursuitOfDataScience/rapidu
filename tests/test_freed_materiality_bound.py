@@ -16,8 +16,9 @@ whatever filesystem ``tmp_path`` landed on would be asserting the overhead of
 that filesystem's directories, which is the thing that made the old claim wrong.
 """
 
-import io
 import os
+
+from conftest import write_landed
 
 from rapidu import report
 from rapidu.walk import SettleCheck, WalkResult, recheck_settling, walk
@@ -87,8 +88,7 @@ def test_control_c_the_far_cases_are_unaffected_on_a_real_tree(tmp_path):
         root = os.path.join(str(tmp_path), name)
         os.makedirs(root)
         for i in range(nfiles):
-            with io.open(os.path.join(root, "f%03d" % i), "wb") as handle:
-                handle.write(b"q" * 65536)
+            write_landed(os.path.join(root, "f%03d" % i), b"q" * 65536)
         res = walk(root, threads=2, depth=1)
         for entry in sorted(os.listdir(res.root))[:ngone]:
             os.unlink(os.path.join(res.root, entry))

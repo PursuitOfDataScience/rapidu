@@ -53,6 +53,7 @@ import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
+from conftest import write_landed
 
 from rapidu import reconcile as rc
 from rapidu import report, ui
@@ -111,9 +112,9 @@ class _FakeEntry(object):
 def _build_tree(root: pathlib.Path) -> None:
     """``root/{big,small}``, each a directory holding one file."""
     (root / "big").mkdir(parents=True)
-    (root / "big" / "data.bin").write_bytes(b"y" * BIG_BYTES)
+    write_landed(root / "big" / "data.bin", b"y" * BIG_BYTES)
     (root / "small").mkdir()
-    (root / "small" / "data.bin").write_bytes(b"z" * SMALL_BYTES)
+    write_landed(root / "small" / "data.bin", b"z" * SMALL_BYTES)
 
 
 def _patch_dev(root: pathlib.Path, foreign: str, monkeypatch: Any) -> None:
@@ -436,8 +437,17 @@ def test_the_split_survives_a_deeper_foreign_subtree(
     directory inode's worth.
     """
     res = _crossing_walk(crossing_root, foreign, monkeypatch)
-    payload = BIG_BYTES if foreign == "big" else SMALL_BYTES
     assert res.other_fs_size is not None
-    assert res.other_fs_size >= payload, (res.other_fs_size, payload)
+    # Measured, not assumed from the payload: GPFS stores the 2 KiB file in 512
+    # allocated bytes, so "at least the payload" is false there while the
+    # accounting is exact. Charging only the boundary entry would leave the
+    # file's own blocks out, which is what this floor catches.
+    subtree = crossing_root / foreign
+    if os.lstat(subtree / "data.bin").st_blocks == 0:
+        pytest.skip(
+            "the file holds no blocks here, so bytes cannot tell the subtree from its top entry"
+        )
+    charged = sum(os.lstat(p).st_blocks * 512 for p in (subtree, subtree / "data.bin"))
+    assert res.other_fs_size >= charged, (res.other_fs_size, charged)
     # A directory plus its one file.
     assert res.other_fs_inodes == 2

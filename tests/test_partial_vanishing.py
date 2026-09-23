@@ -28,8 +28,9 @@ own reading for the paths the re-stat could not find, which
 walk of the same tree.
 """
 
-import io
 import os
+
+from conftest import write_landed
 
 from rapidu import report, ui
 from rapidu import walk as walkmod
@@ -41,8 +42,7 @@ PLAIN = ui.resolve_style("never")
 def _tree(root, nfiles=8, payload=65536):
     os.makedirs(root)
     for i in range(nfiles):
-        with io.open(os.path.join(root, "f%03d" % i), "wb") as handle:
-            handle.write(b"q" * payload)
+        write_landed(os.path.join(root, "f%03d" % i), b"q" * payload)
     return root
 
 

@@ -38,6 +38,8 @@ import os
 import re
 import socket
 
+from conftest import write_landed
+
 from rapidu import report, ui
 from rapidu import walk as walkmod
 from rapidu.walk import SettleCheck, recheck_settling, walk
@@ -169,13 +171,11 @@ def _grown(root, nfiles=8, payload=4096, growth=200000):
     """
     os.makedirs(root)
     for i in range(nfiles):
-        with io.open(os.path.join(root, "f%03d" % i), "wb") as handle:
-            handle.write(b"q" * payload)
+        write_landed(os.path.join(root, "f%03d" % i), b"q" * payload)
     res = walk(root, threads=2, depth=1)
     assert res.recent_files == nfiles, res.recent_files
     for name in sorted(os.listdir(root)):
-        with io.open(os.path.join(root, name), "ab") as handle:
-            handle.write(b"g" * growth)
+        write_landed(os.path.join(root, name), b"g" * growth, mode="ab")
     settle = recheck_settling(res)
     settle.gap = 6.0
     assert settle.moved and settle.drift > 0, settle.drift
@@ -326,14 +326,21 @@ def _pinned(lines, root):
 
 
 def _control_tree(root):
-    """Ten files in two directories, all outside the settle window."""
+    """Ten files in two directories, all outside the settle window.
+
+    Each file of ``a/`` has to outweigh all of ``b/``, or the ranking the controls
+    pin belongs to the mount rather than to the fixture. At 40000 bytes it did not
+    on GPFS: 16 KiB allocation units put ``b/``'s four 8000-byte files at 66,048
+    against 49,152 for one file of ``a/``, and the rows swapped. 90000 and no more:
+    the literals below also pin column padding, and a figure of 100 KiB or more
+    renders one character wider.
+    """
     os.makedirs(root)
-    for name, count, payload in (("a", 6, 40000), ("b", 4, 8000)):
+    for name, count, payload in (("a", 6, 90000), ("b", 4, 8000)):
         sub = os.path.join(root, name)
         os.makedirs(sub)
         for i in range(count):
-            with io.open(os.path.join(sub, "f%d" % i), "wb") as handle:
-                handle.write(b"x" * payload)
+            write_landed(os.path.join(sub, "f%d" % i), b"x" * payload)
     return root
 
 
@@ -345,6 +352,10 @@ def _control(root):
     assert not res.recent_files and not res.touched_files
     assert not res.unreadable_dir_count and not res.unstatable
     res.elapsed = 0.5  # pinned: the rendered rate and the JSON second both use it
+    # The ranking both controls pin, checked as a premise so a mount that breaks
+    # it names the fixture instead of diffing a literal.
+    one_of_a = _du(os.path.join(root, "a", "f1"))[0]
+    assert one_of_a > _du(os.path.join(root, "b"))[0], "fixture premise: a/f1 must outweigh b/"
     return res, recheck_settling(res)
 
 
@@ -408,11 +419,11 @@ def test_the_control_document_is_unchanged(tmp_path):
     allocated, apparent = _du(root)
     assert walk_doc["size_bytes"] == allocated
     assert walk_doc["apparent_bytes"] == apparent
-    # The bytes this tree was BUILT to hold -- 6 x 40000 + 4 x 8000 -- which is
+    # The bytes this tree was BUILT to hold -- 6 x 90000 + 4 x 8000 -- which is
     # the one size figure no mount gets a vote on, and so the literal that can
     # stay a literal.
     dir_bytes = sum(os.lstat(os.path.join(root, name)).st_size for name in (".", "a", "b"))
-    assert apparent - dir_bytes == 272000
+    assert apparent - dir_bytes == 572000
     assert walk_doc["files"] == 10
     assert walk_doc["dirs"] == 3
     assert walk_doc["inodes"] == 13

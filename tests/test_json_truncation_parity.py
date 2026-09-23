@@ -57,9 +57,10 @@ added." ``TestControls`` pins that it did not move, and that the three rankings
 still cut to ``-n`` exactly as before.
 """
 
-import io
 import os
 import re
+
+from conftest import write_landed
 
 from rapidu import report, ui
 from rapidu.walk import recheck_settling, walk
@@ -76,8 +77,7 @@ def _tree(root):
     for i in range(_KIDS):
         sub = os.path.join(root, "d%02d" % i)
         os.makedirs(sub)
-        with io.open(os.path.join(sub, "f"), "wb") as handle:
-            handle.write(b"x" * (1000 * (i + 1)))
+        write_landed(os.path.join(sub, "f"), b"x" * (1000 * (i + 1)))
     return root
 
 
@@ -104,14 +104,12 @@ def _divergent_tree(root):
     for i in range(_BIG):
         sub = os.path.join(root, "big%02d" % i)
         os.makedirs(sub)
-        with io.open(os.path.join(sub, "f"), "wb") as handle:
-            handle.write(b"x" * (5 * 1024 * 1024))
+        write_landed(os.path.join(sub, "f"), b"x" * (5 * 1024 * 1024))
     for i in range(_MANY):
         sub = os.path.join(root, "many%02d" % i)
         os.makedirs(sub)
         for j in range(_FILES + i):
-            with io.open(os.path.join(sub, "f%03d" % j), "wb") as handle:
-                handle.write(b"y")
+            write_landed(os.path.join(sub, "f%03d" % j), b"y")
     return root
 
 
@@ -139,7 +137,12 @@ def _tail(res, top, by_inodes=False):
     second row the document has to agree with.
     """
     lines = report.render_compact(res, recheck_settling(res), top, by_inodes, PLAIN)
-    return next((ln for ln in lines if "more" in ln), None)
+    # The row's own instruction rather than any "more": a caveat above the table can
+    # carry the word, as the settle note does ("unallocated -- more") on a tree whose
+    # blocks had not landed yet, and matching it read that caveat as the truncation
+    # row. The flat row is "(84 more ... use -n 0 for all)" and the nested one drops
+    # the parentheses, so the instruction is the part both forms share.
+    return next((ln for ln in lines if "use -n 0 for all" in ln), None)
 
 
 def _tail_count(res, top):

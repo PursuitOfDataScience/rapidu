@@ -20,8 +20,9 @@ green at 1249 passed, which is what this file is for: the population has to be
 material AND the whole sample gone, and no other test builds that pair.
 """
 
-import io
 import os
+
+from conftest import write_landed
 
 from rapidu import report, ui
 from rapidu.walk import recheck_settling, walk
@@ -32,8 +33,7 @@ PLAIN = ui.resolve_style("never")
 def _tree(root, nfiles, payload=65536):
     os.makedirs(root)
     for i in range(nfiles):
-        with io.open(os.path.join(root, "f%03d" % i), "wb") as handle:
-            handle.write(b"q" * payload)
+        write_landed(os.path.join(root, "f%03d" % i), b"q" * payload)
     return root
 
 

@@ -33,6 +33,10 @@ Probed, not assumed from the filesystem type: ``statvfs`` gives a name, and the
 name is not the behaviour. Both probes default to *capable* if they cannot
 complete, so an unexpected environment still runs the tests and fails loudly
 rather than skipping in silence.
+
+**And one layer further: when a written file's blocks land.** That one is not a
+missing capability but a delay, so it is fixed at the fixture rather than
+skipped: see :func:`write_landed`.
 """
 
 import os
@@ -127,3 +131,25 @@ NEEDS_ENFORCED_MODE = (
     "chmod cannot deny the owner on this filesystem (ACL-backed export), so an "
     "unreadable directory cannot be created"
 )
+
+
+def write_landed(path, data, mode="wb"):
+    """Write ``data`` and ``fsync`` it, so its blocks are allocated before anything stats it.
+
+    GPFS allocates a fresh file's blocks late. Measured on a GPFS project
+    filesystem: 64 KiB written and closed read back ``st_blocks == 0`` for about
+    5.4s, and the full 65,536 bytes at once after an ``fsync``. ext4 and tmpfs
+    report the blocks on close, and ext4 is what CI runs on.
+
+    The delay is real and rapidu reports it (a freshly written tree is "still
+    settling"), so a test that asserts exact block figures, or reads a line of
+    output by position, only holds once the blocks have landed. With ``TMPDIR``
+    on GPFS such tests in three modules failed, and passed on tmpfs. Syncing the
+    fixture's own writes makes the precondition the tests already assumed true
+    everywhere, instead of leaving it to the filesystem, and is a no-op where the
+    blocks were landing anyway. A test *about* settling must not use this.
+    """
+    with open(path, mode) as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
