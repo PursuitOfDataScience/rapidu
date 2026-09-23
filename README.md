@@ -7,9 +7,6 @@
 <a href="https://github.com/PursuitOfDataScience/rapidu/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/rapidu/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="https://pypi.org/project/rapidu/"><img src="https://img.shields.io/pypi/v/rapidu.svg" alt="PyPI"></a>
 <a href="https://pypi.org/project/rapidu/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PursuitOfDataScience/rapidu/badges/downloads.json" alt="PyPI downloads per month"></a>
-<img src="https://img.shields.io/badge/python-3.6%2B-blue.svg" alt="Python 3.6+">
-<img src="https://img.shields.io/badge/dependencies-none-brightgreen.svg" alt="No dependencies">
-<img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 
 <img src="https://raw.githubusercontent.com/PursuitOfDataScience/rapidu/main/assets/demo.gif" width="900" alt="rapiDU sizing a project tree, ranking it by file count, printing a quota table, and finding space held by a deleted file that is still open.">
 
